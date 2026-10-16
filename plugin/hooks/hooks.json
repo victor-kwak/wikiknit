@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v wikiknit >/dev/null 2>&1 || exit 0; exec wikiknit hook session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v wikiknit >/dev/null 2>&1 || exit 0; exec wikiknit hook pre-commit",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v wikiknit >/dev/null 2>&1 || exit 0; exec wikiknit hook stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

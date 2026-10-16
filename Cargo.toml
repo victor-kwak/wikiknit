@@ -1,0 +1,34 @@
+[package]
+name = "wikiknit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Lint and knit wikilinks in Markdown vaults (Obsidian and friends): broken links, link rules, unlinked mentions, a note catalog, and agent hooks."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["obsidian", "wikilinks", "markdown", "lint", "notes"]
+categories = ["command-line-utilities", "text-processing"]
+exclude = ["/tests/fixtures", "/plugin", "/.claude-plugin"]
+
+[dependencies]
+aho-corasick = "1.1.5"
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+clap = { version = "4.6.7", features = ["derive"] }
+ignore = "0.4.33"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "2.0.0"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+toml = "1.1.8"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,9 @@
+{
+  "name": "wikiknit",
+  "displayName": "wikiknit",
+  "version": "0.1.0",
+  "description": "Keeps wikilinks in a Markdown vault complete: hooks hold vault commits until changed notes get a link pass, and the link skill adds related links in both directions. Needs the wikiknit CLI on PATH.",
+  "author": { "name": "Victor Kwak" },
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["obsidian", "wikilinks", "markdown", "notes", "vault"]
+}

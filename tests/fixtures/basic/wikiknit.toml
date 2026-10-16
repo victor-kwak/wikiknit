@@ -1,0 +1,8 @@
+link_style = "full-path"
+ignore = ["Templates/"]
+hubs = ["INDEX"]
+alias_only = ["Systems/"]
+
+[[require_link]]
+when = { field = "scope", matches = "^project/(.+)$" }
+target = "Projects/$1/overview"
