@@ -2,11 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use regex::Regex;
 use serde::Serialize;
 
 use crate::vault::{Target, Vault};
+
+/// Bare URLs and autolinks: a name inside a URL (`github.com/<user>/<repo>`) is not prose.
+static URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>()\[\]"'`]+"#).expect("valid regex")
+});
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Mention {
@@ -90,6 +97,7 @@ pub fn find(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Mention> 
         let mut skip: Vec<Range<usize>> = note.parsed.code.clone();
         skip.extend(note.parsed.links.iter().map(|l| l.span.clone()));
         skip.extend(note.parsed.code_links.iter().map(|l| l.span.clone()));
+        skip.extend(URL.find_iter(&note.text).map(|m| m.range()));
         // Skip the H1 title line: it names the note itself.
         let body = &note.text[note.parsed.body_start..];
         // target -> (first match start, term, count)

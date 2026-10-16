@@ -154,6 +154,11 @@ fn mentions_use_names_and_aliases() {
     assert!(!pairs.iter().any(|(t, _)| t == "display"));
     // Code spans are not prose.
     assert!(!pairs.iter().any(|(t, _)| t.contains("Reference")));
+
+    // Names inside URLs are not mentions.
+    let in_urls =
+        json_out(wikiknit(&v, state.path()).args(["--format", "json", "mentions", "Notes/lonely"]));
+    assert_eq!(in_urls, json!([]));
 }
 
 #[test]
