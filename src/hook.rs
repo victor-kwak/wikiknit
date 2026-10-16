@@ -7,19 +7,14 @@
 use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::state::{self, Baseline};
 use crate::vault::Vault;
-use crate::{Error, rules};
-
-static GIT_COMMIT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bgit\b[^;&|\n]*?\bcommit\b").expect("valid regex"));
+use crate::{Error, rules, shell};
 
 const MAX_LISTED: usize = 20;
 
@@ -75,7 +70,28 @@ pub fn run(event: Event, input: &Input) -> Result<Outcome, Error> {
                 .and_then(|t| t.get("command"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if !GIT_COMMIT.is_match(command) {
+            let commits = shell::git_commits(command);
+            if commits.is_empty() {
+                return Ok(Outcome::Allow);
+            }
+            // Only commits in the repo that holds the vault can carry vault changes.
+            let Some(vault_repo) = git_toplevel(&config.vault) else {
+                return Ok(Outcome::Allow);
+            };
+            let base_dir = input
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            let touches_vault = commits.iter().any(|c| {
+                let dir = c
+                    .dirs
+                    .iter()
+                    .fold(base_dir.clone(), |acc, d| expand_dir(&acc, d));
+                // Unknown repo (dir missing, not a repo): hold to be safe.
+                git_toplevel(&dir).is_none_or(|top| top == vault_repo)
+            });
+            if !touches_vault {
                 return Ok(Outcome::Allow);
             }
             let vault = Vault::load(config)?;
@@ -88,7 +104,7 @@ pub fn run(event: Event, input: &Input) -> Result<Outcome, Error> {
             }
             Ok(Outcome::Block(format!(
                 "Commit held by wikiknit. {}",
-                describe(&vault, &changed)
+                describe(&vault, &changed, session)
             )))
         }
         Event::Stop => {
@@ -110,7 +126,7 @@ pub fn run(event: Event, input: &Input) -> Result<Outcome, Error> {
                     base.last_stop_digest = Some(format!("nudged:{d}"));
                     Outcome::Block(format!(
                         "wikiknit: these vault notes have not changed for a full turn. {}",
-                        describe(&vault, &base.changed(&vault))
+                        describe(&vault, &base.changed(&vault), session)
                     ))
                 }
                 (Some(d), Some(last)) if last.strip_prefix("nudged:") == Some(d.as_str()) => {
@@ -152,6 +168,34 @@ fn session_start(config: Config, session: &str) -> Result<Outcome, Error> {
     Ok(Outcome::Allow)
 }
 
+/// `git rev-parse --show-toplevel` for `dir`, canonicalized.
+fn git_toplevel(dir: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let top = String::from_utf8(out.stdout).ok()?;
+    PathBuf::from(top.trim()).canonicalize().ok()
+}
+
+/// Apply a `cd`/`-C` argument to `base` (handles `~` and absolute paths).
+fn expand_dir(base: &Path, d: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if d == "~" {
+        return home.unwrap_or_else(|| base.to_path_buf());
+    }
+    if let (Some(rest), Some(home)) = (d.strip_prefix("~/"), home) {
+        return home.join(rest);
+    }
+    base.join(d)
+}
+
 /// The session baseline; created now (and `None` returned) if the session has none,
 /// since then there is no record of what changed.
 fn load_or_create(vault: &Vault, session: &str) -> Result<Option<Baseline>, Error> {
@@ -162,7 +206,7 @@ fn load_or_create(vault: &Vault, session: &str) -> Result<Option<Baseline>, Erro
     Ok(None)
 }
 
-fn describe(vault: &Vault, changed: &BTreeSet<String>) -> String {
+fn describe(vault: &Vault, changed: &BTreeSet<String>, session: &str) -> String {
     let mut msg = format!(
         "{} vault note(s) changed in this session and have had no link pass:\n",
         changed.len()
@@ -185,29 +229,10 @@ fn describe(vault: &Vault, changed: &BTreeSet<String>) -> String {
             "`wikiknit check --changed` reports {errors} rule error(s) in them.\n"
         ));
     }
-    msg.push_str(
+    msg.push_str(&format!(
         "The wikiknit `link` skill handles this: it links these notes to related notes in both \
-         directions, then runs `wikiknit mark`.",
-    );
+         directions, then records the pass with `wikiknit mark --session {session}` (run it as \
+         its own command, before the commit)."
+    ));
     msg
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detects_git_commit() {
-        for c in [
-            "git commit -m x",
-            "cd a && git commit -q -F f",
-            "git -C x commit",
-            "git add . && git commit",
-        ] {
-            assert!(GIT_COMMIT.is_match(c), "{c}");
-        }
-        for c in ["git status", "echo commit", "git log; echo commit"] {
-            assert!(!GIT_COMMIT.is_match(c), "{c}");
-        }
-    }
 }

@@ -187,6 +187,16 @@ fn catalog_and_graph() {
     assert_eq!(isolated, ["Issues/i1", "Notes/lonely"]);
 }
 
+fn git_init(dir: &Path) {
+    let ok = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git init in {}", dir.display());
+}
+
 fn hook(dir: &Path, state: &Path, event: &str, input: &Value) -> assert_cmd::assert::Assert {
     wikiknit(dir, state)
         .args(["hook", event])
@@ -213,6 +223,7 @@ fn commit_is_held_until_marked() {
             .contains("export WIKIKNIT_SESSION='s-1'")
     );
 
+    git_init(v);
     let commit = json!({"session_id": "s-1", "cwd": v, "tool_name": "Bash",
                         "tool_input": {"command": "git add -A && git commit -m notes"}});
     hook(v, state.path(), "pre-commit", &commit).success();
@@ -225,11 +236,27 @@ fn commit_is_held_until_marked() {
     let held = hook(v, state.path(), "pre-commit", &commit).code(2);
     let msg = String::from_utf8_lossy(&held.get_output().stderr).into_owned();
     assert!(msg.contains("Systems/display"), "{msg}");
-    assert!(msg.contains("wikiknit mark"), "{msg}");
+    assert!(msg.contains("wikiknit mark --session s-1"), "{msg}");
 
-    // Other Bash commands pass.
-    let ls = json!({"session_id": "s-1", "cwd": v, "tool_input": {"command": "ls"}});
-    hook(v, state.path(), "pre-commit", &ls).success();
+    // Other Bash commands pass, including ones that only mention a commit as data.
+    for command in [
+        "ls",
+        "echo 'git commit'",
+        "cat > notes.md <<'EOF'\nthen run git commit\nEOF",
+    ] {
+        let input = json!({"session_id": "s-1", "cwd": v, "tool_input": {"command": command}});
+        hook(v, state.path(), "pre-commit", &input).success();
+    }
+
+    // A commit in another repository does not carry vault changes.
+    let other = TempDir::new().unwrap();
+    git_init(other.path());
+    let elsewhere = json!({"session_id": "s-1", "cwd": v, "tool_input": {
+        "command": format!("cd {} && git commit -m code", other.path().display())}});
+    hook(v, state.path(), "pre-commit", &elsewhere).success();
+    let dash_c = json!({"session_id": "s-1", "cwd": v, "tool_input": {
+        "command": format!("git -C {} commit -m code", other.path().display())}});
+    hook(v, state.path(), "pre-commit", &dash_c).success();
 
     let changed = wikiknit(v, state.path())
         .env("WIKIKNIT_SESSION", "s-1")

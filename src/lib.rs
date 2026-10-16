@@ -10,6 +10,7 @@ pub mod hook;
 pub mod mentions;
 pub mod parse;
 pub mod rules;
+pub mod shell;
 pub mod state;
 pub mod vault;
 

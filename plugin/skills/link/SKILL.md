@@ -10,7 +10,7 @@ Goal: every note changed in this session is linked to the notes it is about, and
 
 ## 1. Gather
 
-Run these from the project (wikiknit finds `wikiknit.toml` by searching upward):
+Run these from the project (wikiknit finds `wikiknit.toml` by searching upward). The session id is in the hook message; `$WIKIKNIT_SESSION` holds it when the SessionStart hook ran. Pass `--session <id>` to `changed`, `check --changed`, `mentions --changed`, and `mark` whenever `$WIKIKNIT_SESSION` is unset: without it wikiknit uses the newest baseline, which may belong to another open session.
 
 ```bash
 wikiknit changed            # notes changed this session, not yet marked
@@ -45,9 +45,11 @@ When you link something the `mentions` list did not find (a synonym, a product n
 ## 5. Verify and record
 
 ```bash
-wikiknit check --changed    # must report 0 errors
-wikiknit mark               # record the pass; held commits and Stop notes clear
+wikiknit check --changed           # must report 0 errors
+wikiknit mark --session <id>       # record the pass; held commits and Stop notes clear
 ```
+
+Run `mark` as its own command. The commit hook checks before a command runs, so `wikiknit mark && git commit` in one command is still held.
 
 Notes you edited for back-links count as changed too: include them in the check, and `mark` records all of them. Then continue the task (for example, retry the held commit).
 
