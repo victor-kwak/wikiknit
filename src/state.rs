@@ -28,21 +28,37 @@ pub struct Baseline {
     pub last_stop_digest: Option<String>,
 }
 
-fn state_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir).join("wikiknit");
+/// Per-user state root. No shared fallback (such as `/tmp`): another user could
+/// plant files or symlinks there.
+fn state_root() -> Result<PathBuf, Error> {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Ok(dir.join("wikiknit"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/state/wikiknit");
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && home.is_absolute()
+    {
+        return Ok(home.join(".local/state/wikiknit"));
     }
-    std::env::temp_dir().join("wikiknit-state")
+    Err(Error::Usage(
+        "cannot find a state directory: set XDG_STATE_HOME or HOME".into(),
+    ))
+}
+
+/// Create `dir` (and parents) readable only by the current user.
+fn create_private_dir(dir: &Path) -> Result<(), Error> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|e| Error::io(dir, e))
 }
 
 /// Directory holding all baselines for one vault.
-#[must_use]
-pub fn vault_dir(vault_root: &Path) -> PathBuf {
+pub fn vault_dir(vault_root: &Path) -> Result<PathBuf, Error> {
     let hash = blake3::hash(vault_root.to_string_lossy().as_bytes()).to_hex();
-    state_root().join(&hash.as_str()[..16])
+    Ok(state_root()?.join(&hash.as_str()[..16]))
 }
 
 fn file_name(session: &str) -> String {
@@ -83,13 +99,12 @@ pub fn current_hashes(vault: &Vault) -> BTreeMap<String, String> {
 }
 
 impl Baseline {
-    #[must_use]
-    pub fn path(vault_root: &Path, session: &str) -> PathBuf {
-        vault_dir(vault_root).join(file_name(session))
+    pub fn path(vault_root: &Path, session: &str) -> Result<PathBuf, Error> {
+        Ok(vault_dir(vault_root)?.join(file_name(session)))
     }
 
     pub fn load(vault_root: &Path, session: &str) -> Result<Option<Self>, Error> {
-        let path = Self::path(vault_root, session);
+        let path = Self::path(vault_root, session)?;
         match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text)
                 .map(Some)
@@ -114,13 +129,17 @@ impl Baseline {
     }
 
     pub fn save(&self, session: &str) -> Result<(), Error> {
-        let path = Self::path(&self.vault, session);
+        use std::io::Write as _;
+        let path = Self::path(&self.vault, session)?;
         let dir = path.parent().expect("state path has a parent");
-        std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-        let tmp = path.with_extension("json.tmp");
+        create_private_dir(dir)?;
+        // Exclusive, randomly named temp file in the same dir, then an atomic rename.
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| Error::io(dir, e))?;
         let text = serde_json::to_string_pretty(self).expect("baseline serializes");
-        std::fs::write(&tmp, text).map_err(|e| Error::io(&tmp, e))?;
-        std::fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))
+        tmp.write_all(text.as_bytes())
+            .map_err(|e| Error::io(tmp.path(), e))?;
+        tmp.persist(&path).map_err(|e| Error::io(&path, e.error))?;
+        Ok(())
     }
 
     /// Notes added or edited since the baseline (or since their last mark).
@@ -179,7 +198,7 @@ pub fn resolve_session(vault_root: &Path, flag: Option<&str>) -> Result<String, 
     {
         return Ok(s);
     }
-    let dir = vault_dir(vault_root);
+    let dir = vault_dir(vault_root)?;
     let newest = std::fs::read_dir(&dir)
         .ok()
         .into_iter()
@@ -204,7 +223,9 @@ pub fn resolve_session(vault_root: &Path, flag: Option<&str>) -> Result<String, 
 
 /// Delete baselines older than 30 days.
 pub fn prune(vault_root: &Path) {
-    let dir = vault_dir(vault_root);
+    let Ok(dir) = vault_dir(vault_root) else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };

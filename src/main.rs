@@ -341,7 +341,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Baseline::snapshot(&vault).save(session)?;
             eprintln!(
                 "baseline recorded for `{session}`: {}",
-                Baseline::path(&root, session).display()
+                Baseline::path(&root, session)?.display()
             );
             Ok(ExitCode::SUCCESS)
         }

@@ -291,3 +291,29 @@ fn bad_hook_input_does_not_block() {
         .assert()
         .code(1);
 }
+
+#[cfg(unix)]
+#[test]
+fn state_dir_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = TempDir::new().unwrap();
+    wikiknit(&fixture("basic"), state.path())
+        .args(["baseline", "--session", "p-1"])
+        .assert()
+        .success();
+    let root = state.path().join("wikiknit");
+    let vault_dir = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+    for dir in [&root, &vault_dir] {
+        let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", dir.display());
+    }
+    assert!(vault_dir.join("p-1.json").is_file());
+}
+
+#[test]
+fn no_state_dir_without_home() {
+    let state = TempDir::new().unwrap();
+    let mut cmd = wikiknit(&fixture("basic"), state.path());
+    cmd.env_remove("XDG_STATE_HOME").env_remove("HOME");
+    cmd.args(["baseline", "--session", "x"]).assert().code(2);
+}
