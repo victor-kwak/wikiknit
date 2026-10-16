@@ -17,8 +17,8 @@ fits in editor hooks, git hooks, CI, and AI-agent hooks.
 ## Install
 
 ```bash
-cargo install wikiknit          # from crates.io (once published)
-cargo install --path .          # from a checkout
+cargo install --git https://github.com/victor-kwak/wikiknit   # latest from GitHub
+cargo install --path .                                       # from a checkout
 ```
 
 ## Use
@@ -116,7 +116,7 @@ The hooks run only in projects with a `wikiknit.toml`, use no LLM calls, and do 
 `wikiknit` binary is not on `PATH`.
 
 ```bash
-claude plugin marketplace add /path/to/wikiknit   # or the GitHub repo once published
+claude plugin marketplace add victor-kwak/wikiknit   # or a local checkout path
 claude plugin install wikiknit@wikiknit
 ```
 
