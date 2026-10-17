@@ -28,6 +28,8 @@ fn run(dir: &Path, args: &[&str]) -> Value {
         .unwrap()
         .current_dir(dir)
         .env("XDG_STATE_HOME", &state)
+        // Hermetic: no embedding model from the real cache.
+        .env("XDG_CACHE_HOME", dir.join(".cache"))
         .arg("--format")
         .arg("json")
         .args(args)
@@ -187,23 +189,29 @@ fn json_keys_follow_the_text_header_order() {
     let out = Command::cargo_bin("wikiknit")
         .unwrap()
         .current_dir(v.path())
+        .env("XDG_STATE_HOME", v.path().join(".state"))
+        .env("XDG_CACHE_HOME", v.path().join(".cache"))
         .args(["--format", "json", "search", "cloudflare"])
         .output()
         .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
-        text.starts_with(r#"{"schema_version":1,"command":"search","items":[{"id":"#),
+        text.starts_with(
+            r#"{"schema_version":1,"command":"search","mode":"lexical","items":[{"id":"#
+        ),
         "{text}"
     );
     let header = Command::cargo_bin("wikiknit")
         .unwrap()
         .current_dir(v.path())
+        .env("XDG_STATE_HOME", v.path().join(".state"))
+        .env("XDG_CACHE_HOME", v.path().join(".cache"))
         .args(["search", "cloudflare"])
         .output()
         .unwrap();
     let first = String::from_utf8(header.stdout).unwrap();
     assert!(
-        first.starts_with("# id\tscore\ttype\tmatched\tline\tsnippet\n"),
+        first.starts_with("# id\tscore\ttype\tsimilarity\tmatched\tline\tsnippet\n"),
         "{first}"
     );
 }

@@ -3,37 +3,50 @@
 Context for AI agents working on a Markdown vault (Obsidian, and anything else that uses
 `[[wikilinks]]`): find the right notes, see how they relate, and keep the links between them complete.
 
-- **search**: ranked full-text search (BM25F over title, aliases, headings, frontmatter, body), with
-  filters by type, folder, frontmatter field, tag, and linked notes.
+- **search**: hybrid search. Words (BM25F over title, aliases, headings, frontmatter, body) and
+  meaning (local embeddings, no API), fused into one ranking, with filters by type, folder,
+  frontmatter field, tag, and linked notes.
+- **suggest**: ranked link candidates for a note, each with its reasons and the exact edit to apply.
 - **links**: the notes linked to or from a note, each with the line the link is written on, so an agent
   sees how two notes relate without opening either.
 - **catalog**: one line per note (id, type, tags, aliases, title, summary), filterable.
 - **check**: broken links, wrong link style, unquoted links in frontmatter, links hidden in code or HTML,
-  notes with no outgoing link, notes missing a link your rules require, aliases two notes share.
+  notes with no outgoing link, notes missing a link your rules require, aliases two notes share. Every
+  finding comes with a fix (for a broken link: the closest existing notes).
 - **mentions**: text that names another note (by its name or an alias) without linking it.
 - **graph**: connected components with index ("hub") notes left out, so isolated clusters show up.
 - **Claude Code plugin**: hooks that hold a vault commit until the changed notes had a link pass.
 
 It reads the Markdown files directly: Obsidian does not need to be running, and wikiknit never edits
 notes (agents do; wikiknit tells them what and where). It is fast enough for hooks: on a 5,000-note
-vault, `search` takes about 0.1 s and `check` 0.06 s (16 cores).
+vault, lexical `search` takes about 0.1 s and `check` 0.06 s (16 cores); hybrid search adds about
+0.15 s to load the model.
 
 ## Install
 
 ```bash
 cargo install --git https://github.com/victor-kwak/wikiknit   # latest from GitHub
 cargo install --path .                                       # from a checkout
+cargo install --path . --no-default-features                 # without semantic search (no ONNX)
 ```
+
+Semantic search uses [fastembed](https://github.com/Anush008/fastembed-rs) (ONNX Runtime, linked in at
+build time). The embedding model downloads on the first `wikiknit embed` into
+`$XDG_CACHE_HOME/wikiknit/models` (the default model, `BGESmallENV15Q`, is about 65 MB); everything
+after that runs offline.
 
 ## Use
 
 ```bash
+wikiknit embed                                     # build the semantic index (once; then incremental)
 wikiknit search cloudflare tunnel --type project   # ranked notes, best line of each
+wikiknit search "screen goes black when idle"      # finds notes by meaning, not only by words
 wikiknit search '"ssh key"' github --limit 5       # a quoted phrase must appear as written
 wikiknit links gatehouse                           # neighbors of a note (id, path, name, or alias)
 wikiknit links gatehouse --depth 2 --in            # notes linking to it, two hops
 wikiknit catalog --path Projects/ --where status=active
-wikiknit check                                     # every note; exit 1 on errors
+wikiknit suggest gatehouse                         # link candidates, with reasons and edits
+wikiknit check                                     # every note; exit 1 on errors; each with a fix
 wikiknit mentions
 wikiknit graph
 ```
@@ -56,7 +69,7 @@ field are `;`-separated.
 `--format json` prints one compact object instead:
 
 ```json
-{"schema_version":1,"command":"search","items":[{"id":"...","score":6.58,"type":"reference","matched":["body","title"],"line":18,"snippet":"..."}]}
+{"schema_version":1,"command":"search","mode":"hybrid","items":[{"id":"...","score":3.23,"type":"reference","similarity":0.712,"matched":["body","semantic"],"line":18,"snippet":"..."}]}
 ```
 
 `schema_version` changes only when a record's fields change incompatibly.
@@ -77,6 +90,11 @@ alias_only = ["Systems/"]       # notes named with common words: found in prose 
 min_alias_len = 4               # shorter names and aliases are not matched as mentions
 generic_names = ["overview", "index", "readme"]  # stems that take their folder's name
 stemmer = "english"             # search stemming: a Snowball language, or "none"
+embedding_model = "BGESmallENV15Q"  # semantic search model (any fastembed text model)
+min_similarity = 0.5            # semantic match: at least this cosine similarity...
+semantic_margin = 0.12          # ...and this far above the median note for the query
+link_section = "## Related"     # where suggested links go; or "frontmatter:related"
+no_backlink_from = ["Sessions/"]  # logs: their links do not ask for a link back
 
 # A note whose frontmatter `scope` is "project/<name>" must link Projects/<name>/overview.
 [[require_link]]
@@ -130,6 +148,46 @@ text is indexed as single characters and overlapping pairs. Identifiers like `sn
 statistics come from the whole vault, so a filter changes which notes are shown, not their scores. A query that is exactly a note's name, alias, or title
 puts that note first, and notes that many others link to get a small boost. Hub notes are left out
 unless `--include-hubs`. Each hit shows the fields it matched and its best line.
+
+### Hybrid search
+
+`wikiknit embed` splits each note into chunks (by section, then paragraph, about 175 tokens each,
+each prefixed with the note title and heading path) and embeds them with a local model. The index
+lives in the state directory, keyed by note content hash: later runs embed only changed notes, and
+`search` itself refreshes up to 64 changed chunks before answering (about a second). `search` then fuses
+the BM25 ranking and the meaning ranking (each note scored by its best chunk) with reciprocal rank
+fusion; an exact name or alias match still comes first, and quoted phrases still must match. A note
+counts as a semantic match only if its similarity clears `min_similarity` and stands `semantic_margin`
+above the median note for that query (in vaults of 10 or more notes): a real match stands out from the
+rest, so a query about nothing in the vault returns nothing. Hits found by meaning show `semantic` in
+`matched`, their cosine in `similarity`, and point at their chunk's line. The index is used only when it
+covers at least 90% of the notes (otherwise `search` says to run `embed`). Concurrent `embed` and
+`search` runs merge their work under a lock. Without an index (or without the
+`semantic` feature) `search` is lexical and says so on stderr. `--mode lexical|semantic|hybrid`
+chooses explicitly. `embedding_model` picks the model (any fastembed text model, e.g.
+`MultilingualE5Small` for many languages).
+
+### Suggest
+
+`suggest <note>` (or `--changed`) ranks link candidates from:
+
+- the note's text naming the candidate (name or alias) without a link: an inline edit
+  (`line 6: replace "ACME Corp" with [[Reference/acme|ACME Corp]]`);
+- the candidate linking here without a link back, and the note linking to a candidate that does not
+  link back (a `backlink` edit in the other note);
+- similar meaning (semantic index) and similar text (BM25 on the note's title, aliases, headings);
+- shared neighbors in the link graph (Adamic-Adar, hubs left out);
+- rare frontmatter values both notes have (`stack: cloudflare`, tags).
+
+Scores are absolute, so they compare across notes: one strong signal (a mention, a link here) scores
+2-3, a weak text match alone under 0.5; `--min-score` (default 0.75) leaves out the weak ones. Template
+headings shared by many notes and single shared neighbors do not count as similarity. Notes under
+`no_backlink_from` (logs, like session notes) linking here do not ask for a link back.
+
+Each row has the file to edit, the action (`mention`, `link`, `backlink`), the reasons, and the edit:
+where it goes (`link_section`, `## Related` by default, or `frontmatter:related` for a frontmatter list)
+and the link text in the vault's `link_style`. wikiknit never applies edits; an agent decides which
+suggestions are right and makes them.
 
 ### Mentions
 

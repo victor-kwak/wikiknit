@@ -68,7 +68,7 @@ fn state_root() -> Result<PathBuf, Error> {
 }
 
 /// Create `dir` (and parents) readable only by the current user.
-fn create_private_dir(dir: &Path) -> Result<(), Error> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), Error> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -153,10 +153,16 @@ pub struct Store {
 
 impl Store {
     pub fn open(vault_root: &Path) -> Result<Self, Error> {
+        Ok(Self::open_at(&state_root()?, vault_root))
+    }
+
+    /// The store for `vault_root` under an explicit state root (tests, tools).
+    #[must_use]
+    pub fn open_at(state_root: &Path, vault_root: &Path) -> Self {
         let hash = blake3::hash(vault_root.to_string_lossy().as_bytes()).to_hex();
-        Ok(Self {
-            dir: state_root()?.join(&hash.as_str()[..16]),
-        })
+        Self {
+            dir: state_root.join(&hash.as_str()[..16]),
+        }
     }
 
     #[must_use]

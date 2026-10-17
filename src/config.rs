@@ -48,6 +48,16 @@ struct RawConfig {
     alias_only: Vec<String>,
     #[serde(default = "default_stemmer")]
     stemmer: String,
+    #[serde(default = "default_embedding_model")]
+    embedding_model: String,
+    #[serde(default = "default_link_section")]
+    link_section: String,
+    #[serde(default = "default_min_similarity")]
+    min_similarity: f32,
+    #[serde(default = "default_semantic_margin")]
+    semantic_margin: f32,
+    #[serde(default)]
+    no_backlink_from: Vec<String>,
     #[serde(default)]
     require_link: Vec<RawRequireLink>,
     #[serde(default)]
@@ -74,6 +84,22 @@ fn default_vault() -> PathBuf {
 }
 fn default_stemmer() -> String {
     "english".into()
+}
+
+fn default_embedding_model() -> String {
+    "BGESmallENV15Q".into()
+}
+
+fn default_min_similarity() -> f32 {
+    0.5
+}
+
+fn default_semantic_margin() -> f32 {
+    0.12
+}
+
+fn default_link_section() -> String {
+    "## Related".into()
 }
 
 /// Snowball stemmers `search` can use (`none` turns stemming off).
@@ -142,6 +168,17 @@ pub struct Config {
     pub alias_only: Vec<String>,
     /// Stemmer for `search` (a name from [`STEMMERS`]).
     pub stemmer: String,
+    /// fastembed model for semantic search (e.g. `BGESmallENV15Q`, `MultilingualE5Small`).
+    pub embedding_model: String,
+    /// Heading of the section `suggest` puts new links under (e.g. `## Related`).
+    pub link_section: String,
+    /// Cosine similarity below which a note is not a semantic match (model-dependent).
+    pub min_similarity: f32,
+    /// A semantic match must also stand this far above the median note for the query (vaults
+    /// of 10+ notes), so a query about nothing in the vault matches nothing.
+    pub semantic_margin: f32,
+    /// Prefixes of notes whose links do not ask for a link back (logs: `Sessions/`).
+    pub no_backlink_from: Vec<String>,
     pub require_link: Vec<RequireLink>,
     severity: BTreeMap<String, Severity>,
 }
@@ -160,6 +197,11 @@ impl Config {
             generic_names: default_generic_names(),
             alias_only: Vec::new(),
             stemmer: default_stemmer(),
+            embedding_model: default_embedding_model(),
+            link_section: default_link_section(),
+            min_similarity: default_min_similarity(),
+            semantic_margin: default_semantic_margin(),
+            no_backlink_from: Vec::new(),
             require_link: Vec::new(),
             severity: BTreeMap::new(),
         }
@@ -279,6 +321,15 @@ impl Config {
                 .map(|p| p.trim_start_matches("./").to_string())
                 .collect(),
             stemmer,
+            embedding_model: raw.embedding_model,
+            link_section: raw.link_section,
+            min_similarity: raw.min_similarity,
+            semantic_margin: raw.semantic_margin,
+            no_backlink_from: raw
+                .no_backlink_from
+                .into_iter()
+                .map(|p| p.trim_start_matches("./").to_string())
+                .collect(),
             require_link,
             severity: raw.severity,
         })
@@ -308,6 +359,11 @@ impl Config {
     #[must_use]
     pub fn is_ignored(&self, id_or_rel: &str) -> bool {
         under_any(&self.ignore, id_or_rel)
+    }
+
+    #[must_use]
+    pub fn is_no_backlink_from(&self, id: &str) -> bool {
+        under_any(&self.no_backlink_from, id)
     }
 
     #[must_use]

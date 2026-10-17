@@ -24,6 +24,8 @@ fn wk(dir: &Path, state: &Path) -> Command {
     let mut cmd = Command::cargo_bin("wikiknit").unwrap();
     cmd.current_dir(dir)
         .env("XDG_STATE_HOME", state)
+        // Hermetic: no embedding model from the real cache.
+        .env("XDG_CACHE_HOME", state.join("cache"))
         .env_remove("WIKIKNIT_SESSION")
         .env_remove("CLAUDE_PROJECT_DIR")
         .env_remove("CLAUDE_ENV_FILE");
@@ -500,6 +502,7 @@ fn concurrent_marks_are_all_kept() {
             let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("wikiknit"));
             cmd.current_dir(p)
                 .env("XDG_STATE_HOME", state.path())
+                .env("XDG_CACHE_HOME", state.path().join("cache"))
                 .args(["mark", "--session", "m"])
                 .args(part)
                 .stderr(std::process::Stdio::null());

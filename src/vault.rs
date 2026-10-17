@@ -28,6 +28,15 @@ impl Note {
         self.line_starts.partition_point(|&s| s <= offset)
     }
 
+    /// Byte offset where 1-based `line` starts (the end of the text past the last line).
+    #[must_use]
+    pub fn line_start(&self, line: usize) -> usize {
+        self.line_starts
+            .get(line.saturating_sub(1))
+            .copied()
+            .unwrap_or(self.text.len())
+    }
+
     /// (1-based line number, the whole line, byte offset of `offset` within it).
     #[must_use]
     pub fn line_at(&self, offset: usize) -> (usize, &str, usize) {

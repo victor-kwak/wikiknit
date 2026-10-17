@@ -37,6 +37,8 @@ fn wikiknit(dir: &Path, state: &Path) -> Command {
     let mut cmd = Command::cargo_bin("wikiknit").unwrap();
     cmd.current_dir(dir)
         .env("XDG_STATE_HOME", state)
+        // Hermetic: no embedding model from the real cache.
+        .env("XDG_CACHE_HOME", state.join("cache"))
         .env_remove("WIKIKNIT_SESSION")
         .env_remove("CLAUDE_PROJECT_DIR")
         .env_remove("CLAUDE_ENV_FILE");
@@ -208,9 +210,12 @@ fn text_output_is_a_header_and_tab_separated_rows() {
     let out = wikiknit(&v, state.path()).arg("check").output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     let mut lines = text.lines();
-    assert_eq!(lines.next(), Some("# note\tline\tseverity\trule\tmessage"));
+    assert_eq!(
+        lines.next(),
+        Some("# note\tline\tseverity\trule\tmessage\tfix")
+    );
     for line in lines {
-        assert_eq!(line.split('\t').count(), 5, "{line}");
+        assert_eq!(line.split('\t').count(), 6, "{line}");
     }
     assert!(out.stderr.is_empty(), "no chatter on stderr");
     // Clean output is empty.

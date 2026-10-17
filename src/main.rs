@@ -58,6 +58,105 @@ enum Format {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    Hybrid,
+    Lexical,
+    Semantic,
+}
+
+/// Notes ranked by meaning for `query`, and the mode actually used. Never downloads a model:
+/// without one (or without the `semantic` feature) search is lexical, with a note on stderr.
+#[cfg(feature = "semantic")]
+fn meaning(
+    vault: &Vault,
+    query: &str,
+    include_hubs: bool,
+    mode: Mode,
+) -> Result<(Option<Vec<search::Meaning>>, Mode)> {
+    if mode == Mode::Lexical {
+        return Ok((None, Mode::Lexical));
+    }
+    let sem = match wikiknit::semantic::Semantic::open(vault, false) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wikiknit: semantic search unavailable ({e}); using lexical");
+            return Ok((None, Mode::Lexical));
+        }
+    };
+    let Some(mut sem) = sem else {
+        eprintln!(
+            "wikiknit: semantic search is off until `wikiknit embed` downloads the model and indexes the vault; using lexical"
+        );
+        return Ok((None, Mode::Lexical));
+    };
+    // A partial index would rank only the notes it happens to have: use it only when it
+    // covers nearly the whole vault.
+    let (indexed, total) = sem.coverage(vault);
+    if !sem.covers(vault) {
+        eprintln!(
+            "wikiknit: the semantic index covers {indexed} of {total} notes; run `wikiknit embed`; using lexical"
+        );
+        return Ok((None, Mode::Lexical));
+    }
+    // Keep the index current for a few changed notes (about a second); more needs `embed`.
+    let update = sem.update(vault, Some(64))?;
+    if update.stale > 0 {
+        eprintln!(
+            "wikiknit: {} note(s) changed since `wikiknit embed`; their old vectors are used",
+            update.stale
+        );
+    }
+    let ranked = sem.rank(vault, query, include_hubs)?;
+    Ok((Some(ranked), mode))
+}
+
+/// The semantic index for `suggest`, refreshed for a few changed notes when the model is
+/// available; `None` without an index.
+#[cfg(feature = "semantic")]
+fn semantic_index(vault: &Vault) -> Result<Option<wikiknit::vectors::Index>> {
+    if let Ok(Some(mut sem)) = wikiknit::semantic::Semantic::open(vault, false) {
+        if sem.covers(vault) {
+            sem.update(vault, Some(64))?;
+        } else {
+            let (indexed, total) = sem.coverage(vault);
+            eprintln!(
+                "wikiknit: the semantic index covers {indexed} of {total} notes; run `wikiknit embed` for similarity-based suggestions"
+            );
+        }
+        return Ok(Some(sem.index));
+    }
+    index_file(vault)
+}
+
+#[cfg(not(feature = "semantic"))]
+fn semantic_index(vault: &Vault) -> Result<Option<wikiknit::vectors::Index>> {
+    index_file(vault)
+}
+
+/// The semantic index as saved (no model needed to read it).
+fn index_file(vault: &Vault) -> Result<Option<wikiknit::vectors::Index>> {
+    let store = Store::open(&vault.config.vault)?;
+    let model = &vault.config.embedding_model;
+    Ok(wikiknit::vectors::Index::load(
+        &wikiknit::vectors::path(store.dir(), model),
+        model,
+    )?)
+}
+
+#[cfg(not(feature = "semantic"))]
+fn meaning(
+    _vault: &Vault,
+    _query: &str,
+    _include_hubs: bool,
+    mode: Mode,
+) -> Result<(Option<Vec<search::Meaning>>, Mode)> {
+    if mode != Mode::Lexical {
+        eprintln!("wikiknit: built without the `semantic` feature; using lexical search");
+    }
+    Ok((None, Mode::Lexical))
+}
+
 /// Note filters (each kind must match; repeat a flag to accept any of its values).
 #[derive(Debug, Args, Default)]
 struct FilterArgs {
@@ -120,8 +219,36 @@ enum Command {
         /// Also search hub notes (excluded by default: they mention everything).
         #[arg(long)]
         include_hubs: bool,
+        /// hybrid: words + meaning (needs `wikiknit embed` once; falls back to lexical);
+        /// lexical: words only (BM25); semantic: meaning only.
+        #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
+        mode: Mode,
         #[command(flatten)]
         filter: FilterArgs,
+    },
+    /// Ranked link candidates for a note, each with reasons and the edit to apply.
+    Suggest {
+        /// The note: id, path, name, alias, or folder.
+        #[arg(required_unless_present = "changed")]
+        note: Option<String>,
+        /// Every note changed in the session that still needs a link pass.
+        #[arg(long, conflicts_with = "note")]
+        changed: bool,
+        #[arg(long)]
+        session: Option<String>,
+        /// Suggestions per note.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Leave out weaker candidates (a mention scores about 3; a weak text match under 0.5;
+        /// one shared value or two shared links about 0.5-1).
+        #[arg(long, default_value_t = 0.75)]
+        min_score: f64,
+    },
+    /// Build or update the semantic index (downloads the embedding model on first use).
+    Embed {
+        /// Re-embed every note, not only changed ones.
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Notes linked to or from a note, with the line each link is written on.
     Links {
@@ -341,6 +468,59 @@ fn emit_with<T: Serialize>(
     }
 }
 
+#[cfg(feature = "semantic")]
+fn embed(vault: &Vault, fmt: Format, rebuild: bool) -> Result<ExitCode> {
+    let name = &vault.config.embedding_model;
+    if !wikiknit::embedder::is_cached(name)? {
+        eprintln!("wikiknit: downloading embedding model {name} (first use)");
+    }
+    let mut sem =
+        wikiknit::semantic::Semantic::open(vault, true)?.context("embedding model did not load")?;
+    if rebuild {
+        sem.index.notes.clear();
+        sem.rebuild = true;
+    }
+    let started = std::time::Instant::now();
+    let update = sem.update(vault, None)?;
+    let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+    let mut extra = serde_json::Map::new();
+    extra.insert("seconds".into(), seconds.into());
+    emit_with(
+        fmt,
+        "embed",
+        &[
+            "model",
+            "embedded",
+            "chunks",
+            "removed",
+            "stale",
+            "total_notes",
+            "total_chunks",
+            "seconds",
+        ],
+        &[update],
+        |u| {
+            vec![
+                u.model.clone(),
+                u.embedded.to_string(),
+                u.chunks.to_string(),
+                u.removed.to_string(),
+                u.stale.to_string(),
+                u.total_notes.to_string(),
+                u.total_chunks.to_string(),
+                seconds.to_string(),
+            ]
+        },
+        extra,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(feature = "semantic"))]
+fn embed(_vault: &Vault, _fmt: Format, _rebuild: bool) -> Result<ExitCode> {
+    bail!("this wikiknit was built without the `semantic` feature")
+}
+
 fn opt(s: Option<&String>) -> String {
     s.cloned().unwrap_or_default()
 }
@@ -357,7 +537,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             emit(
                 fmt,
                 "check",
-                &["note", "line", "severity", "rule", "message"],
+                &["note", "line", "severity", "rule", "message", "fix"],
                 &findings,
                 |f| {
                     vec![
@@ -366,6 +546,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         f.severity.to_string(),
                         f.rule.to_string(),
                         f.message.clone(),
+                        f.fix.clone(),
                     ]
                 },
             );
@@ -400,23 +581,97 @@ fn run(cli: Cli) -> Result<ExitCode> {
             query,
             limit,
             include_hubs,
+            mode,
             filter,
         } => {
             let filter = filter.build(&vault)?;
-            let hits = search::search(&vault, &query.join(" "), &filter, *include_hubs, *limit);
-            emit(
+            let query = query.join(" ");
+            let (ranked, used) = meaning(&vault, &query, *include_hubs, *mode)?;
+            let hits = search::search(
+                &vault,
+                &query,
+                &filter,
+                &search::Options {
+                    include_hubs: *include_hubs,
+                    limit: *limit,
+                    semantic: ranked.as_deref(),
+                    lexical: used != Mode::Semantic,
+                },
+            );
+            let mut extra = serde_json::Map::new();
+            extra.insert("mode".into(), format!("{used:?}").to_lowercase().into());
+            emit_with(
                 fmt,
                 "search",
-                &["id", "score", "type", "matched", "line", "snippet"],
+                &[
+                    "id",
+                    "score",
+                    "type",
+                    "similarity",
+                    "matched",
+                    "line",
+                    "snippet",
+                ],
                 &hits,
                 |h| {
                     vec![
                         h.id.clone(),
                         format!("{:.2}", h.score),
                         opt(h.kind.as_ref()),
+                        h.similarity.map(|s| format!("{s:.3}")).unwrap_or_default(),
                         h.matched.join(";"),
                         h.line.to_string(),
                         h.snippet.clone(),
+                    ]
+                },
+                extra,
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Embed { rebuild } => embed(&vault, fmt, *rebuild),
+        Command::Suggest {
+            note,
+            changed,
+            session,
+            limit,
+            min_score,
+        } => {
+            let starts: Vec<usize> = if *changed {
+                session_changed(&vault, session.as_deref())?
+                    .2
+                    .iter()
+                    .filter_map(|id| vault.index_of(id))
+                    .collect()
+            } else {
+                vec![vault.find_note(note.as_deref().expect("required by clap"))?]
+            };
+            let index = semantic_index(&vault)?;
+            let mut all = Vec::new();
+            for start in starts {
+                all.extend(wikiknit::suggest::suggest(
+                    &vault,
+                    start,
+                    index.as_ref(),
+                    *limit,
+                    *min_score,
+                ));
+            }
+            emit(
+                fmt,
+                "suggest",
+                &[
+                    "note", "action", "target", "score", "reasons", "line", "edit",
+                ],
+                &all,
+                |s| {
+                    vec![
+                        s.note.clone(),
+                        s.action.to_string(),
+                        s.target.clone(),
+                        format!("{:.2}", s.score),
+                        s.reasons.join("; "),
+                        s.line.to_string(),
+                        s.edit.clone(),
                     ]
                 },
             );

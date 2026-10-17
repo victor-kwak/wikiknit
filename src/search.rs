@@ -9,7 +9,7 @@
 //! name, alias, or title ranks that note first; notes many others link to get a small boost.
 //! Term statistics come from the whole vault, so scores do not change with filters.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
@@ -23,6 +23,13 @@ use crate::text::{self, Fence};
 use crate::vault::{Note, Vault};
 
 const K1: f64 = 1.2;
+/// Reciprocal rank fusion constant (the usual 60).
+const RRF_K: f64 = 60.0;
+/// How many semantic results join the fusion.
+const SEMANTIC_DEPTH: usize = 100;
+/// Semantic results this high are reported as a `semantic` match.
+const SEMANTIC_MATCHED: usize = 10;
+
 const SNIPPET_LEN: usize = 160;
 /// Characters that join parts of an identifier inside one Unicode word.
 const JOINERS: &[char] = &['.', '_', ':', '@'];
@@ -79,12 +86,35 @@ impl Field {
     }
 }
 
+/// How to search.
+#[derive(Debug, Clone, Copy)]
+pub struct Options<'a> {
+    /// Also search hub notes.
+    pub include_hubs: bool,
+    pub limit: usize,
+    /// Notes ranked by meaning, to fuse with the lexical ranking (hybrid search).
+    pub semantic: Option<&'a [Meaning]>,
+    /// Use the lexical (BM25) ranking; off = semantic only.
+    pub lexical: bool,
+}
+
+/// A note ranked by meaning (from the semantic index): best chunk similarity and its line.
+#[derive(Debug, Clone, Copy)]
+pub struct Meaning {
+    pub note: usize,
+    pub similarity: f32,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub id: String,
     pub score: f64,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Cosine similarity of the best chunk, when the note matched by meaning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
     /// Fields the query matched in, best first.
     pub matched: Vec<&'static str>,
     /// Line of the snippet (0 when the match is only in title/aliases/frontmatter and the
@@ -425,13 +455,13 @@ fn normalize(s: &str) -> String {
 /// Search the notes that pass `filter` (hubs only with `include_hubs`); best `limit` hits.
 #[must_use]
 #[allow(clippy::cast_precision_loss)] // counts far below 2^52
-pub fn search(
-    vault: &Vault,
-    query: &str,
-    filter: &Filter,
-    include_hubs: bool,
-    limit: usize,
-) -> Vec<Hit> {
+pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -> Vec<Hit> {
+    let Options {
+        include_hubs,
+        limit,
+        semantic,
+        lexical,
+    } = *opts;
     let cfg = &vault.config;
     let mut an = Analyzer::new(&cfg.stemmer);
     let q = parse_query(query, &mut an);
@@ -474,12 +504,26 @@ pub fn search(
     let inbound = vault.inbound_counts();
     let query_norm = normalize(query.trim_matches('"'));
     let mut hits: Vec<(f64, usize, Vec<&'static str>)> = Vec::new();
+    // Notes allowed in results: pass the filter and contain every quoted phrase.
+    let mut allowed = vec![false; vault.notes.len()];
+    let mut exact_notes = vec![false; vault.notes.len()];
     for (pos, d) in docs.iter().enumerate() {
         let i = corpus[pos];
         let note = &vault.notes[i];
         if !d.phrases_ok || !filter.matches(vault, note) {
             continue;
         }
+        allowed[i] = true;
+        exact_notes[i] = !query_norm.is_empty()
+            && (normalize(note.name(&cfg.generic_names)) == query_norm
+                || note
+                    .parsed
+                    .frontmatter
+                    .aliases()
+                    .iter()
+                    .any(|a| normalize(a) == query_norm)
+                || catalog::title(note, &cfg.generic_names)
+                    .is_some_and(|t| normalize(&t) == query_norm));
         let mut score = 0.0;
         let mut matched: Vec<(f64, &'static str)> = Vec::new();
         for (qi, &dft) in df.iter().enumerate() {
@@ -506,16 +550,7 @@ pub fn search(
         if score <= 0.0 {
             continue;
         }
-        let exact = normalize(note.name(&cfg.generic_names)) == query_norm
-            || note
-                .parsed
-                .frontmatter
-                .aliases()
-                .iter()
-                .any(|a| normalize(a) == query_norm)
-            || catalog::title(note, &cfg.generic_names)
-                .is_some_and(|t| normalize(&t) == query_norm);
-        if exact && !query_norm.is_empty() {
+        if exact_notes[i] {
             score += 10.0;
         }
         score *= 1.0 + 0.05 * (1.0 + inbound[i] as f64).ln();
@@ -523,11 +558,64 @@ pub fn search(
         hits.push((score, i, matched.into_iter().map(|(_, n)| n).collect()));
     }
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    if !lexical {
+        hits.clear();
+    }
+
+    // Hybrid: fuse the lexical and semantic rankings (reciprocal rank fusion).
+    let mut semantic_line: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut semantic_sim: BTreeMap<usize, f32> = BTreeMap::new();
+    if let Some(meaning) = semantic {
+        let mut fused: BTreeMap<usize, (f64, Vec<&'static str>)> = BTreeMap::new();
+        for (rank, (_, i, matched)) in hits.iter().enumerate() {
+            let e = fused.entry(*i).or_insert((0.0, matched.clone()));
+            e.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
+        }
+        // A semantic match must clear `min_similarity` and stand `semantic_margin` above the
+        // median note for this query: similarity levels differ by vault and query, but a real
+        // match stands out from the rest. (The median means little below 10 notes.)
+        let mut sims: Vec<f32> = meaning.iter().map(|m| m.similarity).collect();
+        sims.sort_by(f32::total_cmp);
+        let floor = if sims.len() >= 10 {
+            cfg.min_similarity
+                .max(sims[sims.len() / 2] + cfg.semantic_margin)
+        } else {
+            cfg.min_similarity
+        };
+        let allowed_meaning = meaning
+            .iter()
+            .filter(|m| allowed[m.note] && m.similarity >= floor)
+            .take(SEMANTIC_DEPTH);
+        for (rank, m) in allowed_meaning.enumerate() {
+            let e = fused.entry(m.note).or_insert((0.0, Vec::new()));
+            e.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
+            if rank < SEMANTIC_MATCHED {
+                e.1.push("semantic");
+            }
+            semantic_line.insert(m.note, m.line);
+            semantic_sim.insert(m.note, m.similarity);
+        }
+        hits = fused
+            .into_iter()
+            .map(|(i, (s, matched))| {
+                // Exact name/alias/title matches stay first; scores read as percent-ish.
+                let s = s * 100.0 + if exact_notes[i] { 100.0 } else { 0.0 };
+                (s, i, matched)
+            })
+            .collect();
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    }
     hits.truncate(limit);
     hits.into_iter()
         .map(|(score, i, matched)| {
             let note = &vault.notes[i];
             let (line, snippet) = best_line(note, &q, &mut an)
+                .or_else(|| {
+                    semantic_line.get(&i).filter(|&&l| l > 0).map(|&l| {
+                        let (_, text, _) = note.line_at(note.line_start(l));
+                        (l, text::window(text, 0, SNIPPET_LEN))
+                    })
+                })
                 .unwrap_or_else(|| (0, catalog::summary(note, &cfg.generic_names)));
             Hit {
                 id: note.id.clone(),
@@ -537,6 +625,9 @@ pub fn search(
                     .frontmatter
                     .str_field("type")
                     .map(str::to_string),
+                similarity: semantic_sim
+                    .get(&i)
+                    .map(|s| (f64::from(*s) * 1000.0).round() / 1000.0),
                 matched,
                 line,
                 snippet,
@@ -602,6 +693,57 @@ mod tests {
         );
         let mut none = Analyzer::new("none");
         assert_eq!(none.terms("Deploys"), ["deploys"]);
+    }
+
+    fn vault_of(files: &[(&str, &str)]) -> Vault {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (p, body) in files {
+            std::fs::write(dir.path().join(p), body).unwrap();
+        }
+        let v = Vault::load(crate::Config::for_vault(dir.path().canonicalize().unwrap())).unwrap();
+        std::mem::forget(dir);
+        v
+    }
+
+    #[test]
+    fn hybrid_fuses_and_respects_the_floor() {
+        let v = vault_of(&[
+            ("x.md", "# x\nalpha beta\n"),
+            ("y.md", "# y\ngamma\n"),
+            ("z.md", "# z\ndelta\n"),
+        ]);
+        let idx = |id: &str| v.index_of(id).unwrap();
+        let meaning = [
+            Meaning {
+                note: idx("y"),
+                similarity: 0.9,
+                line: 2,
+            },
+            Meaning {
+                note: idx("z"),
+                similarity: 0.4,
+                line: 2,
+            },
+        ];
+        let opts = |lexical| Options {
+            include_hubs: false,
+            limit: 10,
+            semantic: Some(&meaning),
+            lexical,
+        };
+        let hybrid = search(&v, "alpha", &Filter::default(), &opts(true));
+        let ids: Vec<&str> = hybrid.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["x", "y"], "z is below min_similarity");
+        assert!(hybrid[1].matched.contains(&"semantic"));
+        assert_eq!(hybrid[1].similarity, Some(0.9));
+        assert_eq!(hybrid[1].line, 2);
+        assert_eq!(hybrid[0].similarity, None);
+        // Semantic only.
+        let sem = search(&v, "alpha", &Filter::default(), &opts(false));
+        assert_eq!(sem.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["y"]);
+        // An exact name match stays first even when meaning ranks it lower.
+        let exact = search(&v, "y", &Filter::default(), &opts(true));
+        assert_eq!(exact[0].id, "y");
     }
 
     #[test]
