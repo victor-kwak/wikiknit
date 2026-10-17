@@ -39,7 +39,8 @@ the `wikiknit.toml` in or above that folder that names it as its vault, else def
 
 ```toml
 # wikiknit.toml
-vault = "notes"                 # vault folder, relative to this file and inside its folder (default ".")
+vault = "notes"                 # vault folder: a relative path inside this file's folder (default ".");
+                                # it may be a symlink, but not to /, your home, or a folder above this one
 link_style = "full-path"        # or "shortest" (Obsidian's default; resolution is best-effort)
 ignore = ["Templates/"]         # folders not checked (links to notes there still resolve)
 hubs = ["INDEX"]                # index notes: not mention targets, left out of graph components
@@ -129,7 +130,9 @@ This repo is also a Claude Code plugin marketplace. The plugin adds:
 - **PreToolUse hook on Bash**: a `git commit` in the vault's repository while changed notes lack a link
   pass is held, with the list of notes and a pointer to the skill. It parses the command: commits
   behind `if`/`for`/`&&`, wrappers (`sudo`, `timeout`, `xargs`, `env`), `bash -c`, `eval`, `$(...)`, and
-  git aliases that run `commit` are caught; text in quotes, heredocs, and comments is not a commit.
+  git aliases that run `commit` (from git config or `-c alias.*`) are caught. When it cannot tell (config
+  from `GIT_CONFIG_*`, an external `git-<name>` program), it holds. Text in quotes, quoted heredocs, and
+  comments is not a commit.
 - **Stop hook**: if changed notes sit unlinked for a full turn without further edits, one reminder.
 - **`link` skill**: the link pass itself. The agent reads the catalog, decides which notes each changed
   note is about (by meaning, using what it knows about the task), adds links both ways, adds missing

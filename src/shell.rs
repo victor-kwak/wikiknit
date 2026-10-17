@@ -15,6 +15,11 @@ pub struct GitCall {
     pub dirs: Vec<String>,
     /// The subcommand (`commit`, `add`, or an alias such as `ci`).
     pub subcommand: String,
+    /// Aliases defined on the command line: `git -c alias.ci=commit ci`.
+    pub inline_aliases: Vec<(String, String)>,
+    /// Git config may come from the environment (`GIT_CONFIG_*`, `--config-env`), so an
+    /// alias cannot be looked up.
+    pub config_from_env: bool,
 }
 
 /// Every git invocation the command would run.
@@ -54,6 +59,8 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
             .split_first()
             .is_some_and(|(p, args)| SHELLS.contains(&program_name(p)) && shell_reads_stdin(args))
     };
+    // `export GIT_CONFIG_COUNT=...` (or a bare assignment) earlier in the command.
+    let mut env_config = false;
     for item in tokenize(command) {
         match item {
             Item::Pipe => {
@@ -94,6 +101,16 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
             Item::Cmd(words) => {
                 commands.push(words.clone());
                 piped.push(false);
+                let sets_git_config = words
+                    .iter()
+                    .any(|w| w.starts_with("GIT_CONFIG") && w.contains('='));
+                let first = words.first().map(String::as_str);
+                if sets_git_config
+                    && (matches!(first, Some("export" | "declare" | "typeset" | "readonly"))
+                        || words.iter().all(|w| w.contains('=')))
+                {
+                    env_config = true;
+                }
                 let words = strip_prefixes(&words);
                 let Some((program, args)) = words.split_first() else {
                     continue;
@@ -118,7 +135,7 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
                         collect(&args.join(" "), &mut inner, out, depth + 1);
                     }
                     "git" => {
-                        if let Some(call) = parse_git(args, cds) {
+                        if let Some(call) = parse_git(args, cds, env_config || sets_git_config) {
                             out.push(call);
                         }
                     }
@@ -191,13 +208,28 @@ fn shell_reads_stdin(args: &[String]) -> bool {
     true
 }
 
-fn parse_git(args: &[String], cds: &[String]) -> Option<GitCall> {
+fn parse_git(args: &[String], cds: &[String], config_from_env: bool) -> Option<GitCall> {
     let mut dirs = cds.to_vec();
+    let mut inline_aliases = Vec::new();
+    let mut config_from_env = config_from_env;
     let mut it = args.iter();
     while let Some(t) = it.next() {
         match t.as_str() {
             "-C" | "--work-tree" | "--git-dir" => dirs.push(it.next()?.clone()),
-            "-c" | "--namespace" | "--exec-path" | "--config-env" => {
+            "-c" => {
+                let kv = it.next()?;
+                if let Some((k, v)) = kv.split_once('=')
+                    && let Some(name) = k.strip_prefix("alias.")
+                {
+                    inline_aliases.push((name.to_string(), v.to_string()));
+                }
+            }
+            "--config-env" => {
+                it.next();
+                config_from_env = true;
+            }
+            s if s.starts_with("--config-env=") => config_from_env = true,
+            "--namespace" | "--exec-path" => {
                 it.next();
             }
             s if s.starts_with("--work-tree=") => {
@@ -209,6 +241,8 @@ fn parse_git(args: &[String], cds: &[String]) -> Option<GitCall> {
                 return Some(GitCall {
                     dirs,
                     subcommand: sub.to_string(),
+                    inline_aliases,
+                    config_from_env,
                 });
             }
         }
@@ -817,5 +851,14 @@ mod tests {
         let calls = git_calls("git ci -m x");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].subcommand, "ci");
+        let inline = git_calls("git -c alias.x=commit x");
+        assert_eq!(
+            inline[0].inline_aliases,
+            vec![("x".into(), "commit".into())]
+        );
+        assert!(!inline[0].config_from_env);
+        assert!(git_calls("GIT_CONFIG_COUNT=1 git x")[0].config_from_env);
+        assert!(git_calls("export GIT_CONFIG_COUNT=1; git x")[0].config_from_env);
+        assert!(git_calls("git --config-env=alias.x=V x")[0].config_from_env);
     }
 }

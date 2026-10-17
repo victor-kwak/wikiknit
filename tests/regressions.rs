@@ -597,3 +597,76 @@ fn guessing_the_session_refuses_when_several_are_active() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("several sessions"));
 }
+
+#[test]
+fn inline_env_and_external_aliases_are_held() {
+    let v = git_vault();
+    let state = TempDir::new().unwrap();
+    let p = v.path();
+    hook(
+        p,
+        state.path(),
+        "session-start",
+        &json!({"session_id": "s", "cwd": p}),
+    );
+    fs::write(p.join("a.md"), "# a\nedited [[b]]\n").unwrap();
+    for command in [
+        "git -c alias.x=commit x -m y",
+        "git -c 'alias.x=!git commit -m y' x",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=commit git x",
+        "export GIT_CONFIG_COUNT=1; git x",
+        "git --config-env=alias.x=CMD x",
+    ] {
+        let out = hook(
+            p,
+            state.path(),
+            "pre-commit",
+            &commit_input(p, "s", command),
+        );
+        assert_eq!(out.status.code(), Some(2), "not held: {command}");
+    }
+    // An external `git-<name>` program may commit: held.
+    let bin = TempDir::new().unwrap();
+    let tool = bin.path().join("git-absorbx");
+    fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let out = wk(p, state.path())
+        .env("PATH", &path)
+        .args(["hook", "pre-commit"])
+        .write_stdin(commit_input(p, "s", "git absorbx").to_string())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "external git command not held");
+    // Built-in read-only commands and unknown names with no alias or program are not commits.
+    for command in [
+        "git cat-file -t HEAD",
+        "git for-each-ref",
+        "git nosuchthing",
+    ] {
+        let out = hook(
+            p,
+            state.path(),
+            "pre-commit",
+            &commit_input(p, "s", command),
+        );
+        assert_eq!(out.status.code(), Some(0), "held: {command}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn vault_symlink_to_a_folder_above_the_config_is_rejected() {
+    let root = TempDir::new().unwrap();
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    std::os::unix::fs::symlink(root.path(), repo.join("notes")).unwrap();
+    fs::write(repo.join("wikiknit.toml"), "vault = \"notes\"\n").unwrap();
+    let state = TempDir::new().unwrap();
+    let out = wk(&repo, state.path()).arg("check").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("folder above the config"));
+}

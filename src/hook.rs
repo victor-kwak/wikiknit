@@ -128,7 +128,7 @@ fn pre_commit(config: Config, session: &str, input: &Input) -> Result<Outcome, E
             .iter()
             .fold(base_dir.clone(), |acc, d| expand_dir(&acc, d));
         let alias_dir = if dir.is_dir() { &dir } else { &base_dir };
-        if !is_commit(&c.subcommand, alias_dir, 0) {
+        if !is_commit(c, &c.subcommand, alias_dir, 0) {
             return false;
         }
         // Unknown repo (dir missing, not a repo): hold to be safe.
@@ -239,27 +239,62 @@ const NOT_COMMIT: &[&str] = &[
     "worktree",
 ];
 
-/// `commit`, or a git alias that runs it (`ci = commit -v`, `save = !git add -A && git commit`).
-fn is_commit(subcommand: &str, dir: &Path, depth: usize) -> bool {
+/// `commit`, or something that may run it: an alias (from `-c alias.*`, or git config),
+/// or an external `git-<name>` command. Fails closed when it cannot tell (config from the
+/// environment, an external command).
+fn is_commit(call: &shell::GitCall, subcommand: &str, dir: &Path, depth: usize) -> bool {
     if subcommand == "commit" {
         return true;
     }
-    if depth > 3 || NOT_COMMIT.contains(&subcommand) {
+    if depth > 3 || NOT_COMMIT.contains(&subcommand) || is_builtin(subcommand) {
         return false;
     }
-    let Some(alias) = git_output(dir, &["config", "--get", &format!("alias.{subcommand}")]) else {
-        return false;
+    let alias = call
+        .inline_aliases
+        .iter()
+        .find(|(name, _)| name == subcommand)
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            if call.config_from_env {
+                None
+            } else {
+                git_output(dir, &["config", "--get", &format!("alias.{subcommand}")])
+            }
+        });
+    let Some(alias) = alias else {
+        // No alias we can see: hold if the config is out of view, or if an external
+        // `git-<name>` program would run (it may commit).
+        return call.config_from_env || external_git_command(subcommand);
     };
     let alias = alias.trim();
     if let Some(script) = alias.strip_prefix('!') {
         return shell::git_calls(script)
             .iter()
-            .any(|c| is_commit(&c.subcommand, dir, depth + 1));
+            .any(|c| is_commit(c, &c.subcommand, dir, depth + 1));
     }
     alias
         .split_whitespace()
         .next()
-        .is_some_and(|first| is_commit(first, dir, depth + 1))
+        .is_some_and(|first| is_commit(call, first, dir, depth + 1))
+}
+
+/// Git's built-in commands (other than `commit`), from `git --list-cmds=builtins`.
+fn is_builtin(subcommand: &str) -> bool {
+    static BUILTINS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        git_output(Path::new("."), &["--list-cmds=builtins"])
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    });
+    subcommand != "commit" && BUILTINS.iter().any(|b| b == subcommand)
+}
+
+/// An executable `git-<name>` on `PATH` (git runs it for `git <name>`).
+fn external_git_command(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let file = format!("git-{name}");
+    std::env::split_paths(&path).any(|dir| dir.join(&file).is_file())
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Option<String> {

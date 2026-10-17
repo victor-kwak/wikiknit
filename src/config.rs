@@ -168,6 +168,23 @@ impl Config {
         }
         let vault = base.join(&raw.vault);
         let vault = vault.canonicalize().map_err(|e| Error::io(&vault, e))?;
+        // A symlinked vault folder is fine, but not one that resolves to `/`, the home
+        // directory, or a folder above the config (a cloned repo could plant such a link).
+        let base_abs = base.canonicalize().map_err(|e| Error::io(base, e))?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let too_broad = vault.parent().is_none()
+            || home.is_some_and(|h| h.canonicalize().is_ok_and(|h| h == vault))
+            || (vault != base_abs && base_abs.starts_with(&vault));
+        if too_broad {
+            return Err(Error::Config {
+                path: path.to_path_buf(),
+                message: format!(
+                    "vault resolves to {}, which is the filesystem root, the home directory, \
+                     or a folder above the config",
+                    vault.display()
+                ),
+            });
+        }
         let bad = |message: String| Error::Config {
             path: path.to_path_buf(),
             message,
