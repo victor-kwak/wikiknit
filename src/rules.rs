@@ -16,9 +16,11 @@ pub const RULES: &[(&str, Severity)] = &[
     ("frontmatter-invalid", Severity::Error),
     ("frontmatter-unquoted-link", Severity::Error),
     ("link-in-code", Severity::Warn),
+    ("link-in-html", Severity::Warn),
     ("no-outbound-links", Severity::Error),
     ("missing-required-link", Severity::Error),
     ("duplicate-alias", Severity::Error),
+    ("file-not-utf8", Severity::Warn),
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +76,14 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             continue;
         }
         let p = &note.parsed;
+        if note.not_utf8 {
+            sink.push(
+                "file-not-utf8",
+                &note.id,
+                1,
+                "file is not valid UTF-8; read with replacement characters".into(),
+            );
+        }
         if let Some(err) = &p.frontmatter.error {
             sink.push(
                 "frontmatter-invalid",
@@ -106,6 +116,17 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 &note.id,
                 note.line_of(l.span.start),
                 format!("[[{}]] is inside code, so it is not a link", l.target),
+            );
+        }
+        for l in &p.html_links {
+            sink.push(
+                "link-in-html",
+                &note.id,
+                note.line_of(l.span.start),
+                format!(
+                    "[[{}]] is inside raw HTML, so it is not rendered as a link",
+                    l.target
+                ),
             );
         }
         let resolved = vault.resolve_links(note);

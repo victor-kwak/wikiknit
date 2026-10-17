@@ -1,7 +1,8 @@
 //! Claude Code hooks: JSON on stdin, exit code 2 + stderr to hand Claude a reason.
 //!
-//! - `session-start`: record the session baseline; export `WIKIKNIT_SESSION` via `CLAUDE_ENV_FILE`.
-//! - `pre-commit` (PreToolUse on Bash): hold a `git commit` while changed notes lack a link pass.
+//! - `session-start`: record the session start; export `WIKIKNIT_SESSION` via `CLAUDE_ENV_FILE`.
+//! - `pre-commit` (PreToolUse on Bash): hold a `git commit` in the vault's repo while notes
+//!   changed in this session lack a link pass.
 //! - `stop`: backup nudge once a change set has sat untouched for a whole turn.
 
 use std::collections::BTreeSet;
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::state::{self, Baseline};
+use crate::state::{self, Store};
 use crate::vault::Vault;
 use crate::{Error, rules, shell};
 
@@ -34,6 +35,9 @@ pub struct Input {
     pub stop_hook_active: bool,
     #[serde(default)]
     pub tool_input: Option<Value>,
+    /// SessionStart: `startup`, `resume`, `clear`, or `compact`.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// What the hook process should do.
@@ -62,94 +66,24 @@ pub fn run(event: Event, input: &Input) -> Result<Outcome, Error> {
     let config = Config::load(&config_path)?;
     let session = input.session_id.as_str();
     match event {
-        Event::SessionStart => session_start(config, session),
-        Event::PreCommit => {
-            let command = input
-                .tool_input
-                .as_ref()
-                .and_then(|t| t.get("command"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let commits = shell::git_commits(command);
-            if commits.is_empty() {
-                return Ok(Outcome::Allow);
-            }
-            // Only commits in the repo that holds the vault can carry vault changes.
-            let Some(vault_repo) = git_toplevel(&config.vault) else {
-                return Ok(Outcome::Allow);
-            };
-            let base_dir = input
-                .cwd
-                .clone()
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_default();
-            let touches_vault = commits.iter().any(|c| {
-                let dir = c
-                    .dirs
-                    .iter()
-                    .fold(base_dir.clone(), |acc, d| expand_dir(&acc, d));
-                // Unknown repo (dir missing, not a repo): hold to be safe.
-                git_toplevel(&dir).is_none_or(|top| top == vault_repo)
-            });
-            if !touches_vault {
-                return Ok(Outcome::Allow);
-            }
-            let vault = Vault::load(config)?;
-            let Some(base) = load_or_create(&vault, session)? else {
-                return Ok(Outcome::Allow);
-            };
-            let changed = base.changed(&vault);
-            if changed.is_empty() {
-                return Ok(Outcome::Allow);
-            }
-            Ok(Outcome::Block(format!(
-                "Commit held by wikiknit. {}",
-                describe(&vault, &changed, session)
-            )))
+        Event::SessionStart => {
+            session_start(config, session, input.source.as_deref() == Some("clear"))
         }
+        Event::PreCommit => pre_commit(config, session, input),
         Event::Stop => {
             if input.stop_hook_active {
                 return Ok(Outcome::Allow);
             }
-            let vault = Vault::load(config)?;
-            let Some(mut base) = load_or_create(&vault, session)? else {
-                return Ok(Outcome::Allow);
-            };
-            let digest = base.change_digest(&vault);
-            let outcome = match (&digest, &base.last_stop_digest) {
-                (None, _) => {
-                    base.last_stop_digest = None;
-                    Outcome::Allow
-                }
-                (Some(d), Some(last)) if last == d => {
-                    // Settled for a whole turn: nudge once.
-                    base.last_stop_digest = Some(format!("nudged:{d}"));
-                    Outcome::Block(format!(
-                        "wikiknit: these vault notes have not changed for a full turn. {}",
-                        describe(&vault, &base.changed(&vault), session)
-                    ))
-                }
-                (Some(d), Some(last)) if last.strip_prefix("nudged:") == Some(d.as_str()) => {
-                    Outcome::Allow
-                }
-                (Some(d), _) => {
-                    base.last_stop_digest = Some(d.clone());
-                    Outcome::Allow
-                }
-            };
-            base.save(session)?;
-            Ok(outcome)
+            stop(config, session)
         }
     }
 }
 
-fn session_start(config: Config, session: &str) -> Result<Outcome, Error> {
-    let root = config.vault.clone();
-    state::prune(&root);
-    if Baseline::load(&root, session)?.is_none() {
-        let vault = Vault::load(config)?;
-        Baseline::snapshot(&vault).save(session)?;
-    }
+fn session_start(config: Config, session: &str, after_clear: bool) -> Result<Outcome, Error> {
+    let store = Store::open(&config.vault)?;
+    store.prune();
+    let vault = Vault::load(config)?;
+    store.start_session(session, &state::current_hashes(&vault), after_clear)?;
     if let Some(env_file) = std::env::var_os("CLAUDE_ENV_FILE").filter(|f| !f.is_empty()) {
         let env_file = Path::new(&env_file);
         let mut f = std::fs::OpenOptions::new()
@@ -168,19 +102,183 @@ fn session_start(config: Config, session: &str) -> Result<Outcome, Error> {
     Ok(Outcome::Allow)
 }
 
-/// `git rev-parse --show-toplevel` for `dir`, canonicalized.
-fn git_toplevel(dir: &Path) -> Option<PathBuf> {
+fn pre_commit(config: Config, session: &str, input: &Input) -> Result<Outcome, Error> {
+    let command = input
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let calls = shell::git_calls(command);
+    if calls.is_empty() {
+        return Ok(Outcome::Allow);
+    }
+    // Only commits in the repo that holds the vault can carry vault changes.
+    let Some(vault_repo) = git_toplevel(&config.vault) else {
+        return Ok(Outcome::Allow);
+    };
+    let base_dir = input
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let touches_vault = calls.iter().any(|c| {
+        let dir = c
+            .dirs
+            .iter()
+            .fold(base_dir.clone(), |acc, d| expand_dir(&acc, d));
+        let alias_dir = if dir.is_dir() { &dir } else { &base_dir };
+        if !is_commit(&c.subcommand, alias_dir, 0) {
+            return false;
+        }
+        // Unknown repo (dir missing, not a repo): hold to be safe.
+        git_toplevel(&dir).is_none_or(|top| top == vault_repo)
+    });
+    if !touches_vault {
+        return Ok(Outcome::Allow);
+    }
+    let vault = Vault::load(config)?;
+    let store = Store::open(&vault.config.vault)?;
+    let now = state::current_hashes(&vault);
+    // No record of this session's start (plugin added mid-session, state lost): start it with
+    // every pending note counted as its own, so the gate fails closed.
+    let s = store.start_session(session, &now, true)?;
+    let changed = store.changed(&s, &now)?;
+    if changed.is_empty() {
+        return Ok(Outcome::Allow);
+    }
+    Ok(Outcome::Block(format!(
+        "Commit held by wikiknit. {}",
+        describe(&vault, &changed, session)
+    )))
+}
+
+fn stop(config: Config, session: &str) -> Result<Outcome, Error> {
+    let vault = Vault::load(config)?;
+    let store = Store::open(&vault.config.vault)?;
+    let now = state::current_hashes(&vault);
+    let mut s = store.start_session(session, &now, true)?;
+    let changed = store.changed(&s, &now)?;
+    let digest = state::digest(&changed, &now);
+    let outcome = match (&digest, &s.last_stop_digest) {
+        (None, _) => {
+            s.last_stop_digest = None;
+            Outcome::Allow
+        }
+        (Some(d), Some(last)) if last == d => {
+            // Settled for a whole turn: nudge once.
+            s.last_stop_digest = Some(format!("nudged:{d}"));
+            Outcome::Block(format!(
+                "wikiknit: these vault notes have not changed for a full turn. {}",
+                describe(&vault, &changed, session)
+            ))
+        }
+        (Some(d), Some(last)) if last.strip_prefix("nudged:") == Some(d.as_str()) => Outcome::Allow,
+        (Some(d), _) => {
+            s.last_stop_digest = Some(d.clone());
+            Outcome::Allow
+        }
+    };
+    store.save_session(session, &s)?;
+    Ok(outcome)
+}
+
+/// Git's own subcommands that are not `commit`; anything else may be an alias.
+const NOT_COMMIT: &[&str] = &[
+    "add",
+    "am",
+    "apply",
+    "archive",
+    "bisect",
+    "blame",
+    "branch",
+    "bundle",
+    "checkout",
+    "cherry",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "config",
+    "describe",
+    "diff",
+    "fetch",
+    "format-patch",
+    "fsck",
+    "gc",
+    "grep",
+    "help",
+    "init",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "ls-tree",
+    "merge",
+    "mv",
+    "notes",
+    "pull",
+    "push",
+    "range-diff",
+    "rebase",
+    "reflog",
+    "remote",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "sparse-checkout",
+    "stash",
+    "status",
+    "submodule",
+    "switch",
+    "tag",
+    "version",
+    "worktree",
+];
+
+/// `commit`, or a git alias that runs it (`ci = commit -v`, `save = !git add -A && git commit`).
+fn is_commit(subcommand: &str, dir: &Path, depth: usize) -> bool {
+    if subcommand == "commit" {
+        return true;
+    }
+    if depth > 3 || NOT_COMMIT.contains(&subcommand) {
+        return false;
+    }
+    let Some(alias) = git_output(dir, &["config", "--get", &format!("alias.{subcommand}")]) else {
+        return false;
+    };
+    let alias = alias.trim();
+    if let Some(script) = alias.strip_prefix('!') {
+        return shell::git_calls(script)
+            .iter()
+            .any(|c| is_commit(&c.subcommand, dir, depth + 1));
+    }
+    alias
+        .split_whitespace()
+        .next()
+        .is_some_and(|first| is_commit(first, dir, depth + 1))
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
+        .args(args)
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let top = String::from_utf8(out.stdout).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8(out.stdout).ok())
+        .flatten()
+}
+
+/// `git rev-parse --show-toplevel` for `dir`, canonicalized.
+fn git_toplevel(dir: &Path) -> Option<PathBuf> {
+    let top = git_output(dir, &["rev-parse", "--show-toplevel"])?;
     PathBuf::from(top.trim()).canonicalize().ok()
 }
 
@@ -196,43 +294,34 @@ fn expand_dir(base: &Path, d: &str) -> PathBuf {
     base.join(d)
 }
 
-/// The session baseline; created now (and `None` returned) if the session has none,
-/// since then there is no record of what changed.
-fn load_or_create(vault: &Vault, session: &str) -> Result<Option<Baseline>, Error> {
-    if let Some(b) = Baseline::load(&vault.config.vault, session)? {
-        return Ok(Some(b));
-    }
-    Baseline::snapshot(vault).save(session)?;
-    Ok(None)
-}
-
 fn describe(vault: &Vault, changed: &BTreeSet<String>, session: &str) -> String {
+    use std::fmt::Write as _;
     let mut msg = format!(
         "{} vault note(s) changed in this session and have had no link pass:\n",
         changed.len()
     );
     for id in changed.iter().take(MAX_LISTED) {
-        msg.push_str(&format!("  - {id}\n"));
+        let _ = writeln!(msg, "  - {id}");
     }
     if changed.len() > MAX_LISTED {
-        msg.push_str(&format!(
-            "  - ... and {} more\n",
-            changed.len() - MAX_LISTED
-        ));
+        let _ = writeln!(msg, "  - ... and {} more", changed.len() - MAX_LISTED);
     }
     let errors = rules::check(vault, Some(changed))
         .into_iter()
         .filter(rules::Finding::is_error)
         .count();
     if errors > 0 {
-        msg.push_str(&format!(
-            "`wikiknit check --changed` reports {errors} rule error(s) in them.\n"
-        ));
+        let _ = writeln!(
+            msg,
+            "`wikiknit check --changed --session {session}` reports {errors} rule error(s) in them."
+        );
     }
-    msg.push_str(&format!(
-        "The wikiknit `link` skill handles this: it links these notes to related notes in both \
-         directions, then records the pass with `wikiknit mark --session {session}` (run it as \
-         its own command, before the commit)."
-    ));
+    let _ = write!(
+        msg,
+        "Some may have been changed by another session or editor; any session can do their \
+         link pass. The wikiknit `link` skill handles this: it links these notes to related \
+         notes in both directions, then records the pass with `wikiknit mark --session \
+         {session}` (run it as its own command, before the commit)."
+    );
     msg
 }

@@ -140,6 +140,32 @@ impl Config {
             message: e.to_string(),
         })?;
         let base = path.parent().unwrap_or(Path::new("."));
+        // The vault must be named inside the config's folder (a relative path that does not
+        // climb out): a cloned repo's config must not point the hooks at `/` or the home
+        // directory. The check is on the path as written, so a vault folder that is itself a
+        // symlink still works.
+        let mut depth = 0i32;
+        let inside = raw.vault.components().all(|c| match c {
+            std::path::Component::Normal(_) => {
+                depth += 1;
+                true
+            }
+            std::path::Component::CurDir => true,
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                depth >= 0
+            }
+            _ => false, // absolute path or drive prefix
+        });
+        if !inside {
+            return Err(Error::Config {
+                path: path.to_path_buf(),
+                message: format!(
+                    "vault `{}` is outside the config's folder; use a relative path inside it",
+                    raw.vault.display()
+                ),
+            });
+        }
         let vault = base.join(&raw.vault);
         let vault = vault.canonicalize().map_err(|e| Error::io(&vault, e))?;
         let bad = |message: String| Error::Config {

@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use wikiknit::config::{CONFIG_FILE, Config};
 use wikiknit::hook::{self, Outcome};
-use wikiknit::state::{self, Baseline};
+use wikiknit::state::{self, Store};
 use wikiknit::{Vault, catalog, graph, mentions, rules};
 
 /// `println!` that exits quietly when stdout is closed (`wikiknit ... | head`).
@@ -51,10 +51,10 @@ enum Format {
 
 #[derive(Debug, Args)]
 struct Select {
-    /// Only notes changed since the session baseline and not yet marked.
+    /// Only notes changed in the session that still need a link pass.
     #[arg(long)]
     changed: bool,
-    /// Session id (default: $WIKIKNIT_SESSION, else the newest baseline).
+    /// Session id (default: $WIKIKNIT_SESSION, else the one active session).
     #[arg(long)]
     session: Option<String>,
     /// Notes to include (ids, vault paths, or file paths). Default: every note.
@@ -71,19 +71,25 @@ enum Command {
     Catalog,
     /// Link graph summary: isolated notes and components, hub notes excluded.
     Graph,
-    /// List notes changed since the session baseline and not yet marked.
+    /// List notes changed in the session that still need a link pass.
     Changed {
         #[arg(long)]
         session: Option<String>,
+        /// Every note in the vault that needs a link pass, from any session or editor.
+        #[arg(long)]
+        all: bool,
     },
-    /// Record changed notes as linked (after a link pass).
+    /// Record a link pass: the notes' current content counts as linked, for every session.
     Mark {
         #[arg(long)]
         session: Option<String>,
-        /// Notes to mark. Default: every changed note.
+        /// Mark every pending note in the vault, not only this session's.
+        #[arg(long)]
+        all: bool,
+        /// Notes to mark. Default: the session's changed notes.
         paths: Vec<String>,
     },
-    /// Create (or with --reset, replace) the session baseline.
+    /// Start a session record (hooks do this); --reset restarts it from the vault as it is now.
     Baseline {
         #[arg(long)]
         session: String,
@@ -143,13 +149,19 @@ fn load_config(cli: &Cli) -> Result<Config> {
         return Ok(Config::load(path)?);
     }
     if let Some(vault) = &cli.vault {
-        let file = vault.join(CONFIG_FILE);
-        if file.is_file() {
-            return Ok(Config::load(&file)?);
-        }
         let root = vault
             .canonicalize()
             .with_context(|| format!("vault {}", vault.display()))?;
+        // A wikiknit.toml in the vault, or above it naming this vault.
+        for dir in root.ancestors() {
+            let file = dir.join(CONFIG_FILE);
+            if file.is_file()
+                && let Ok(cfg) = Config::load(&file)
+                && cfg.vault == root
+            {
+                return Ok(cfg);
+            }
+        }
         return Ok(Config::for_vault(root));
     }
     let cwd = std::env::current_dir()?;
@@ -162,12 +174,25 @@ fn load_config(cli: &Cli) -> Result<Config> {
     }
 }
 
+/// The session's id and its changed notes (pending and changed while it ran).
+fn session_changed(vault: &Vault, flag: Option<&str>) -> Result<(Store, String, BTreeSet<String>)> {
+    let store = Store::open(&vault.config.vault)?;
+    let guessed =
+        flag.is_none() && std::env::var_os(state::SESSION_ENV).is_none_or(|v| v.is_empty());
+    let session = store.resolve_session(flag)?;
+    if guessed {
+        eprintln!("wikiknit: session {session} (the only active one; pass --session to choose)");
+    }
+    let s = store
+        .load_session(&session)?
+        .with_context(|| format!("no record of session `{session}`"))?;
+    let changed = store.changed(&s, &state::current_hashes(vault))?;
+    Ok((store, session, changed))
+}
+
 fn selection(vault: &Vault, sel: &Select) -> Result<Option<BTreeSet<String>>> {
     if sel.changed {
-        let session = state::resolve_session(&vault.config.vault, sel.session.as_deref())?;
-        let base = Baseline::load(&vault.config.vault, &session)?
-            .with_context(|| format!("no baseline for session `{session}`"))?;
-        return Ok(Some(base.changed(vault)));
+        return Ok(Some(session_changed(vault, sel.session.as_deref())?.2));
     }
     if sel.paths.is_empty() {
         return Ok(None);
@@ -180,9 +205,13 @@ fn ids_for(vault: &Vault, paths: &[String]) -> Result<BTreeSet<String>> {
     paths
         .iter()
         .map(|p| {
-            vault
-                .id_for_arg(p, &cwd)
-                .with_context(|| format!("`{p}` is not a note in the vault"))
+            vault.id_for_arg(p, &cwd).with_context(|| {
+                if vault.is_ignored_arg(p, &cwd) {
+                    format!("`{p}` is in a folder the config ignores")
+                } else {
+                    format!("`{p}` is not a note in the vault")
+                }
+            })
         })
         .collect()
 }
@@ -219,7 +248,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 let notes: BTreeSet<_> = findings.iter().map(|f| &f.note).collect();
                 let checked = selected.as_ref().map_or(vault.notes.len(), BTreeSet::len);
                 eprintln!(
-                    "{errors} error(s), {} warning(s) in {} of {checked} note(s) checked",
+                    "{checked} note(s) checked: {errors} error(s), {} warning(s), in {} note(s)",
                     findings.len() - errors,
                     notes.len()
                 );
@@ -271,7 +300,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     } else {
                         format!(" {{{}}}", e.aliases.join(", "))
                     };
-                    out!("{}{kind}{hub}{aliases}: {}", e.id, e.summary);
+                    let title = e
+                        .title
+                        .as_deref()
+                        .map(|t| format!("{t} — "))
+                        .unwrap_or_default();
+                    out!("{}{kind}{hub}{aliases}: {title}{}", e.id, e.summary);
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -302,11 +336,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Changed { session } => {
-            let session = state::resolve_session(&vault.config.vault, session.as_deref())?;
-            let base = Baseline::load(&vault.config.vault, &session)?
-                .with_context(|| format!("no baseline for session `{session}`"))?;
-            let changed = base.changed(&vault);
+        Command::Changed { session, all } => {
+            let changed = if *all {
+                Store::open(&vault.config.vault)?.pending(&state::current_hashes(&vault))?
+            } else {
+                session_changed(&vault, session.as_deref())?.2
+            };
             if json {
                 print_json(&changed);
             } else {
@@ -314,17 +349,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Mark { session, paths } => {
-            let session = state::resolve_session(&vault.config.vault, session.as_deref())?;
-            let mut base = Baseline::load(&vault.config.vault, &session)?
-                .with_context(|| format!("no baseline for session `{session}`"))?;
-            let only = if paths.is_empty() {
-                None
+        Command::Mark {
+            session,
+            all,
+            paths,
+        } => {
+            let now = state::current_hashes(&vault);
+            let (store, ids) = if *all {
+                let store = Store::open(&vault.config.vault)?;
+                let pending = store.pending(&now)?;
+                (store, pending)
+            } else if !paths.is_empty() {
+                (Store::open(&vault.config.vault)?, ids_for(&vault, paths)?)
             } else {
-                Some(ids_for(&vault, paths)?)
+                let (store, _, changed) = session_changed(&vault, session.as_deref())?;
+                (store, changed)
             };
-            let marked = base.mark(&vault, only.as_ref());
-            base.save(&session)?;
+            let marked = store.mark(&ids, &now)?;
             if json {
                 print_json(&marked);
             } else {
@@ -333,15 +374,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Baseline { session, reset } => {
-            let root = vault.config.vault.clone();
-            if !reset && Baseline::load(&root, session)?.is_some() {
-                eprintln!("baseline for `{session}` already exists (use --reset to replace)");
+            let store = Store::open(&vault.config.vault)?;
+            if *reset {
+                let _ = std::fs::remove_file(store.session_path(session));
+            } else if store.load_session(session)?.is_some() {
+                eprintln!("session `{session}` already started (use --reset to restart it)");
                 return Ok(ExitCode::SUCCESS);
             }
-            Baseline::snapshot(&vault).save(session)?;
+            store.start_session(session, &state::current_hashes(&vault), false)?;
             eprintln!(
-                "baseline recorded for `{session}`: {}",
-                Baseline::path(&root, session)?.display()
+                "session `{session}` started: {}",
+                store.session_path(session).display()
             );
             Ok(ExitCode::SUCCESS)
         }

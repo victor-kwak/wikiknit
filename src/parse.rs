@@ -85,6 +85,10 @@ pub struct Parsed {
     pub code_links: Vec<RawLink>,
     /// Byte ranges of code spans and blocks.
     pub code: Vec<Range<usize>>,
+    /// Wikilinks inside raw HTML (not rendered as links).
+    pub html_links: Vec<RawLink>,
+    /// Byte ranges that are not prose for mention matching: raw HTML and external links.
+    pub non_prose: Vec<Range<usize>>,
     /// Frontmatter keys holding `[[link]]` that YAML read as nested lists (unquoted).
     pub unquoted_frontmatter_links: Vec<String>,
 }
@@ -92,7 +96,11 @@ pub struct Parsed {
 #[must_use]
 pub fn parse(text: &str) -> Parsed {
     let mut out = Parsed::default();
-    let (yaml, body_start) = split_frontmatter(text);
+    // A UTF-8 byte order mark must not hide the frontmatter.
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let (yaml, body_start) = split_frontmatter(&text[bom..]);
+    let yaml = yaml.map(|r| r.start + bom..r.end + bom);
+    let body_start = body_start + bom;
     out.body_start = body_start;
     if let Some(range) = yaml {
         let src = &text[range.clone()];
@@ -211,8 +219,17 @@ pub fn link_target(raw: &str) -> String {
         .to_string()
 }
 
+/// URLs, any `scheme:` (`mailto:`, `tel:`, `obsidian:`), anchors, and empty targets.
 fn is_external(url: &str) -> bool {
-    url.contains("://") || url.starts_with("mailto:") || url.starts_with('#') || url.is_empty()
+    let scheme_len = url.find(':').filter(|&i| {
+        let s = &url[..i];
+        // One letter is a Windows drive (`C:`), not a scheme.
+        s.len() > 1
+            && s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    scheme_len.is_some() || url.starts_with('#') || url.is_empty()
 }
 
 fn percent_decode(s: &str) -> String {
@@ -244,6 +261,7 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     let mut code_block: Option<usize> = None;
+    let mut html: Vec<Range<usize>> = Vec::new();
     for (ev, range) in Parser::new_ext(body, opts).into_offset_iter() {
         let abs = body_start + range.start..body_start + range.end;
         match ev {
@@ -254,6 +272,7 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
                 }
             }
             Event::Code(_) => out.code.push(abs),
+            Event::Html(_) | Event::InlineHtml(_) => html.push(abs),
             Event::Start(Tag::Link {
                 link_type,
                 dest_url,
@@ -271,6 +290,22 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
             _ => {}
         }
     }
+    for range in &html {
+        for m in WIKILINK.captures_iter(&text[range.clone()]) {
+            let whole = m.get(0).expect("match");
+            out.html_links.push(RawLink {
+                kind: if &m[1] == "!" {
+                    LinkKind::Embed
+                } else {
+                    LinkKind::Wiki
+                },
+                target: link_target(&m[2]),
+                span: range.start + whole.start()..range.start + whole.end(),
+                location: Location::Body,
+            });
+        }
+    }
+    out.non_prose.extend(html);
     for range in out.code.clone() {
         for m in WIKILINK.captures_iter(&text[range.clone()]) {
             let whole = m.get(0).expect("match");
@@ -311,7 +346,8 @@ fn push_link(out: &mut Parsed, link_type: LinkType, dest: &str, span: Range<usiz
                 location: Location::Body,
             });
         }
-        _ => {}
+        // External links and images: their text is not prose that names a note.
+        _ => out.non_prose.push(span),
     }
 }
 
@@ -348,6 +384,32 @@ mod tests {
     fn invalid_frontmatter_is_reported() {
         let p = parse("---\nrelated: [[A]], [[B]]\n---\nbody\n");
         assert!(p.frontmatter.error.is_some());
+    }
+
+    #[test]
+    fn bom_does_not_hide_frontmatter() {
+        let p = parse("\u{feff}---\naliases: [Bommy]\n---\nbody [[x]]\n");
+        assert_eq!(p.frontmatter.aliases(), vec!["Bommy".to_string()]);
+        assert_eq!(p.links.len(), 1);
+    }
+
+    #[test]
+    fn schemes_are_external() {
+        let p = parse(
+            "[call](tel:123) [m](mailto:a@b.c) [o](obsidian://open?x) [n](note.md) [w](C:/x.md)\n",
+        );
+        let targets: Vec<_> = p.links.iter().map(|l| l.target.as_str()).collect();
+        assert_eq!(targets, ["note.md", "C:/x.md"]);
+    }
+
+    #[test]
+    fn html_links_and_non_prose() {
+        let p = parse(
+            "<div>\n[[Target]]\n</div>\n\n[learn python](https://python.org) <span title=\"x\">y</span>\n",
+        );
+        assert_eq!(p.html_links.len(), 1);
+        assert!(p.links.is_empty());
+        assert!(p.non_prose.len() >= 3);
     }
 
     #[test]

@@ -1,189 +1,681 @@
-//! Just enough shell parsing to find `git commit` invocations in a Bash command,
+//! Just enough shell parsing to find the git commands a Bash command would run,
 //! and the directory each one runs in.
 //!
-//! Heredoc bodies and quoted text are data, not commands: `cat <<EOF ... git commit ... EOF`
-//! and `echo "git commit"` are not commits.
+//! Data is not a command: heredoc bodies, quoted text, comments, and arithmetic
+//! (`cat <<EOF ... git commit ... EOF`, `echo "git commit"`, `$((1<<2))`, `(( x = 1 << 2 ))`).
+//! Commands are found behind shell keywords (`if ...; then git commit; fi`), wrappers (`sudo`,
+//! `timeout`, `xargs`, `env`, ...), `bash -c '...'`, `eval`, command substitution (also inside
+//! double quotes), and heredocs fed to a shell (`bash <<EOF`). `cd` inside a subshell or
+//! substitution does not leak out of it.
 
-/// A `git ... commit` found in a command.
+/// A git invocation found in a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitCommit {
+pub struct GitCall {
     /// Directory changes before it, in order (`cd a && cd b` -> `["a", "b"]`), then `-C` values.
     pub dirs: Vec<String>,
+    /// The subcommand (`commit`, `add`, or an alias such as `ci`).
+    pub subcommand: String,
 }
 
-/// Every `git commit` the command would run.
+/// Every git invocation the command would run.
 #[must_use]
-pub fn git_commits(command: &str) -> Vec<GitCommit> {
+pub fn git_calls(command: &str) -> Vec<GitCall> {
     let mut out = Vec::new();
-    let mut cds: Vec<String> = Vec::new();
-    for words in simple_commands(&strip_heredocs(command)) {
-        let mut w = words.iter().map(String::as_str).peekable();
-        // Skip env assignments and wrappers.
-        while let Some(&t) = w.peek() {
-            let assignment = t.split_once('=').is_some_and(|(k, _)| {
-                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            });
-            if assignment || matches!(t, "sudo" | "command" | "exec" | "env" | "time" | "nice") {
-                w.next();
-            } else {
-                break;
+    let mut cds = Vec::new();
+    collect(command, &mut cds, &mut out, 0);
+    out
+}
+
+/// Every `git commit` the command would run (aliases not resolved).
+#[must_use]
+pub fn git_commits(command: &str) -> Vec<GitCall> {
+    git_calls(command)
+        .into_iter()
+        .filter(|g| g.subcommand == "commit")
+        .collect()
+}
+
+const MAX_DEPTH: usize = 6;
+const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
+
+fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    // cds length at each open subshell / substitution
+    let mut scopes: Vec<usize> = Vec::new();
+    // every simple command so far, by index (heredoc bodies refer back to their command)
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    // piped[i]: command i's output is piped into command i + 1
+    let mut piped: Vec<bool> = Vec::new();
+    let reads_stdin_shell = |words: &[String]| {
+        let words = strip_prefixes(words);
+        words
+            .split_first()
+            .is_some_and(|(p, args)| SHELLS.contains(&program_name(p)) && shell_reads_stdin(args))
+    };
+    for item in tokenize(command) {
+        match item {
+            Item::Pipe => {
+                if let Some(last) = piped.last_mut() {
+                    *last = true;
+                }
             }
-        }
-        let Some(program) = w.next() else { continue };
-        if program == "cd" || program == "pushd" {
-            if let Some(dir) = w.next() {
-                cds.push(dir.to_string());
+            Item::Open => scopes.push(cds.len()),
+            Item::Close => {
+                if let Some(n) = scopes.pop() {
+                    cds.truncate(n);
+                }
             }
-            continue;
-        }
-        if program != "git" && !program.ends_with("/git") {
-            continue;
-        }
-        let mut dirs = cds.clone();
-        while let Some(t) = w.next() {
-            match t {
-                "-C" => {
-                    if let Some(d) = w.next() {
-                        dirs.push(d.to_string());
+            Item::Sub(script) => {
+                let mut inner = cds.clone();
+                collect(&script, &mut inner, out, depth + 1);
+            }
+            Item::Body { cmd, text } => {
+                // The body is a script when its command, or a command it is piped into
+                // (`cat <<EOF | sh`), is a shell reading stdin.
+                let mut j = cmd;
+                let mut feeds_shell = false;
+                while let Some(words) = commands.get(j) {
+                    if reads_stdin_shell(words) {
+                        feeds_shell = true;
+                        break;
                     }
+                    if !piped.get(j).copied().unwrap_or(false) {
+                        break;
+                    }
+                    j += 1;
                 }
-                "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path" => {
-                    w.next();
+                if feeds_shell {
+                    let mut inner = cds.clone();
+                    collect(&text, &mut inner, out, depth + 1);
                 }
-                _ if t.starts_with("--work-tree=") => {
-                    dirs.push(t["--work-tree=".len()..].to_string());
+            }
+            Item::Cmd(words) => {
+                commands.push(words.clone());
+                piped.push(false);
+                let words = strip_prefixes(&words);
+                let Some((program, args)) = words.split_first() else {
+                    continue;
+                };
+                match program_name(program) {
+                    "cd" | "pushd" => {
+                        if let Some(dir) = args.iter().find(|a| !a.starts_with('-')) {
+                            cds.push(dir.clone());
+                        }
+                    }
+                    "popd" => {
+                        cds.pop();
+                    }
+                    name if SHELLS.contains(&name) => {
+                        if let Some(script) = shell_c_script(args) {
+                            let mut inner = cds.clone();
+                            collect(script, &mut inner, out, depth + 1);
+                        }
+                    }
+                    "eval" => {
+                        let mut inner = cds.clone();
+                        collect(&args.join(" "), &mut inner, out, depth + 1);
+                    }
+                    "git" => {
+                        if let Some(call) = parse_git(args, cds) {
+                            out.push(call);
+                        }
+                    }
+                    _ => {}
                 }
-                _ if t.starts_with('-') => {}
-                "commit" => {
-                    out.push(GitCommit { dirs });
+            }
+        }
+    }
+}
+
+fn program_name(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+/// Shell options that take a separate argument.
+fn shell_opt_takes_arg(opt: &str) -> bool {
+    matches!(opt, "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file")
+}
+
+/// The script of `bash -c SCRIPT` (also `-lc`, `-ec`, `-o pipefail -c`, `-euo pipefail -c`).
+fn shell_c_script(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if a == "--" {
+            return None;
+        }
+        if shell_opt_takes_arg(a) {
+            it.next();
+            continue;
+        }
+        if a.starts_with("--") {
+            continue;
+        }
+        if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
+            let cluster = &a[1..];
+            if cluster.contains(['o', 'O']) {
+                it.next(); // `-euo pipefail`
+            }
+            if a.starts_with('-') && cluster.contains('c') {
+                return it.next().map(String::as_str);
+            }
+            continue;
+        }
+        return None; // a script file
+    }
+    None
+}
+
+/// `bash` with only options reads its script from stdin (a heredoc).
+fn shell_reads_stdin(args: &[String]) -> bool {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if shell_opt_takes_arg(a) {
+            it.next();
+            continue;
+        }
+        if a.starts_with('-') || a.starts_with('+') {
+            if a.len() > 1 && !a.starts_with("--") && a[1..].contains('c') {
+                return false;
+            }
+            if a.len() > 1 && !a.starts_with("--") && a[1..].contains(['o', 'O']) {
+                it.next();
+            }
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn parse_git(args: &[String], cds: &[String]) -> Option<GitCall> {
+    let mut dirs = cds.to_vec();
+    let mut it = args.iter();
+    while let Some(t) = it.next() {
+        match t.as_str() {
+            "-C" | "--work-tree" | "--git-dir" => dirs.push(it.next()?.clone()),
+            "-c" | "--namespace" | "--exec-path" | "--config-env" => {
+                it.next();
+            }
+            s if s.starts_with("--work-tree=") => {
+                dirs.push(s["--work-tree=".len()..].to_string());
+            }
+            s if s.starts_with("--git-dir=") => dirs.push(s["--git-dir=".len()..].to_string()),
+            s if s.starts_with('-') => {}
+            sub => {
+                return Some(GitCall {
+                    dirs,
+                    subcommand: sub.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Options (of a wrapper) that take a separate argument.
+fn wrapper_arg_opts(wrapper: &str) -> &'static [&'static str] {
+    match wrapper {
+        "sudo" => &["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"],
+        "timeout" => &["-s", "-k", "--signal", "--kill-after"],
+        "nice" => &["-n", "--adjustment"],
+        "ionice" => &["-c", "-n", "-p", "-P", "-u"],
+        "xargs" => &[
+            "-I",
+            "-i",
+            "-n",
+            "-P",
+            "-L",
+            "-l",
+            "-d",
+            "-E",
+            "-e",
+            "-s",
+            "-a",
+            "--max-args",
+            "--max-procs",
+            "--max-lines",
+            "--max-chars",
+            "--delimiter",
+            "--arg-file",
+            "--eof",
+            "--process-slot-var",
+        ],
+        "stdbuf" => &["-i", "-o", "-e"],
+        "env" => &["-u", "-C", "-S", "--unset", "--chdir"],
+        "doas" => &["-u", "-C"],
+        _ => &[],
+    }
+}
+
+/// Drop shell keywords, env assignments, and wrapper commands (with their options)
+/// in front of the real program.
+fn strip_prefixes(words: &[String]) -> Vec<String> {
+    let mut i = 0;
+    while i < words.len() {
+        let t = words[i].as_str();
+        let assignment = t.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty()
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !k.starts_with(|c: char| c.is_ascii_digit())
+        });
+        if assignment
+            || matches!(
+                t,
+                "if" | "then"
+                    | "else"
+                    | "elif"
+                    | "do"
+                    | "while"
+                    | "until"
+                    | "{"
+                    | "}"
+                    | "!"
+                    | "time"
+                    | "coproc"
+                    | "command"
+                    | "exec"
+                    | "nohup"
+                    | "builtin"
+            )
+        {
+            i += 1;
+            continue;
+        }
+        let name = program_name(t);
+        if matches!(
+            name,
+            "sudo"
+                | "doas"
+                | "timeout"
+                | "nice"
+                | "ionice"
+                | "xargs"
+                | "stdbuf"
+                | "env"
+                | "chronic"
+        ) {
+            let arg_opts = wrapper_arg_opts(name);
+            i += 1;
+            while i < words.len() && words[i].starts_with('-') {
+                let opt = words[i].as_str();
+                i += 1;
+                if opt == "--" {
                     break;
                 }
-                _ => break, // another subcommand
+                if arg_opts.contains(&opt) {
+                    i += 1;
+                }
             }
-        }
-    }
-    out
-}
-
-/// Drop heredoc bodies (the lines after `<<WORD` up to the line `WORD`).
-fn strip_heredocs(command: &str) -> String {
-    let mut out = String::new();
-    let mut pending: Vec<String> = Vec::new();
-    for line in command.lines() {
-        if let Some(delim) = pending.first() {
-            if line.trim() == delim {
-                pending.remove(0);
+            // timeout DURATION
+            if name == "timeout" && i < words.len() {
+                i += 1;
             }
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
-        pending.extend(heredoc_delims(line));
+        break;
     }
-    out
+    words[i..].to_vec()
 }
 
-fn heredoc_delims(line: &str) -> Vec<String> {
-    let mut delims = Vec::new();
-    let mut rest = line;
-    while let Some(i) = rest.find("<<") {
-        let after = &rest[i + 2..];
-        if let Some(here_string) = after.strip_prefix('<') {
-            // `<<<` here-string: no body.
-            rest = here_string;
-            continue;
-        }
-        let after = after.trim_start_matches('-').trim_start();
-        let word: String = after
-            .chars()
-            .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')' | '<' | '>'))
-            .collect();
-        let word = word.trim_matches(|c| c == '\'' || c == '"').to_string();
-        if !word.is_empty() {
-            delims.push(word);
-        }
-        rest = after;
-    }
-    delims
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Item {
+    /// A simple command, words with quotes removed.
+    Cmd(Vec<String>),
+    /// Start of a subshell or command substitution.
+    Open,
+    /// End of one.
+    Close,
+    /// A command substitution found inside double quotes.
+    Sub(String),
+    /// A heredoc body, fed to the command with this index (in order of `Cmd` items).
+    Body { cmd: usize, text: String },
+    /// The previous command's output is piped into the next one (`|`, `|&`).
+    Pipe,
 }
 
-/// Split into simple commands (by `;`, `&&`, `||`, `|`, `&`, newlines, parens),
-/// each as a list of words with quotes removed.
-fn simple_commands(command: &str) -> Vec<Vec<String>> {
-    let mut cmds = Vec::new();
+struct Heredoc {
+    delim: String,
+    strip_tabs: bool,
+    /// The delimiter was quoted (`<<'EOF'`): the body is literal. Unquoted bodies expand
+    /// `$(...)` and backticks, which run commands.
+    quoted: bool,
+    cmd: usize,
+}
+
+/// Command substitutions (`$(...)`, backticks) in an unquoted heredoc body.
+fn body_substitutions(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut subs = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '$' if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') => {
+                let end = balanced_close(&chars, i + 1);
+                subs.push(
+                    chars[i + 2..end.saturating_sub(1).max(i + 2)]
+                        .iter()
+                        .collect(),
+                );
+                i = end;
+            }
+            '`' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '`' {
+                    if chars[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                subs.push(chars[start..j.min(chars.len())].iter().collect());
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    subs
+}
+
+/// Index just past the `)` that closes the `(` at `open` (or the end), skipping quotes.
+fn balanced_close(chars: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '\'' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    i += 1;
+                }
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+#[allow(clippy::too_many_lines)] // one state machine; splitting it hides the state
+fn tokenize(command: &str) -> Vec<Item> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut items = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
-    let mut chars = command.chars().peekable();
-    let end_word = |word: &mut String, in_word: &mut bool, words: &mut Vec<String>| {
-        if *in_word {
-            words.push(std::mem::take(word));
-            *in_word = false;
-        }
-    };
-    while let Some(c) = chars.next() {
+    let mut cmd_count = 0usize;
+    let mut heredocs: Vec<Heredoc> = Vec::new();
+    let mut in_backtick = false;
+    let mut i = 0;
+
+    // Nesting depth of `(`/`$(`/backticks, and that depth at each open `case`: inside a
+    // `case`, a `)` at the same depth ends a pattern (`a) ...;;`), not a subshell.
+    let mut open_depth = 0usize;
+    let mut cases: Vec<usize> = Vec::new();
+    macro_rules! end_word {
+        () => {
+            if in_word {
+                if words.is_empty() && !word.is_empty() {
+                    match word.as_str() {
+                        "case" => cases.push(open_depth),
+                        "esac" => {
+                            cases.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                words.push(std::mem::take(&mut word));
+                in_word = false;
+            }
+        };
+    }
+    macro_rules! end_cmd {
+        () => {
+            end_word!();
+            if !words.is_empty() {
+                items.push(Item::Cmd(std::mem::take(&mut words)));
+                cmd_count += 1;
+            }
+        };
+    }
+
+    while i < chars.len() {
+        let c = chars[i];
         match c {
             '\'' => {
                 in_word = true;
-                for q in chars.by_ref() {
-                    if q == '\'' {
-                        break;
-                    }
-                    word.push(q);
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    word.push(chars[i]);
+                    i += 1;
                 }
             }
             '"' => {
                 in_word = true;
-                while let Some(q) = chars.next() {
-                    match q {
-                        '"' => break,
-                        '\\' => {
-                            if let Some(n) = chars.next() {
-                                word.push(n);
-                            }
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    match chars[i] {
+                        '\\' if i + 1 < chars.len() => {
+                            i += 1;
+                            word.push(chars[i]);
                         }
-                        _ => word.push(q),
+                        '$' if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') => {
+                            // "$(...)": a command inside the string.
+                            let end = balanced_close(&chars, i + 1);
+                            let inner: String = chars[i + 2..end.saturating_sub(1).max(i + 2)]
+                                .iter()
+                                .collect();
+                            items.push(Item::Sub(inner));
+                            i = end;
+                            continue;
+                        }
+                        '`' => {
+                            let start = i + 1;
+                            let mut j = start;
+                            while j < chars.len() && chars[j] != '`' {
+                                if chars[j] == '\\' {
+                                    j += 1;
+                                }
+                                j += 1;
+                            }
+                            items
+                                .push(Item::Sub(chars[start..j.min(chars.len())].iter().collect()));
+                            i = j + 1;
+                            continue;
+                        }
+                        ch => word.push(ch),
                     }
+                    i += 1;
                 }
             }
             '\\' => {
                 // A backslash-newline joins lines; any other escaped char is literal.
-                if let Some(n) = chars.next()
-                    && n != '\n'
-                {
+                if i + 1 < chars.len() && chars[i + 1] != '\n' {
                     in_word = true;
-                    word.push(n);
+                    word.push(chars[i + 1]);
                 }
+                i += 1;
+            }
+            '$' if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') => {
+                // Arithmetic `$((...))`: data, kept as part of the word.
+                in_word = true;
+                i = balanced_close(&chars, i + 1);
+                continue;
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                // Command substitution: its contents are commands, in their own scope.
+                end_cmd!();
+                items.push(Item::Open);
+                open_depth += 1;
+                i += 2;
+                continue;
+            }
+            '(' if !in_word && chars.get(i + 1) == Some(&'(') => {
+                // Arithmetic command `(( ... ))`: data.
+                end_cmd!();
+                i = balanced_close(&chars, i);
+                continue;
+            }
+            '(' => {
+                end_cmd!();
+                items.push(Item::Open);
+                open_depth += 1;
+            }
+            ')' => {
+                end_cmd!();
+                if cases.last() == Some(&open_depth) {
+                    // end of a `case` pattern
+                } else {
+                    items.push(Item::Close);
+                    open_depth = open_depth.saturating_sub(1);
+                }
+            }
+            '`' => {
+                end_cmd!();
+                if in_backtick {
+                    items.push(Item::Close);
+                    open_depth = open_depth.saturating_sub(1);
+                } else {
+                    items.push(Item::Open);
+                    open_depth += 1;
+                }
+                in_backtick = !in_backtick;
             }
             '#' if !in_word => {
-                // Comment to end of line.
-                for n in chars.by_ref() {
-                    if n == '\n' {
-                        break;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue; // the newline ends the command below
+            }
+            '<' if chars.get(i + 1) == Some(&'<') => {
+                if chars.get(i + 2) == Some(&'<') {
+                    // `<<<` here-string: the next word is data, read as a normal word.
+                    end_word!();
+                    i += 3;
+                    continue;
+                }
+                end_word!();
+                i += 2;
+                let strip_tabs = chars.get(i) == Some(&'-');
+                if strip_tabs {
+                    i += 1;
+                }
+                while i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+                    i += 1;
+                }
+                let mut delim = String::new();
+                let mut quoted = false;
+                while i < chars.len()
+                    && !chars[i].is_whitespace()
+                    && !matches!(chars[i], ';' | '&' | '|' | ')' | '<' | '>')
+                {
+                    if chars[i] == '\'' || chars[i] == '"' || chars[i] == '\\' {
+                        quoted = true;
+                    } else {
+                        delim.push(chars[i]);
                     }
+                    i += 1;
                 }
-                end_word(&mut word, &mut in_word, &mut words);
-                cmds.push(std::mem::take(&mut words));
+                if !delim.is_empty() {
+                    heredocs.push(Heredoc {
+                        delim,
+                        strip_tabs,
+                        quoted,
+                        cmd: cmd_count,
+                    });
+                }
+                continue;
             }
-            ';' | '&' | '|' | '\n' | '(' | ')' | '`' => {
-                end_word(&mut word, &mut in_word, &mut words);
-                if !words.is_empty() {
-                    cmds.push(std::mem::take(&mut words));
+            '\n' => {
+                end_cmd!();
+                i += 1;
+                // Heredoc bodies start on the next line; the terminator is the exact word
+                // (leading tabs allowed with `<<-`).
+                for h in std::mem::take(&mut heredocs) {
+                    let mut body = String::new();
+                    while i < chars.len() {
+                        let start = i;
+                        while i < chars.len() && chars[i] != '\n' {
+                            i += 1;
+                        }
+                        let line: String = chars[start..i].iter().collect();
+                        i += 1;
+                        let line_cmp = line.trim_end_matches('\r');
+                        let line_cmp = if h.strip_tabs {
+                            line_cmp.trim_start_matches('\t')
+                        } else {
+                            line_cmp
+                        };
+                        if line_cmp == h.delim {
+                            break;
+                        }
+                        body.push_str(&line);
+                        body.push('\n');
+                    }
+                    if !h.quoted {
+                        items.extend(body_substitutions(&body).into_iter().map(Item::Sub));
+                    }
+                    items.push(Item::Body {
+                        cmd: h.cmd,
+                        text: body,
+                    });
+                }
+                continue;
+            }
+            '|' if chars.get(i + 1) == Some(&'|') => {
+                end_cmd!();
+                i += 2;
+                continue;
+            }
+            '|' => {
+                // `|` or `|&`: a pipe into the next command.
+                end_cmd!();
+                items.push(Item::Pipe);
+                if chars.get(i + 1) == Some(&'&') {
+                    i += 1;
                 }
             }
-            c if c.is_whitespace() => end_word(&mut word, &mut in_word, &mut words),
+            ';' | '&' => {
+                end_cmd!();
+            }
+            c if c.is_whitespace() => {
+                end_word!();
+            }
             _ => {
                 in_word = true;
                 word.push(c);
             }
         }
+        i += 1;
     }
-    end_word(&mut word, &mut in_word, &mut words);
+    if in_word {
+        words.push(word);
+    }
     if !words.is_empty() {
-        cmds.push(words);
+        items.push(Item::Cmd(words));
     }
-    cmds.retain(|c| !c.is_empty());
-    cmds
+    items
 }
 
 #[cfg(test)]
@@ -194,22 +686,88 @@ mod tests {
         git_commits(c).into_iter().map(|g| g.dirs).collect()
     }
 
+    fn none() -> Vec<String> {
+        Vec::new()
+    }
+
+    fn v(dirs: &[&str]) -> Vec<String> {
+        dirs.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn finds_commits() {
-        assert_eq!(dirs("git commit -m x"), vec![Vec::<String>::new()]);
-        assert_eq!(
-            dirs("cd a && git commit -q -F f"),
-            vec![vec!["a".to_string()]]
-        );
-        assert_eq!(dirs("git -C x commit"), vec![vec!["x".to_string()]]);
-        assert_eq!(
-            dirs("git add . && git -c user.name=v commit"),
-            vec![Vec::<String>::new()]
-        );
-        assert_eq!(dirs("FOO=1 git commit"), vec![Vec::<String>::new()]);
+        assert_eq!(dirs("git commit -m x"), vec![none()]);
+        assert_eq!(dirs("cd a && git commit -q -F f"), vec![v(&["a"])]);
+        assert_eq!(dirs("git -C x commit"), vec![v(&["x"])]);
+        assert_eq!(dirs("git --work-tree /v commit"), vec![v(&["/v"])]);
+        assert_eq!(dirs("git add . && git -c user.name=v commit"), vec![none()]);
+        assert_eq!(dirs("FOO=1 git commit"), vec![none()]);
         assert_eq!(
             dirs("cd ~/r && git add a\ngit commit -m 'msg; with git commit'").len(),
             1
+        );
+        assert_eq!(dirs("git commit --amend --no-edit"), vec![none()]);
+        assert_eq!(dirs("/usr/bin/git commit"), vec![none()]);
+        assert_eq!(
+            dirs("git commit -m \"$(cat <<'EOF'\nmsg git commit\nEOF\n)\""),
+            vec![none()]
+        );
+    }
+
+    #[test]
+    fn finds_commits_behind_keywords_and_wrappers() {
+        for c in [
+            "if true; then git commit -m x; fi",
+            "git diff --quiet || { git commit -m x; }",
+            "! git commit",
+            "for f in a; do git commit; done",
+            "while false; do :; done; git commit",
+            "timeout 30 git commit",
+            "timeout -s KILL 30s git commit",
+            "sudo -u me git commit",
+            "sudo git commit",
+            "xargs git commit",
+            "xargs -I{} git commit -m {}",
+            "xargs --max-args 1 git commit",
+            "env -u X FOO=1 git commit",
+            "nice -n 5 git commit",
+            "bash -c \"git commit -m x\"",
+            "sh -c 'cd a && git commit'",
+            "bash -lc 'git commit'",
+            "bash -o pipefail -c 'git commit'",
+            "bash -euo pipefail -c 'git commit'",
+            "eval git commit -m x",
+            "echo $(git commit -m x)",
+            "echo `git commit -m x`",
+            "out=\"$(git commit -m x)\"",
+            "echo \"`git commit -m x`\"",
+            "x=$((1<<2))\ngit commit -m z",
+            "(( x = 1 << 2 ))\ngit commit -m z",
+            "bash <<EOF\ngit commit -m x\nEOF",
+            "cat <<EOF | sh\ngit commit -m x\nEOF",
+            "cat <<EOF | tee log | bash\ngit commit -m x\nEOF",
+            "cat > f <<EOF\n$(git commit -m x)\nEOF",
+            "cat > f <<EOF\n`git commit -m x`\nEOF",
+            "bash -s <<'EOF'\ngit commit -m x\nEOF",
+        ] {
+            assert_eq!(git_commits(c).len(), 1, "{c}");
+        }
+        assert_eq!(dirs("sh -c 'cd a && git commit'"), vec![v(&["a"])]);
+    }
+
+    #[test]
+    fn cd_does_not_leak_out_of_subshells() {
+        assert_eq!(dirs("(cd /other && ls); git commit"), vec![none()]);
+        assert_eq!(dirs("X=$(cd /other && pwd); git commit"), vec![none()]);
+        assert_eq!(dirs("pushd /other; popd; git commit"), vec![none()]);
+        assert_eq!(dirs("(cd /other && git commit)"), vec![v(&["/other"])]);
+        assert_eq!(
+            dirs("(case x in a) ;; esac; cd /o); git commit"),
+            vec![none()]
+        );
+        assert_eq!(
+            dirs("case $x in (a) cd /o ;; esac; git commit"),
+            vec![v(&["/o"])]
         );
     }
 
@@ -223,16 +781,41 @@ mod tests {
             "echo \"cd x && git commit\"",
             "cat > f <<'EOF'\nrun `git commit` later\ngit commit -m x\nEOF\necho done",
             "python3 - <<EOF\nprint('git commit')\nEOF",
+            "cat <<-EOF\n\tgit commit\n\tEOF",
+            "cat <<EOF\n  EOF\ngit commit\nEOF",
             "grep -n 'git commit' file",
             "git log --grep commit",
+            "# git commit -m x",
+            "echo hi # git commit",
+            "cat <<< 'git commit'",
+            "bash -c 'echo git commit'",
+            "bash script.sh <<EOF\ngit commit\nEOF",
+            "cat > f <<'EOF'\n$(git commit -m x)\nEOF",
+            "cat <<EOF | grep x\ngit commit\nEOF",
+            "false || echo git commit",
         ] {
             assert!(git_commits(c).is_empty(), "{c}");
         }
     }
 
     #[test]
+    fn quoted_heredoc_marker_is_not_a_heredoc() {
+        assert_eq!(git_commits("echo \"x << y\"\ngit commit -m z").len(), 1);
+        assert_eq!(git_commits("echo 'a <<EOF'\ngit commit").len(), 1);
+    }
+
+    #[test]
     fn commit_after_heredoc_counts() {
         let c = "cat > f <<'EOF'\ntext\nEOF\ngit commit -m done";
         assert_eq!(git_commits(c).len(), 1);
+        let two = "cat <<A <<B\na\nA\nb\nB\ngit commit";
+        assert_eq!(git_commits(two).len(), 1);
+    }
+
+    #[test]
+    fn reports_aliases_as_subcommands() {
+        let calls = git_calls("git ci -m x");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].subcommand, "ci");
     }
 }

@@ -21,12 +21,9 @@ pub use vault::{Note, Vault};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("{path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    // The io error is part of the message, not a `source`, so `{:#}` chains don't repeat it.
+    #[error("{path}: {err}")]
+    Io { path: PathBuf, err: std::io::Error },
     #[error("{path}: {message}")]
     Config { path: PathBuf, message: String },
     #[error("{0}")]
@@ -34,10 +31,10 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
+    pub(crate) fn io(path: &Path, err: std::io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
-            source,
+            err,
         }
     }
 }

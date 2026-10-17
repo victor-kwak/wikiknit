@@ -51,6 +51,6 @@ wikiknit mark --session <id>       # record the pass; held commits and Stop note
 
 Run `mark` as its own command. The commit hook checks before a command runs, so `wikiknit mark && git commit` in one command is still held.
 
-Notes you edited for back-links count as changed too: include them in the check, and `mark` records all of them. Then continue the task (for example, retry the held commit).
+Notes you edited for back-links count as changed too: include them in the check, and `mark` records all of them. A pass is recorded for the vault, so other sessions see it too. The list can include notes another session or a person changed while yours ran. Link them too: any session may do the pass for any note, and the vault stays linked either way. Then continue the task (for example, retry the held commit).
 
 If a changed note truly needs no new links (a typo fix, a note already well linked), say so in one line and run `wikiknit mark` anyway.

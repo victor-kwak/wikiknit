@@ -335,11 +335,13 @@ fn state_dir_is_private() {
         .success();
     let root = state.path().join("wikiknit");
     let vault_dir = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
-    for dir in [&root, &vault_dir] {
+    let sessions = vault_dir.join("sessions");
+    for dir in [&root, &vault_dir, &sessions] {
         let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "{}", dir.display());
     }
-    assert!(vault_dir.join("p-1.json").is_file());
+    assert!(sessions.join("p-1.json").is_file());
+    assert!(vault_dir.join("linked.json").is_file());
 }
 
 #[test]

@@ -14,6 +14,8 @@ pub struct Note {
     pub id: String,
     pub path: PathBuf,
     pub text: String,
+    /// The file was not valid UTF-8; `text` has replacement characters.
+    pub not_utf8: bool,
     pub parsed: Parsed,
     /// Byte offsets where each line starts, for line numbers.
     line_starts: Vec<usize>,
@@ -129,14 +131,29 @@ impl Vault {
         let root = config.vault.clone();
         let mut notes = Vec::new();
         let mut files = BTreeSet::new();
+        // Follows symlinks (as Obsidian does); the walker detects loops. A symlink whose target
+        // is outside the vault is skipped, so a link to `/` or `~` cannot make every hook walk it.
+        let inside_root = {
+            let root = root.clone();
+            move |p: &Path| p.canonicalize().is_ok_and(|c| c.starts_with(&root))
+        };
+        let filter_root = inside_root.clone();
         let walker = ignore::WalkBuilder::new(&root)
             .standard_filters(false)
             .hidden(true)
+            .follow_links(true)
             .sort_by_file_name(std::cmp::Ord::cmp)
+            .filter_entry(move |e| !e.path_is_symlink() || filter_root(e.path()))
             .build();
         for entry in walker {
-            let entry =
-                entry.map_err(|e| Error::Usage(format!("walking {}: {e}", root.display())))?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    // One unreadable entry must not stop the whole vault (or the hooks).
+                    eprintln!("wikiknit: skipping: {e}");
+                    continue;
+                }
+            };
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -144,25 +161,43 @@ impl Vault {
             let Some(rel) = rel_id(&root, path) else {
                 continue;
             };
-            if config.is_ignored(&rel) {
+            let Ok(real) = path.canonicalize() else {
+                continue;
+            };
+            if !real.starts_with(&root) {
                 continue;
             }
-            if path
+            let is_md = path
                 .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("md"))
-            {
-                let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-                let id = rel[..rel.len() - 3].to_string();
-                notes.push(Note {
-                    id,
-                    path: path.to_path_buf(),
-                    parsed: parse::parse(&text),
-                    line_starts: line_starts(&text),
-                    text,
-                });
-            } else {
+                .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+            // A second path to a note already in the vault (an in-vault symlink): the real
+            // path is the note; this one resolves as a file. Ignored notes are not checked,
+            // but links to them still resolve (as files).
+            let via_symlink = real != path && real.starts_with(&root);
+            if !is_md || via_symlink || config.is_ignored(&rel) {
                 files.insert(rel);
+                continue;
             }
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("wikiknit: skipping {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let (text, not_utf8) = match String::from_utf8(bytes) {
+                Ok(s) => (s, false),
+                Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+            };
+            let id = rel[..rel.len() - 3].to_string();
+            notes.push(Note {
+                id,
+                path: path.to_path_buf(),
+                not_utf8,
+                parsed: parse::parse(&text),
+                line_starts: line_starts(&text),
+                text,
+            });
         }
         let mut by_id = HashMap::new();
         let mut by_id_lower: HashMap<String, Vec<usize>> = HashMap::new();
@@ -211,20 +246,36 @@ impl Vault {
     /// Map a CLI argument (note id, vault-relative path, or file path) to a note id.
     #[must_use]
     pub fn id_for_arg(&self, arg: &str, cwd: &Path) -> Option<String> {
-        let trimmed = arg.trim_end_matches(".md");
-        if self.by_id.contains_key(trimmed) {
-            return Some(trimmed.to_string());
+        // An existing file path wins over a note id of the same spelling.
+        if let Some(rel) = self.rel_for_path(arg, cwd) {
+            let id = rel.strip_suffix(".md").unwrap_or(&rel).to_string();
+            return self.by_id.contains_key(&id).then_some(id);
         }
+        let trimmed = arg.trim_end_matches(".md");
+        self.by_id
+            .contains_key(trimmed)
+            .then(|| trimmed.to_string())
+    }
+
+    /// A CLI argument names a file in an ignored folder.
+    #[must_use]
+    pub fn is_ignored_arg(&self, arg: &str, cwd: &Path) -> bool {
+        let rel = self
+            .rel_for_path(arg, cwd)
+            .unwrap_or_else(|| arg.to_string());
+        self.config.is_ignored(&rel)
+    }
+
+    /// Vault-relative path of an existing file argument.
+    fn rel_for_path(&self, arg: &str, cwd: &Path) -> Option<String> {
         let p = Path::new(arg);
         let abs = if p.is_absolute() {
             p.to_path_buf()
         } else {
             cwd.join(p)
         };
-        let abs = abs.canonicalize().ok()?;
-        let rel = rel_id(&self.config.vault, &abs)?;
-        let id = rel.strip_suffix(".md")?.to_string();
-        self.by_id.contains_key(&id).then_some(id)
+        let abs = abs.canonicalize().ok().filter(|a| a.is_file())?;
+        rel_id(&self.config.vault, &abs)
     }
 
     /// Resolve every link of a note (body and frontmatter).
@@ -303,6 +354,10 @@ impl Vault {
         if self.files.contains(t) {
             return Some(Target::File(t.to_string()));
         }
+        let as_md = format!("{note_id}.md");
+        if self.files.contains(&as_md) {
+            return Some(Target::File(as_md));
+        }
         if let Some(v) = self.files_lower.get(&t.to_lowercase())
             && v.len() == 1
         {
@@ -345,16 +400,20 @@ impl Vault {
         }
         let fneedle = t.to_lowercase();
         let fsuffix = format!("/{fneedle}");
-        let files: Vec<&String> = self
-            .files_by_name
-            .get(last_segment(&fneedle))
+        let md_needle = format!("{needle}.md");
+        let md_suffix = format!("/{md_needle}");
+        let files: Vec<&String> = [last_segment(&fneedle), last_segment(&md_needle)]
             .into_iter()
+            .filter_map(|name| self.files_by_name.get(name))
             .flatten()
             .filter(|f| {
                 let f = f.to_lowercase();
-                f == fneedle || f.ends_with(&fsuffix)
+                f == fneedle || f.ends_with(&fsuffix) || f == md_needle || f.ends_with(&md_suffix)
             })
             .collect();
+        let mut files = files;
+        files.sort();
+        files.dedup();
         match files.len() {
             0 => (Target::Unresolved, Form::Short),
             1 => (Target::File(files[0].clone()), Form::Short),
