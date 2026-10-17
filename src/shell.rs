@@ -103,15 +103,33 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
                 commands.push(words.clone());
                 piped.push(false);
                 // Variables that change where git finds config or commands.
+                // (`PATH+=...` appends; strip the `+`.)
                 let sets_git_config = words.iter().any(|w| {
                     w.split_once('=').is_some_and(|(k, _)| {
+                        let k = k.strip_suffix('+').unwrap_or(k);
                         k.starts_with("GIT_") || matches!(k, "HOME" | "XDG_CONFIG_HOME" | "PATH")
                     })
                 });
-                let first = words.first().map(String::as_str);
+                // First word after shell keywords (`{ local X=1; ...`, `then export X=1`).
+                let first = words.iter().map(String::as_str).find(|w| {
+                    !matches!(
+                        *w,
+                        "{" | "}"
+                            | "!"
+                            | "if"
+                            | "then"
+                            | "else"
+                            | "elif"
+                            | "do"
+                            | "while"
+                            | "until"
+                    )
+                });
                 if sets_git_config
-                    && (matches!(first, Some("export" | "declare" | "typeset" | "readonly"))
-                        || words.iter().all(|w| w.contains('=')))
+                    && (matches!(
+                        first,
+                        Some("export" | "declare" | "typeset" | "readonly" | "local")
+                    ) || words.iter().all(|w| w.contains('=')))
                 {
                     env_config = true;
                 }
@@ -301,6 +319,7 @@ fn strip_prefixes(words: &[String]) -> Vec<String> {
     while i < words.len() {
         let t = words[i].as_str();
         let assignment = t.split_once('=').is_some_and(|(k, _)| {
+            let k = k.strip_suffix('+').unwrap_or(k); // `VAR+=value` appends
             !k.is_empty()
                 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && !k.starts_with(|c: char| c.is_ascii_digit())
@@ -878,6 +897,9 @@ mod tests {
             "PATH=/tmp:$PATH git x",
             "GIT_EXEC_PATH=/tmp git x",
             "git --exec-path=/tmp x",
+            "PATH+=:/tmp git x",
+            "export PATH+=:/tmp; git x",
+            "f() { local GIT_DIR=/x; git x; }",
         ] {
             assert!(git_calls(c)[0].config_overridden, "{c}");
         }

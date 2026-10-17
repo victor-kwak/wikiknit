@@ -252,7 +252,8 @@ fn is_commit(call: &shell::GitCall, subcommand: &str, dir: &Path, depth: usize) 
     let alias = call
         .inline_aliases
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(subcommand))
+        // The last definition wins, as in git.
+        .rfind(|(name, _)| name.eq_ignore_ascii_case(subcommand))
         .map(|(_, v)| v.clone())
         .or_else(|| {
             if call.config_overridden {

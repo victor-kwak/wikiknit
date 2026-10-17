@@ -620,6 +620,8 @@ fn inline_env_and_external_aliases_are_held() {
         "git -c include.path=/tmp/evil x",
         "HOME=/tmp/other git x",
         "PATH=/tmp/bin:$PATH git x",
+        "PATH+=:/tmp/bin git x",
+        "git -c alias.x=status -c alias.x=commit x -m y",
     ] {
         let out = hook(
             p,
