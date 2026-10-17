@@ -316,7 +316,13 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 fix,
             );
         }
-        for l in &p.code_links {
+        // `[[x]]` in code that names no note is code (TOML `[[table]]`, a regex), not a
+        // link someone meant.
+        for l in p
+            .code_links
+            .iter()
+            .filter(|l| matches!(vault.target_of(note, l), Target::Note(_) | Target::File(_)))
+        {
             sink.push_fix(
                 "link-in-code",
                 &note.id,

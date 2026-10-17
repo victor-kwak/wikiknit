@@ -150,7 +150,7 @@ link-in-code = "warn"
 | `ambiguous-link` | warn | A short link several notes match |
 | `frontmatter-invalid` | error | Frontmatter that is not valid YAML |
 | `frontmatter-unquoted-link` | error | `key: [[x]]` or `- [[x]]` in YAML (a nested list, not a link); quote it |
-| `link-in-code` | warn | `[[x]]` inside a code span or block (not a link) |
+| `link-in-code` | warn | `[[x]]` naming a note or file inside a code span or block (not a link); other `[[...]]` in code, such as a TOML `[[table]]`, is left alone |
 | `no-outbound-links` | error | A note (not a hub) that links to no other note |
 | `missing-required-link` | error | A note matching a `[[require_link]]` rule without that link |
 | `missing-required-inbound` | error | A note matching a `[[require_inbound]]` rule that its `from` note does not link; the fix is the edit in the `from` note, next to its links to similar notes. Checked when either note is selected; with only the `from` note selected, the finding is on it |

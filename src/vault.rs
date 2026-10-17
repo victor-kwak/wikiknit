@@ -461,6 +461,12 @@ impl Vault {
         counts
     }
 
+    /// Where one link written in `from` points (also for links in code, which do not count).
+    #[must_use]
+    pub fn target_of(&self, from: &Note, raw: &RawLink) -> Target {
+        self.resolve(from, raw).0
+    }
+
     fn resolve(&self, from: &Note, raw: &RawLink) -> (Target, Form) {
         let t = raw.target.trim().trim_start_matches('/');
         if t.is_empty() {

@@ -265,3 +265,21 @@ fn required_inbound_from_is_an_id_not_an_alias() {
         "must be linked from [[q]] (that note does not exist yet)"
     );
 }
+
+#[test]
+fn code_that_names_no_note_is_not_a_link_in_code() {
+    let v = vault(
+        "",
+        &[
+            (
+                "a.md",
+                "# a\nConfig `[[stale]]` table, and `[[b]]` in code. [[b]]\n",
+            ),
+            ("b.md", "# b\n[[a]]\n"),
+        ],
+    );
+    let f = check(v.path(), &[]);
+    let m = by_rule(&f, "link-in-code");
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert!(m[0]["message"].as_str().unwrap().starts_with("[[b]]"));
+}
