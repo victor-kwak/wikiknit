@@ -102,10 +102,11 @@ impl Index {
         if header.chunker != CHUNKER_VERSION || header.dim == 0 {
             return None;
         }
-        let mut floats = rest
-            .get(4 + len..)?
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")));
+        let (blocks, tail) = rest.get(4 + len..)?.as_chunks::<4>();
+        if !tail.is_empty() {
+            return None; // not a whole number of f32s: truncated or corrupt
+        }
+        let mut floats = blocks.iter().map(|b| f32::from_le_bytes(*b));
         let mut notes = BTreeMap::new();
         for meta in header.notes {
             let mut vectors = Vec::with_capacity(meta.lines.len());
