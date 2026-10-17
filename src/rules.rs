@@ -25,10 +25,10 @@ pub const RULES: &[(&str, Severity)] = &[
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
-    pub rule: &'static str,
-    pub severity: &'static str,
     pub note: String,
     pub line: usize,
+    pub severity: &'static str,
+    pub rule: &'static str,
     pub message: String,
 }
 
@@ -52,10 +52,10 @@ impl Sink<'_> {
             Severity::Error => "error",
         };
         self.out.push(Finding {
-            rule,
-            severity,
             note: note.to_string(),
             line,
+            severity,
+            rule,
             message,
         });
     }

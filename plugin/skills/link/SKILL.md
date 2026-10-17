@@ -13,20 +13,32 @@ Goal: every note changed in this session is linked to the notes it is about, and
 Run these from the project (wikiknit finds `wikiknit.toml` by searching upward). The session id is in the hook message; `$WIKIKNIT_SESSION` holds it when the SessionStart hook ran. Pass `--session <id>` to `changed`, `check --changed`, `mentions --changed`, and `mark` whenever `$WIKIKNIT_SESSION` is unset: without it wikiknit uses the newest baseline, which may belong to another open session.
 
 ```bash
-wikiknit changed            # notes changed this session, not yet marked
-wikiknit catalog            # every note: id, type, aliases, one-line summary
-wikiknit check --changed    # rule errors in the changed notes
-wikiknit mentions --changed # text naming another note (name/alias) without a link
+wikiknit changed              # notes changed this session, not yet marked
+wikiknit check --changed      # rule errors in the changed notes
+wikiknit mentions --changed   # text naming another note (name/alias) without a link
+wikiknit links <note>         # what a changed note links to and what links to it, with the lines
 ```
+
+To find what a note should link to, search for the things it is about instead of reading the whole vault:
+
+```bash
+wikiknit search <topic words> --limit 10       # ranked candidates, best line of each
+wikiknit catalog --type project                # all notes of one kind
+wikiknit catalog --path Reference/             # one folder
+wikiknit catalog --where stack=cloudflare      # notes sharing a frontmatter value
+```
+
+Read the full `wikiknit catalog` only for a small vault (a few hundred notes).
 
 Read the vault's own instructions first if it has any (a `CLAUDE.md`, `AGENTS.md`, or templates folder): they say where links go and how they are written. Follow them over the defaults below.
 
 ## 2. Decide what each changed note relates to
 
-For each changed note, use what you know about why it changed in this task, plus the catalog:
+For each changed note, use what you know about why it changed in this task, plus what the commands above return:
 
 - Name the things it is about: the project or repo, the system or component, the company, the person, the issue, the report or source it came from, the session that produced it.
-- Find the note for each in the catalog. Match by meaning, not only by shared words: a client name in one note can mean a company note that never uses that word.
+- Find the note for each with `search` or a filtered `catalog`. Match by meaning, not only by shared words: a client name in one note can mean a company note that never uses that word.
+- Check what `links <note>` already shows, so you add only what is missing.
 - Check `mentions` output: each hit is a candidate, not an order. Link it only if the note really refers to that target (a common word that happens to match is not a mention).
 - Skip hub/index notes (marked `(hub)` in the catalog) as link targets unless the vault says otherwise.
 

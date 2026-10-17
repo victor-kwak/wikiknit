@@ -5,13 +5,17 @@
 
 pub mod catalog;
 pub mod config;
+pub mod filter;
 pub mod graph;
 pub mod hook;
+pub mod links;
 pub mod mentions;
 pub mod parse;
 pub mod rules;
+pub mod search;
 pub mod shell;
 pub mod state;
+pub mod text;
 pub mod vault;
 
 use std::path::{Path, PathBuf};

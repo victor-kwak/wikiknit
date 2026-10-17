@@ -7,6 +7,11 @@ use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use serde_json::Value;
 
+/// An inline `#tag`: after start, whitespace, or an opening bracket; letters, digits,
+/// `_`, `-`, `/` (nested tags). Obsidian needs at least one non-digit.
+static TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)(?:^|[\s(\[,;])#([\p{L}\p{N}_/\-]+)").expect("valid regex"));
+
 static WIKILINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(!?)\[\[([^\[\]\n]+)\]\]").expect("valid regex"));
 
@@ -55,6 +60,25 @@ impl Frontmatter {
         self.value.as_ref()?.get(key)?.as_str()
     }
 
+    /// `tags` (or `tag`): a list, or a string of space- or comma-separated tags. Normalized
+    /// (no `#`, lowercase).
+    #[must_use]
+    pub fn tags(&self) -> Vec<String> {
+        let Some(v) = self.value.as_ref() else {
+            return Vec::new();
+        };
+        let raw: Vec<String> = match v.get("tags").or_else(|| v.get("tag")) {
+            Some(Value::String(s)) => s.split([',', ' ']).map(str::to_string).collect(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        raw.iter().filter_map(|t| normalize_tag(t)).collect()
+    }
+
     /// `aliases` (or `alias`) as a list of strings; a single string is accepted.
     #[must_use]
     pub fn aliases(&self) -> Vec<String> {
@@ -89,6 +113,8 @@ pub struct Parsed {
     pub html_links: Vec<RawLink>,
     /// Byte ranges that are not prose for mention matching: raw HTML and external links.
     pub non_prose: Vec<Range<usize>>,
+    /// Inline `#tags` in the body (normalized), in order of appearance.
+    pub tags: Vec<String>,
     /// Frontmatter keys holding `[[link]]` that YAML read as nested lists (unquoted).
     pub unquoted_frontmatter_links: Vec<String>,
 }
@@ -205,6 +231,36 @@ fn string_leaves<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
     }
 }
 
+/// `#Project/Alpha` -> `project/alpha`; `None` for an empty or all-digit tag.
+#[must_use]
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_start_matches('#').trim_matches('/');
+    (!t.is_empty() && !t.chars().all(|c| c.is_ascii_digit())).then(|| t.to_lowercase())
+}
+
+fn collect_inline_tags(text: &str, body_start: usize, out: &mut Parsed) {
+    let body = &text[body_start..];
+    let inside = |r: &Range<usize>| {
+        out.code
+            .iter()
+            .chain(out.non_prose.iter())
+            .chain(out.links.iter().map(|l| &l.span))
+            .any(|x| r.start < x.end && x.start < r.end)
+    };
+    let mut tags = Vec::new();
+    for m in TAG.captures_iter(body) {
+        let g = m.get(1).expect("group");
+        let abs = body_start + g.start()..body_start + g.end();
+        if inside(&abs) {
+            continue;
+        }
+        if let Some(t) = normalize_tag(g.as_str()) {
+            tags.push(t);
+        }
+    }
+    out.tags = tags;
+}
+
 /// Strip `|alias`, `#subpath`, a table-escape backslash, and whitespace.
 #[must_use]
 pub fn link_target(raw: &str) -> String {
@@ -306,6 +362,7 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
         }
     }
     out.non_prose.extend(html);
+    collect_inline_tags(text, body_start, out);
     for range in out.code.clone() {
         for m in WIKILINK.captures_iter(&text[range.clone()]) {
             let whole = m.get(0).expect("match");
@@ -410,6 +467,17 @@ mod tests {
         assert_eq!(p.html_links.len(), 1);
         assert!(p.links.is_empty());
         assert!(p.non_prose.len() >= 3);
+    }
+
+    #[test]
+    fn tags_inline_and_frontmatter() {
+        let p = parse(
+            "---\ntags: [Project/Alpha, \"#infra\"]\n---\n# Title\nSee #todo and #Area/Ops, not `#code` or #123 or [x](https://a.b/#frag) or [[n#Head]].\n",
+        );
+        assert_eq!(p.frontmatter.tags(), vec!["project/alpha", "infra"]);
+        assert_eq!(p.tags, vec!["todo", "area/ops"]);
+        let s = parse("---\ntags: a, b c\n---\n");
+        assert_eq!(s.frontmatter.tags(), vec!["a", "b", "c"]);
     }
 
     #[test]

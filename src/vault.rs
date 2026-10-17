@@ -28,6 +28,19 @@ impl Note {
         self.line_starts.partition_point(|&s| s <= offset)
     }
 
+    /// (1-based line number, the whole line, byte offset of `offset` within it).
+    #[must_use]
+    pub fn line_at(&self, offset: usize) -> (usize, &str, usize) {
+        let line = self.line_of(offset);
+        let start = self.line_starts[line - 1];
+        let end = self
+            .line_starts
+            .get(line)
+            .map_or(self.text.len(), |e| e - 1);
+        let end = end.max(start);
+        (line, &self.text[start..end], offset.saturating_sub(start))
+    }
+
     /// The text of the line containing `offset`, trimmed.
     #[must_use]
     pub fn line_text(&self, offset: usize) -> &str {
@@ -38,6 +51,18 @@ impl Note {
             .get(line)
             .map_or(self.text.len(), |e| e - 1);
         self.text[start..end.max(start)].trim()
+    }
+
+    /// Frontmatter and inline tags, normalized and deduplicated.
+    #[must_use]
+    pub fn tags(&self) -> Vec<String> {
+        let mut tags = self.parsed.frontmatter.tags();
+        for t in &self.parsed.tags {
+            if !tags.contains(t) {
+                tags.push(t.clone());
+            }
+        }
+        tags
     }
 
     /// File stem, e.g. `overview` for `Projects/gatehouse/overview`.
@@ -105,6 +130,8 @@ pub struct Vault {
     by_stem: HashMap<String, Vec<usize>>,
     /// Lowercase file name -> attachments.
     files_by_name: HashMap<String, Vec<String>>,
+    /// Outbound note links per note, computed once on first use.
+    outbound: std::sync::OnceLock<Vec<BTreeSet<usize>>>,
 }
 
 fn last_segment(p: &str) -> &str {
@@ -129,7 +156,7 @@ fn line_starts(text: &str) -> Vec<usize> {
 impl Vault {
     pub fn load(config: Config) -> Result<Self, Error> {
         let root = config.vault.clone();
-        let mut notes = Vec::new();
+        let mut md: Vec<(String, PathBuf)> = Vec::new();
         let mut files = BTreeSet::new();
         // Follows symlinks (as Obsidian does); the walker detects loops. A symlink whose target
         // is outside the vault is skipped, so a link to `/` or `~` cannot make every hook walk it.
@@ -178,27 +205,34 @@ impl Vault {
                 files.insert(rel);
                 continue;
             }
-            let bytes = match std::fs::read(path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("wikiknit: skipping {}: {e}", path.display());
-                    continue;
-                }
-            };
-            let (text, not_utf8) = match String::from_utf8(bytes) {
-                Ok(s) => (s, false),
-                Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
-            };
-            let id = rel[..rel.len() - 3].to_string();
-            notes.push(Note {
-                id,
-                path: path.to_path_buf(),
-                not_utf8,
-                parsed: parse::parse(&text),
-                line_starts: line_starts(&text),
-                text,
-            });
+            md.push((rel, path.to_path_buf()));
         }
+        // Read and parse in parallel; keep the walk's (sorted) order.
+        use rayon::prelude::*;
+        let notes: Vec<Note> = md
+            .into_par_iter()
+            .filter_map(|(rel, path)| {
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("wikiknit: skipping {}: {e}", path.display());
+                        return None;
+                    }
+                };
+                let (text, not_utf8) = match String::from_utf8(bytes) {
+                    Ok(s) => (s, false),
+                    Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+                };
+                Some(Note {
+                    id: rel[..rel.len() - 3].to_string(),
+                    path,
+                    not_utf8,
+                    parsed: parse::parse(&text),
+                    line_starts: line_starts(&text),
+                    text,
+                })
+            })
+            .collect();
         let mut by_id = HashMap::new();
         let mut by_id_lower: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, n) in notes.iter().enumerate() {
@@ -230,6 +264,7 @@ impl Vault {
             files_lower,
             by_stem,
             files_by_name,
+            outbound: std::sync::OnceLock::new(),
         })
     }
 
@@ -255,6 +290,76 @@ impl Vault {
         self.by_id
             .contains_key(trimmed)
             .then(|| trimmed.to_string())
+    }
+
+    /// Find a note from a reference an agent would write: an id, a file path, a link target
+    /// (`gatehouse/overview`, `acme`), or a name or alias (`gatehouse`, `ACME Corp`),
+    /// case-insensitive. Ambiguous or unknown references are an error that lists candidates.
+    pub fn find_note(&self, reference: &str) -> Result<usize, Error> {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(id) = self.id_for_arg(reference, &cwd) {
+            return Ok(self.by_id[&id]);
+        }
+        let r = reference.trim().trim_end_matches(".md");
+        if let Some(Target::Note(i)) = self.lookup_exact(r) {
+            return Ok(i);
+        }
+        if let (Target::Note(i), Form::Short) = self.lookup_suffix(r, "") {
+            return Ok(i);
+        }
+        // A folder whose note has a generic stem: `Projects/x` -> `Projects/x/overview`.
+        for g in &self.config.generic_names {
+            let folder = r.trim_end_matches('/');
+            if let Some(&i) = self
+                .by_id_lower
+                .get(&format!("{}/{g}", folder.to_lowercase()))
+                .and_then(|v| (v.len() == 1).then_some(&v[0]))
+            {
+                return Ok(i);
+            }
+        }
+        let want = r.to_lowercase();
+        let generic = &self.config.generic_names;
+        let named: Vec<usize> = self
+            .notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                n.name(generic).to_lowercase() == want
+                    || n.parsed
+                        .frontmatter
+                        .aliases()
+                        .iter()
+                        .any(|a| a.to_lowercase() == want)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if named.len() == 1 {
+            return Ok(named[0]);
+        }
+        let candidates: Vec<&str> = if named.is_empty() {
+            self.notes
+                .iter()
+                .filter(|n| n.id.to_lowercase().contains(&want))
+                .map(|n| n.id.as_str())
+                .take(8)
+                .collect()
+        } else {
+            named.iter().map(|&i| self.notes[i].id.as_str()).collect()
+        };
+        Err(Error::Usage(
+            match (named.is_empty(), candidates.is_empty()) {
+                (true, true) => format!("no note matches `{reference}`"),
+                (true, false) => format!(
+                    "no note matches `{reference}`; ids containing it: {}",
+                    candidates.join(", ")
+                ),
+                (false, _) => format!(
+                    "`{reference}` matches several notes: {}",
+                    candidates.join(", ")
+                ),
+            },
+        ))
     }
 
     /// A CLI argument names a file in an ignored folder.
@@ -295,17 +400,48 @@ impl Vault {
             .collect()
     }
 
+    /// Outbound note links of every note (resolved, excluding self-links), computed once.
+    #[must_use]
+    pub fn outbound_all(&self) -> &[BTreeSet<usize>] {
+        self.outbound.get_or_init(|| {
+            use rayon::prelude::*;
+            self.notes
+                .par_iter()
+                .enumerate()
+                .map(|(me, note)| {
+                    self.resolve_links(note)
+                        .into_iter()
+                        .filter_map(|r| match r.target {
+                            Target::Note(i) if i != me => Some(i),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+    }
+
     /// Indexes of notes this note links to (resolved, excluding itself).
     #[must_use]
     pub fn outbound(&self, note: &Note) -> BTreeSet<usize> {
-        let me = self.index_of(&note.id);
-        self.resolve_links(note)
-            .into_iter()
-            .filter_map(|r| match r.target {
-                Target::Note(i) if Some(i) != me => Some(i),
-                _ => None,
-            })
-            .collect()
+        self.index_of(&note.id)
+            .map(|i| self.outbound_all()[i].clone())
+            .unwrap_or_default()
+    }
+
+    /// How many non-hub notes link to each note.
+    #[must_use]
+    pub fn inbound_counts(&self) -> Vec<usize> {
+        let mut counts = vec![0usize; self.notes.len()];
+        for (i, out) in self.outbound_all().iter().enumerate() {
+            if self.config.is_hub(&self.notes[i].id) {
+                continue;
+            }
+            for &j in out {
+                counts[j] += 1;
+            }
+        }
+        counts
     }
 
     fn resolve(&self, from: &Note, raw: &RawLink) -> (Target, Form) {

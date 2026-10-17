@@ -1,7 +1,7 @@
 {
   "name": "wikiknit",
   "displayName": "wikiknit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keeps wikilinks in a Markdown vault complete: hooks hold vault commits until changed notes get a link pass, and the link skill adds related links in both directions. Needs the wikiknit CLI on PATH.",
   "author": {
     "name": "Victor Kwak"

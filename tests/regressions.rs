@@ -30,10 +30,12 @@ fn wk(dir: &Path, state: &Path) -> Command {
     cmd
 }
 
+/// The `items` of a `--format json` run.
 fn json_of(cmd: &mut Command) -> Value {
     let out = cmd.output().unwrap();
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("bad JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)))
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("bad JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)));
+    v["items"].clone()
 }
 
 fn rules(findings: &Value) -> Vec<(String, String)> {
@@ -99,7 +101,7 @@ fn non_utf8_note_is_a_finding_not_a_failure() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let f: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let f: Value = serde_json::from_slice::<Value>(&out.stdout).unwrap()["items"].clone();
     assert_eq!(rules(&f), [("b".to_string(), "file-not-utf8".to_string())]);
 }
 

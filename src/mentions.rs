@@ -18,11 +18,11 @@ static URL: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone, Serialize)]
 pub struct Mention {
     pub note: String,
-    pub target: String,
-    /// The text that matched (as written in the note).
-    pub term: String,
     /// First line with a match.
     pub line: usize,
+    /// The text that matched (as written in the note).
+    pub term: String,
+    pub target: String,
     pub count: usize,
     pub context: String,
 }

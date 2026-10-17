@@ -1,18 +1,22 @@
 # wikiknit
 
-Lint and knit the wikilinks in a Markdown vault (Obsidian, and anything else that uses `[[wikilinks]]`).
+Context for AI agents working on a Markdown vault (Obsidian, and anything else that uses
+`[[wikilinks]]`): find the right notes, see how they relate, and keep the links between them complete.
 
-A vault's value is in its links, and links are the first thing to go missing: a note gets written, the
-graph view shows it floating alone, and nobody notices. wikiknit finds those gaps:
-
-- **check**: broken links, wrong link style, unquoted links in frontmatter, links hidden in code, notes
-  with no outgoing link, notes missing a link your rules require, aliases two notes share.
+- **search**: ranked full-text search (BM25F over title, aliases, headings, frontmatter, body), with
+  filters by type, folder, frontmatter field, tag, and linked notes.
+- **links**: the notes linked to or from a note, each with the line the link is written on, so an agent
+  sees how two notes relate without opening either.
+- **catalog**: one line per note (id, type, tags, aliases, title, summary), filterable.
+- **check**: broken links, wrong link style, unquoted links in frontmatter, links hidden in code or HTML,
+  notes with no outgoing link, notes missing a link your rules require, aliases two notes share.
 - **mentions**: text that names another note (by its name or an alias) without linking it.
-- **catalog**: one line per note (id, type, aliases, summary), to see the whole vault at once.
 - **graph**: connected components with index ("hub") notes left out, so isolated clusters show up.
+- **Claude Code plugin**: hooks that hold a vault commit until the changed notes had a link pass.
 
-It reads the Markdown files directly. Obsidian does not need to be running. It runs in milliseconds, so it
-fits in editor hooks, git hooks, CI, and AI-agent hooks.
+It reads the Markdown files directly: Obsidian does not need to be running, and wikiknit never edits
+notes (agents do; wikiknit tells them what and where). It is fast enough for hooks: on a 5,000-note
+vault, `search` takes about 0.1 s and `check` 0.06 s (16 cores).
 
 ## Install
 
@@ -24,13 +28,38 @@ cargo install --path .                                       # from a checkout
 ## Use
 
 ```bash
-wikiknit check                    # every note; exit 1 on errors
-wikiknit check Projects/alpha/overview.md
-wikiknit mentions                 # unlinked mentions
-wikiknit catalog
+wikiknit search cloudflare tunnel --type project   # ranked notes, best line of each
+wikiknit search '"ssh key"' github --limit 5       # a quoted phrase must appear as written
+wikiknit links gatehouse                           # neighbors of a note (id, path, name, or alias)
+wikiknit links gatehouse --depth 2 --in            # notes linking to it, two hops
+wikiknit catalog --path Projects/ --where status=active
+wikiknit check                                     # every note; exit 1 on errors
+wikiknit mentions
 wikiknit graph
-wikiknit --format json check      # machine-readable output for every command
 ```
+
+Filters (`search`, `links`, `catalog`): `--type`, `--path <prefix>`, `--where key=regex` (frontmatter;
+case-insensitive and matching anywhere in the value, so anchor with `^...$` for an exact value; lists match
+any element), `--tag` (frontmatter `tags` and inline `#tags`; a tag also matches its nested tags),
+`--linked-to <note>`. Repeat a flag to accept any of its values. A note can be named by its id, path,
+link target, name, alias, or folder (`Projects/x` for `Projects/x/overview`).
+
+`links` rows give `dir` (`out`, `in`, `both`), `depth`, the note, `via` (the note one hop closer to the
+start), `source`/`line`/`context` (where the link is written, and the text around it), and for `both`
+also `back_line`/`back_context` (the link back).
+
+### Output
+
+Output is for agents. Each command prints a `# field...` header line, then one tab-separated record
+per line, and nothing at all when there are no records (a clean `check` prints nothing). Lists inside a
+field are `;`-separated.
+`--format json` prints one compact object instead:
+
+```json
+{"schema_version":1,"command":"search","items":[{"id":"...","score":6.58,"type":"reference","matched":["body","title"],"line":18,"snippet":"..."}]}
+```
+
+`schema_version` changes only when a record's fields change incompatibly.
 
 wikiknit looks for `wikiknit.toml` in the current directory and its parents. `--vault <dir>` uses
 the `wikiknit.toml` in or above that folder that names it as its vault, else defaults.
@@ -47,6 +76,7 @@ hubs = ["INDEX"]                # index notes: not mention targets, left out of 
 alias_only = ["Systems/"]       # notes named with common words: found in prose by aliases only
 min_alias_len = 4               # shorter names and aliases are not matched as mentions
 generic_names = ["overview", "index", "readme"]  # stems that take their folder's name
+stemmer = "english"             # search stemming: a Snowball language, or "none"
 
 # A note whose frontmatter `scope` is "project/<name>" must link Projects/<name>/overview.
 [[require_link]]
@@ -89,6 +119,17 @@ link-in-code = "warn"
   style follows Obsidian's documented rules (unique name or path suffix, case-insensitive); when several
   notes match it prefers one in the linking note's folder, then the shortest path, and reports
   `ambiguous-link`.
+
+### Search
+
+`search` ranks notes with BM25F: title (H1, file name) and aliases weigh most, then headings, frontmatter
+values, and body text. Words are lowercased and stemmed (`stemmer`); Chinese, Japanese, Korean, and Thai
+text is indexed as single characters and overlapping pairs. Identifiers like `snapshot.sh` or
+`id_ed25519_vectorpoint` are indexed whole, by their parts, and by their leading sub-identifiers
+(`id_ed25519`); a query keeps them whole. Links count as their display text, not their path. Term
+statistics come from the whole vault, so a filter changes which notes are shown, not their scores. A query that is exactly a note's name, alias, or title
+puts that note first, and notes that many others link to get a small boost. Hub notes are left out
+unless `--include-hubs`. Each hit shows the fields it matched and its best line.
 
 ### Mentions
 

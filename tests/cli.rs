@@ -43,10 +43,18 @@ fn wikiknit(dir: &Path, state: &Path) -> Command {
     cmd
 }
 
-fn json_out(cmd: &mut Command) -> Value {
+/// The JSON envelope of a `--format json` run.
+fn envelope(cmd: &mut Command) -> Value {
     let out = cmd.output().unwrap();
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("bad JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)))
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("bad JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(v["schema_version"], 1);
+    v
+}
+
+/// The `items` of a `--format json` run.
+fn json_out(cmd: &mut Command) -> Value {
+    envelope(cmd)["items"].clone()
 }
 
 fn rules_for(findings: &Value, note: &str) -> Vec<String> {
@@ -172,7 +180,7 @@ fn catalog_and_graph() {
         .iter()
         .find(|e| e["id"] == "Projects/alpha/overview")
         .unwrap();
-    assert_eq!(alpha["kind"], "project");
+    assert_eq!(alpha["type"], "project");
     assert_eq!(alpha["aliases"], json!(["Alpha App"]));
     assert_eq!(alpha["summary"], "The alpha app, built for ACME.");
     assert!(
@@ -183,13 +191,160 @@ fn catalog_and_graph() {
     );
 
     let g = json_out(wikiknit(&v, state.path()).args(["--format", "json", "graph"]));
-    let isolated: Vec<&str> = g["isolated"]
+    let isolated: Vec<&str> = g
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| v.as_str().unwrap())
+        .filter(|r| r["kind"] == "isolated")
+        .map(|r| r["ids"][0].as_str().unwrap())
         .collect();
     assert_eq!(isolated, ["Issues/i1", "Notes/lonely"]);
+}
+
+#[test]
+fn text_output_is_a_header_and_tab_separated_rows() {
+    let state = TempDir::new().unwrap();
+    let v = fixture("basic");
+    let out = wikiknit(&v, state.path()).arg("check").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("# note\tline\tseverity\trule\tmessage"));
+    for line in lines {
+        assert_eq!(line.split('\t').count(), 5, "{line}");
+    }
+    assert!(out.stderr.is_empty(), "no chatter on stderr");
+    // Clean output is empty.
+    let clean = wikiknit(&v, state.path())
+        .args(["check", "Systems/display"])
+        .output()
+        .unwrap();
+    assert!(clean.stdout.is_empty());
+}
+
+#[test]
+fn search_ranks_titles_aliases_and_filters() {
+    let state = TempDir::new().unwrap();
+    let v = fixture("basic");
+    let hits = json_out(wikiknit(&v, state.path()).args(["--format", "json", "search", "acme"]));
+    let ids: Vec<&str> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids[0], "Reference/acme", "{hits}");
+    // An exact alias puts its note first.
+    let alias =
+        json_out(wikiknit(&v, state.path()).args(["--format", "json", "search", "Alpha App"]));
+    assert_eq!(alias[0]["id"], "Projects/alpha/overview");
+    // Filters.
+    let typed = json_out(
+        wikiknit(&v, state.path())
+            .args(["--format", "json", "search", "acme", "--type", "project"]),
+    );
+    assert!(
+        typed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["type"] == "project"),
+        "{typed}"
+    );
+    // Hubs are left out unless asked for.
+    assert!(!ids.contains(&"INDEX"));
+    // A quoted phrase must appear as written.
+    let phrase =
+        json_out(wikiknit(&v, state.path()).args(["--format", "json", "search", "\"acme alpha\""]));
+    assert_eq!(phrase, json!([]));
+}
+
+#[test]
+fn links_lists_neighbors_with_the_linking_line() {
+    let state = TempDir::new().unwrap();
+    let v = fixture("basic");
+    let env = envelope(wikiknit(&v, state.path()).args(["--format", "json", "links", "alpha"]));
+    assert_eq!(env["note"], "Projects/alpha/overview");
+    let edges = env["items"].as_array().unwrap().clone();
+    let find = |id: &str| edges.iter().find(|e| e["id"] == id).cloned();
+    let acme = find("Reference/acme").expect("acme");
+    assert_eq!(acme["dir"], "both");
+    assert_eq!(acme["source"], "Projects/alpha/overview");
+    assert!(
+        acme["context"]
+            .as_str()
+            .unwrap()
+            .contains("[[Reference/acme|ACME]]")
+    );
+    let display = find("Systems/display").expect("display");
+    assert_eq!(display["dir"], "in");
+    assert_eq!(display["source"], "Systems/display");
+    assert_eq!(find("INDEX").expect("hub")["hub"], true);
+    // --out only, and depth 2 does not expand through the hub.
+    let out =
+        json_out(wikiknit(&v, state.path()).args(["--format", "json", "links", "alpha", "--out"]));
+    assert!(out.as_array().unwrap().iter().all(|e| e["dir"] == "out"));
+    let deep = json_out(wikiknit(&v, state.path()).args([
+        "--format",
+        "json",
+        "links",
+        "Systems/display",
+        "--depth",
+        "2",
+    ]));
+    let ids: Vec<&str> = deep
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"Reference/acme"),
+        "reached through alpha: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"Notes/lonely"),
+        "not through the hub: {ids:?}"
+    );
+    // Unknown and ambiguous references are errors that say why.
+    let bad = wikiknit(&v, state.path())
+        .args(["links", "nope"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("no note matches"));
+}
+
+#[test]
+fn catalog_filters() {
+    let state = TempDir::new().unwrap();
+    let v = fixture("basic");
+    let ids = |args: &[&str]| -> Vec<String> {
+        let mut full = vec!["--format", "json", "catalog"];
+        full.extend_from_slice(args);
+        json_out(wikiknit(&v, state.path()).args(&full))
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids(&["--type", "reference"]), ["Reference/acme"]);
+    assert_eq!(ids(&["--path", "Projects"]), ["Projects/alpha/overview"]);
+    assert_eq!(ids(&["--where", "scope=^project/"]), ["Sessions/s1"]);
+    assert_eq!(
+        ids(&["--linked-to", "Reference/acme"]),
+        [
+            "INDEX",
+            "Notes/dup",
+            "Projects/alpha/overview",
+            "Sessions/s1"
+        ]
+    );
+    assert_eq!(ids(&["--tag", "infra"]), ["Systems/display"]);
+    assert_eq!(
+        ids(&["--type", "reference", "--type", "system"]),
+        ["Reference/acme", "Systems/display"]
+    );
 }
 
 fn git_init(dir: &Path) {
@@ -270,7 +425,7 @@ fn commit_is_held_until_marked() {
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&changed.stdout).trim(),
-        "Systems/display"
+        "# id\nSystems/display"
     );
 
     wikiknit(v, state.path())

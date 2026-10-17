@@ -46,6 +46,8 @@ struct RawConfig {
     generic_names: Vec<String>,
     #[serde(default)]
     alias_only: Vec<String>,
+    #[serde(default = "default_stemmer")]
+    stemmer: String,
     #[serde(default)]
     require_link: Vec<RawRequireLink>,
     #[serde(default)]
@@ -70,6 +72,33 @@ struct RawWhen {
 fn default_vault() -> PathBuf {
     PathBuf::from(".")
 }
+fn default_stemmer() -> String {
+    "english".into()
+}
+
+/// Snowball stemmers `search` can use (`none` turns stemming off).
+pub const STEMMERS: &[&str] = &[
+    "none",
+    "arabic",
+    "danish",
+    "dutch",
+    "english",
+    "finnish",
+    "french",
+    "german",
+    "greek",
+    "hungarian",
+    "italian",
+    "norwegian",
+    "portuguese",
+    "romanian",
+    "russian",
+    "spanish",
+    "swedish",
+    "tamil",
+    "turkish",
+];
+
 fn default_min_alias_len() -> usize {
     4
 }
@@ -111,6 +140,8 @@ pub struct Config {
     /// Vault-relative prefixes whose notes are found in prose by their aliases only,
     /// not by their name (for notes named with common words, like `Systems/display`).
     pub alias_only: Vec<String>,
+    /// Stemmer for `search` (a name from [`STEMMERS`]).
+    pub stemmer: String,
     pub require_link: Vec<RequireLink>,
     severity: BTreeMap<String, Severity>,
 }
@@ -128,6 +159,7 @@ impl Config {
             min_alias_len: default_min_alias_len(),
             generic_names: default_generic_names(),
             alias_only: Vec::new(),
+            stemmer: default_stemmer(),
             require_link: Vec::new(),
             severity: BTreeMap::new(),
         }
@@ -212,6 +244,14 @@ impl Config {
                 target: r.target,
             });
         }
+        let stemmer = raw.stemmer.to_lowercase();
+        if !STEMMERS.contains(&stemmer.as_str()) {
+            return Err(bad(format!(
+                "stemmer: unknown `{}` (one of: {})",
+                raw.stemmer,
+                STEMMERS.join(", ")
+            )));
+        }
         for key in raw.severity.keys() {
             if !crate::rules::RULES.iter().any(|(name, _)| name == key) {
                 return Err(bad(format!("severity: unknown rule `{key}`")));
@@ -238,6 +278,7 @@ impl Config {
                 .into_iter()
                 .map(|p| p.trim_start_matches("./").to_string())
                 .collect(),
+            stemmer,
             require_link,
             severity: raw.severity,
         })

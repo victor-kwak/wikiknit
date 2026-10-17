@@ -8,9 +8,14 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use wikiknit::config::{CONFIG_FILE, Config};
+use wikiknit::filter::Filter;
 use wikiknit::hook::{self, Outcome};
+use wikiknit::links::{self, Direction};
 use wikiknit::state::{self, Store};
-use wikiknit::{Vault, catalog, graph, mentions, rules};
+use wikiknit::{Vault, catalog, graph, mentions, rules, search};
+
+/// Version of the `--format json` envelope and record fields.
+const SCHEMA_VERSION: u32 = 1;
 
 /// `println!` that exits quietly when stdout is closed (`wikiknit ... | head`).
 macro_rules! out {
@@ -27,6 +32,10 @@ macro_rules! out {
 }
 
 /// Lint and knit wikilinks in a Markdown vault.
+///
+/// Output is for agents: one record per line, tab-separated, after a `# field...` header;
+/// nothing when there are no records. Lists inside a field are `;`-separated. `--format json` prints one compact JSON object:
+/// `{"schema_version":1,"command":...,"items":[...]}`.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -49,6 +58,40 @@ enum Format {
     Json,
 }
 
+/// Note filters (each kind must match; repeat a flag to accept any of its values).
+#[derive(Debug, Args, Default)]
+struct FilterArgs {
+    /// Frontmatter `type`.
+    #[arg(long = "type", value_name = "TYPE")]
+    types: Vec<String>,
+    /// Note id prefix (folder), e.g. `Projects/`.
+    #[arg(long = "path", value_name = "PREFIX")]
+    paths: Vec<String>,
+    /// Frontmatter field matches a regex anywhere in the value (case-insensitive):
+    /// `stack=cloudflare`; anchor with `^...$` for an exact value.
+    #[arg(long = "where", value_name = "KEY=REGEX")]
+    wheres: Vec<String>,
+    /// Tag, from frontmatter `tags` or inline `#tag` (nested tags match their parent).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Only notes that link to this note (id, path, name, or alias).
+    #[arg(long)]
+    linked_to: Option<String>,
+}
+
+impl FilterArgs {
+    fn build(&self, vault: &Vault) -> Result<Filter> {
+        Ok(Filter::new(
+            vault,
+            &self.types,
+            &self.paths,
+            &self.wheres,
+            &self.tags,
+            self.linked_to.as_deref(),
+        )?)
+    }
+}
+
 #[derive(Debug, Args)]
 struct Select {
     /// Only notes changed in the session that still need a link pass.
@@ -67,8 +110,40 @@ enum Command {
     Check(Select),
     /// List unlinked mentions: text naming another note (name or alias) without a link.
     Mentions(Select),
-    /// One line per note: id, type, aliases, summary.
-    Catalog,
+    /// Ranked full-text search: title, aliases, headings, frontmatter, body.
+    Search {
+        /// Words and "quoted phrases".
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Also search hub notes (excluded by default: they mention everything).
+        #[arg(long)]
+        include_hubs: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// Notes linked to or from a note, with the line each link is written on.
+    Links {
+        /// The note: id, path, name, or alias.
+        note: String,
+        /// Hops to follow (hubs are never expanded through).
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Only links from the note.
+        #[arg(long = "out", conflicts_with = "inbound")]
+        outbound: bool,
+        /// Only links to the note.
+        #[arg(long = "in")]
+        inbound: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// One line per note: id, type, tags, aliases, title, summary.
+    Catalog {
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
     /// Link graph summary: isolated notes and components, hub notes excluded.
     Graph,
     /// List notes changed in the session that still need a link pass.
@@ -217,43 +292,83 @@ fn ids_for(vault: &Vault, paths: &[String]) -> Result<BTreeSet<String>> {
         .collect()
 }
 
-fn print_json<T: Serialize>(value: &T) {
-    out!(
-        "{}",
-        serde_json::to_string_pretty(value).expect("serializable")
-    );
+/// One output field: tabs and newlines become spaces.
+fn field(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
+
+/// Print records: tab-separated lines after a `# header`, or the JSON envelope.
+fn emit<T: Serialize>(
+    format: Format,
+    command: &str,
+    header: &[&str],
+    items: &[T],
+    row: impl Fn(&T) -> Vec<String>,
+) {
+    emit_with(format, command, header, items, row, serde_json::Map::new());
+}
+
+fn emit_with<T: Serialize>(
+    format: Format,
+    command: &str,
+    header: &[&str],
+    items: &[T],
+    row: impl Fn(&T) -> Vec<String>,
+    extra: serde_json::Map<String, serde_json::Value>,
+) {
+    match format {
+        Format::Json => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("schema_version".into(), SCHEMA_VERSION.into());
+            obj.insert("command".into(), command.into());
+            obj.extend(extra);
+            obj.insert(
+                "items".into(),
+                serde_json::to_value(items).expect("serializable"),
+            );
+            out!("{}", serde_json::Value::Object(obj));
+        }
+        Format::Text => {
+            if items.is_empty() {
+                return;
+            }
+            out!("# {}", header.join("\t"));
+            for item in items {
+                let fields: Vec<String> = row(item).iter().map(|f| field(f)).collect();
+                out!("{}", fields.join("\t"));
+            }
+        }
+    }
+}
+
+fn opt(s: Option<&String>) -> String {
+    s.cloned().unwrap_or_default()
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
     let config = load_config(&cli)?;
     let vault = Vault::load(config)?;
-    let json = cli.format == Format::Json;
+    let fmt = cli.format;
     match &cli.command {
         Command::Check(sel) => {
             let selected = selection(&vault, sel)?;
             let findings = rules::check(&vault, selected.as_ref());
             let errors = findings.iter().filter(|f| f.is_error()).count();
-            if json {
-                print_json(&findings);
-            } else {
-                for f in &findings {
-                    out!(
-                        "{}.md:{}: {} [{}] {}",
-                        f.note,
-                        f.line,
-                        f.severity,
-                        f.rule,
-                        f.message
-                    );
-                }
-                let notes: BTreeSet<_> = findings.iter().map(|f| &f.note).collect();
-                let checked = selected.as_ref().map_or(vault.notes.len(), BTreeSet::len);
-                eprintln!(
-                    "{checked} note(s) checked: {errors} error(s), {} warning(s), in {} note(s)",
-                    findings.len() - errors,
-                    notes.len()
-                );
-            }
+            emit(
+                fmt,
+                "check",
+                &["note", "line", "severity", "rule", "message"],
+                &findings,
+                |f| {
+                    vec![
+                        f.note.clone(),
+                        f.line.to_string(),
+                        f.severity.to_string(),
+                        f.rule.to_string(),
+                        f.message.clone(),
+                    ]
+                },
+            );
             Ok(if errors > 0 {
                 ExitCode::from(1)
             } else {
@@ -263,91 +378,195 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Mentions(sel) => {
             let selected = selection(&vault, sel)?;
             let found = mentions::find(&vault, selected.as_ref());
-            if json {
-                print_json(&found);
-            } else {
-                for m in &found {
-                    let times = if m.count > 1 {
-                        format!(" ({}x)", m.count)
-                    } else {
-                        String::new()
-                    };
-                    out!(
-                        "{}.md:{}: \"{}\" -> [[{}]]{times}  | {}",
-                        m.note,
-                        m.line,
-                        m.term,
-                        m.target,
-                        m.context
-                    );
-                }
-            }
+            emit(
+                fmt,
+                "mentions",
+                &["note", "line", "term", "target", "count", "context"],
+                &found,
+                |m| {
+                    vec![
+                        m.note.clone(),
+                        m.line.to_string(),
+                        m.term.clone(),
+                        m.target.clone(),
+                        m.count.to_string(),
+                        m.context.clone(),
+                    ]
+                },
+            );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Catalog => {
-            let entries = catalog::build(&vault);
-            if json {
-                print_json(&entries);
-            } else {
-                for e in &entries {
-                    let kind = e
-                        .kind
-                        .as_deref()
-                        .map(|k| format!(" [{k}]"))
-                        .unwrap_or_default();
-                    let hub = if e.hub { " (hub)" } else { "" };
-                    let aliases = if e.aliases.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {{{}}}", e.aliases.join(", "))
-                    };
-                    let title = e
-                        .title
-                        .as_deref()
-                        .map(|t| format!("{t} — "))
-                        .unwrap_or_default();
-                    out!("{}{kind}{hub}{aliases}: {title}{}", e.id, e.summary);
-                }
-            }
+        Command::Search {
+            query,
+            limit,
+            include_hubs,
+            filter,
+        } => {
+            let filter = filter.build(&vault)?;
+            let hits = search::search(&vault, &query.join(" "), &filter, *include_hubs, *limit);
+            emit(
+                fmt,
+                "search",
+                &["id", "score", "type", "matched", "line", "snippet"],
+                &hits,
+                |h| {
+                    vec![
+                        h.id.clone(),
+                        format!("{:.2}", h.score),
+                        opt(h.kind.as_ref()),
+                        h.matched.join(";"),
+                        h.line.to_string(),
+                        h.snippet.clone(),
+                    ]
+                },
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Links {
+            note,
+            depth,
+            outbound,
+            inbound,
+            filter,
+        } => {
+            let start = vault.find_note(note)?;
+            let filter = filter.build(&vault)?;
+            let dir = match (outbound, inbound) {
+                (true, _) => Direction::Out,
+                (_, true) => Direction::In,
+                _ => Direction::Both,
+            };
+            let edges = links::neighbors(&vault, start, *depth, dir, &filter);
+            let mut extra = serde_json::Map::new();
+            extra.insert("note".into(), vault.notes[start].id.clone().into());
+            emit_with(
+                fmt,
+                "links",
+                &[
+                    "dir",
+                    "depth",
+                    "id",
+                    "hub",
+                    "type",
+                    "via",
+                    "source",
+                    "line",
+                    "context",
+                    "back_line",
+                    "back_context",
+                    "count",
+                    "summary",
+                ],
+                &edges,
+                |e| {
+                    vec![
+                        e.dir.to_string(),
+                        e.depth.to_string(),
+                        e.id.clone(),
+                        e.hub.to_string(),
+                        opt(e.kind.as_ref()),
+                        e.via.clone(),
+                        e.source.clone(),
+                        e.line.to_string(),
+                        e.context.clone(),
+                        e.back_line.map(|l| l.to_string()).unwrap_or_default(),
+                        opt(e.back_context.as_ref()),
+                        e.count.to_string(),
+                        e.summary.clone(),
+                    ]
+                },
+                extra,
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Catalog { filter } => {
+            let filter = filter.build(&vault)?;
+            let entries: Vec<catalog::Entry> = catalog::build(&vault)
+                .into_iter()
+                .filter(|e| {
+                    filter.is_empty() || vault.get(&e.id).is_some_and(|n| filter.matches(&vault, n))
+                })
+                .collect();
+            emit(
+                fmt,
+                "catalog",
+                &["id", "hub", "type", "tags", "aliases", "title", "summary"],
+                &entries,
+                |e| {
+                    vec![
+                        e.id.clone(),
+                        e.hub.to_string(),
+                        opt(e.kind.as_ref()),
+                        e.tags.join(";"),
+                        e.aliases.join(";"),
+                        opt(e.title.as_ref()),
+                        e.summary.clone(),
+                    ]
+                },
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Graph => {
             let r = graph::report(&vault);
-            if json {
-                print_json(&r);
-            } else {
+            let mut rows: Vec<serde_json::Value> = r
+                .isolated
+                .iter()
+                .map(|id| serde_json::json!({"kind": "isolated", "size": 1, "ids": [id]}))
+                .collect();
+            rows.extend(
+                r.components
+                    .iter()
+                    .map(|c| serde_json::json!({"kind": "component", "size": c.len(), "ids": c})),
+            );
+            let mut extra = serde_json::Map::new();
+            extra.insert("notes".into(), r.notes.into());
+            extra.insert("links".into(), r.links.into());
+            extra.insert("hubs".into(), r.hubs.clone().into());
+            if fmt == Format::Text {
                 out!(
-                    "{} notes, {} links; hubs excluded: {}",
+                    "# notes={} links={} hubs={}",
                     r.notes,
                     r.links,
-                    r.hubs.join(", ")
+                    r.hubs.join(",")
                 );
-                out!("isolated ({}):", r.isolated.len());
-                for id in &r.isolated {
-                    out!("  {id}");
-                }
-                out!("components ({}):", r.components.len());
-                for c in &r.components {
-                    if c.len() <= 12 {
-                        out!("  [{}] {}", c.len(), c.join(", "));
-                    } else {
-                        out!("  [{}] {}, ...", c.len(), c[..6].join(", "));
-                    }
-                }
             }
+            emit_with(
+                fmt,
+                "graph",
+                &["kind", "size", "ids"],
+                &rows,
+                |v| {
+                    vec![
+                        v["kind"].as_str().unwrap_or_default().to_string(),
+                        v["size"].to_string(),
+                        v["ids"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(";")
+                            })
+                            .unwrap_or_default(),
+                    ]
+                },
+                extra,
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Changed { session, all } => {
-            let changed = if *all {
-                Store::open(&vault.config.vault)?.pending(&state::current_hashes(&vault))?
+            let changed: Vec<String> = if *all {
+                Store::open(&vault.config.vault)?
+                    .pending(&state::current_hashes(&vault))?
+                    .into_iter()
+                    .collect()
             } else {
-                session_changed(&vault, session.as_deref())?.2
+                session_changed(&vault, session.as_deref())?
+                    .2
+                    .into_iter()
+                    .collect()
             };
-            if json {
-                print_json(&changed);
-            } else {
-                changed.iter().for_each(|id| out!("{id}"));
-            }
+            emit(fmt, "changed", &["id"], &changed, |id| vec![id.clone()]);
             Ok(ExitCode::SUCCESS)
         }
         Command::Mark {
@@ -366,27 +585,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 let (store, _, changed) = session_changed(&vault, session.as_deref())?;
                 (store, changed)
             };
-            let marked = store.mark(&ids, &now)?;
-            if json {
-                print_json(&marked);
-            } else {
-                eprintln!("marked {} note(s) as linked", marked.len());
-            }
+            let marked: Vec<String> = store.mark(&ids, &now)?.into_iter().collect();
+            emit(fmt, "mark", &["marked"], &marked, |id| vec![id.clone()]);
             Ok(ExitCode::SUCCESS)
         }
         Command::Baseline { session, reset } => {
             let store = Store::open(&vault.config.vault)?;
             if *reset {
                 let _ = std::fs::remove_file(store.session_path(session));
-            } else if store.load_session(session)?.is_some() {
-                eprintln!("session `{session}` already started (use --reset to restart it)");
-                return Ok(ExitCode::SUCCESS);
             }
             store.start_session(session, &state::current_hashes(&vault), false)?;
-            eprintln!(
-                "session `{session}` started: {}",
-                store.session_path(session).display()
-            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Hook { .. } => unreachable!("handled in main"),
