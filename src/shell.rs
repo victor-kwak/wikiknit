@@ -17,9 +17,10 @@ pub struct GitCall {
     pub subcommand: String,
     /// Aliases defined on the command line: `git -c alias.ci=commit ci`.
     pub inline_aliases: Vec<(String, String)>,
-    /// Git config may come from the environment (`GIT_CONFIG_*`, `--config-env`), so an
-    /// alias cannot be looked up.
-    pub config_from_env: bool,
+    /// Config or command lookup is overridden for this call (`-c` other than `alias.*`,
+    /// `--config-env`, `--exec-path`, or `GIT_*`, `HOME`, `XDG_CONFIG_HOME`, `PATH` set in
+    /// the command), so an alias or external command cannot be resolved reliably.
+    pub config_overridden: bool,
 }
 
 /// Every git invocation the command would run.
@@ -101,9 +102,12 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
             Item::Cmd(words) => {
                 commands.push(words.clone());
                 piped.push(false);
-                let sets_git_config = words
-                    .iter()
-                    .any(|w| w.starts_with("GIT_CONFIG") && w.contains('='));
+                // Variables that change where git finds config or commands.
+                let sets_git_config = words.iter().any(|w| {
+                    w.split_once('=').is_some_and(|(k, _)| {
+                        k.starts_with("GIT_") || matches!(k, "HOME" | "XDG_CONFIG_HOME" | "PATH")
+                    })
+                });
                 let first = words.first().map(String::as_str);
                 if sets_git_config
                     && (matches!(first, Some("export" | "declare" | "typeset" | "readonly"))
@@ -208,28 +212,33 @@ fn shell_reads_stdin(args: &[String]) -> bool {
     true
 }
 
-fn parse_git(args: &[String], cds: &[String], config_from_env: bool) -> Option<GitCall> {
+fn parse_git(args: &[String], cds: &[String], config_overridden: bool) -> Option<GitCall> {
     let mut dirs = cds.to_vec();
     let mut inline_aliases = Vec::new();
-    let mut config_from_env = config_from_env;
+    let mut config_overridden = config_overridden;
     let mut it = args.iter();
     while let Some(t) = it.next() {
         match t.as_str() {
             "-C" | "--work-tree" | "--git-dir" => dirs.push(it.next()?.clone()),
             "-c" => {
                 let kv = it.next()?;
-                if let Some((k, v)) = kv.split_once('=')
-                    && let Some(name) = k.strip_prefix("alias.")
-                {
+                // Config keys are case-insensitive: `-c ALIAS.X=commit` defines alias `x`.
+                let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), "true"));
+                let k = k.to_ascii_lowercase();
+                if let Some(name) = k.strip_prefix("alias.") {
                     inline_aliases.push((name.to_string(), v.to_string()));
+                } else {
+                    config_overridden = true; // include.path, includeIf, ...
                 }
             }
-            "--config-env" => {
+            "--config-env" | "--exec-path" => {
                 it.next();
-                config_from_env = true;
+                config_overridden = true;
             }
-            s if s.starts_with("--config-env=") => config_from_env = true,
-            "--namespace" | "--exec-path" => {
+            s if s.starts_with("--config-env=") || s.starts_with("--exec-path") => {
+                config_overridden = true;
+            }
+            "--namespace" => {
                 it.next();
             }
             s if s.starts_with("--work-tree=") => {
@@ -242,7 +251,7 @@ fn parse_git(args: &[String], cds: &[String], config_from_env: bool) -> Option<G
                     dirs,
                     subcommand: sub.to_string(),
                     inline_aliases,
-                    config_from_env,
+                    config_overridden,
                 });
             }
         }
@@ -856,9 +865,21 @@ mod tests {
             inline[0].inline_aliases,
             vec![("x".into(), "commit".into())]
         );
-        assert!(!inline[0].config_from_env);
-        assert!(git_calls("GIT_CONFIG_COUNT=1 git x")[0].config_from_env);
-        assert!(git_calls("export GIT_CONFIG_COUNT=1; git x")[0].config_from_env);
-        assert!(git_calls("git --config-env=alias.x=V x")[0].config_from_env);
+        assert!(!inline[0].config_overridden);
+        let upper = git_calls("git -c ALIAS.X=commit x");
+        assert_eq!(upper[0].inline_aliases, vec![("x".into(), "commit".into())]);
+        for c in [
+            "GIT_CONFIG_COUNT=1 git x",
+            "export GIT_CONFIG_COUNT=1; git x",
+            "git --config-env=alias.x=V x",
+            "git -c include.path=/tmp/c x",
+            "HOME=/tmp git x",
+            "XDG_CONFIG_HOME=/tmp git x",
+            "PATH=/tmp:$PATH git x",
+            "GIT_EXEC_PATH=/tmp git x",
+            "git --exec-path=/tmp x",
+        ] {
+            assert!(git_calls(c)[0].config_overridden, "{c}");
+        }
     }
 }

@@ -252,19 +252,19 @@ fn is_commit(call: &shell::GitCall, subcommand: &str, dir: &Path, depth: usize) 
     let alias = call
         .inline_aliases
         .iter()
-        .find(|(name, _)| name == subcommand)
+        .find(|(name, _)| name.eq_ignore_ascii_case(subcommand))
         .map(|(_, v)| v.clone())
         .or_else(|| {
-            if call.config_from_env {
+            if call.config_overridden {
                 None
             } else {
                 git_output(dir, &["config", "--get", &format!("alias.{subcommand}")])
             }
         });
     let Some(alias) = alias else {
-        // No alias we can see: hold if the config is out of view, or if an external
-        // `git-<name>` program would run (it may commit).
-        return call.config_from_env || external_git_command(subcommand);
+        // No alias we can see: hold if config or command lookup is overridden (we cannot
+        // know what runs), or if an external `git-<name>` program would run (it may commit).
+        return call.config_overridden || external_git_command(subcommand);
     };
     let alias = alias.trim();
     if let Some(script) = alias.strip_prefix('!') {

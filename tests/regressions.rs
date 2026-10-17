@@ -616,6 +616,10 @@ fn inline_env_and_external_aliases_are_held() {
         "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=commit git x",
         "export GIT_CONFIG_COUNT=1; git x",
         "git --config-env=alias.x=CMD x",
+        "git -c ALIAS.X=commit x -m y",
+        "git -c include.path=/tmp/evil x",
+        "HOME=/tmp/other git x",
+        "PATH=/tmp/bin:$PATH git x",
     ] {
         let out = hook(
             p,
