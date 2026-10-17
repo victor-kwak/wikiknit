@@ -26,6 +26,10 @@ const K1: f64 = 1.2;
 const SNIPPET_LEN: usize = 160;
 /// Characters that join parts of an identifier inside one Unicode word.
 const JOINERS: &[char] = &['.', '_', ':', '@'];
+/// Longer identifiers are indexed whole only.
+const MAX_IDENT_LEN: usize = 128;
+/// At most this many parts, and this many prefixes, per identifier.
+const MAX_PARTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -188,20 +192,28 @@ impl Analyzer {
             if word.contains(JOINERS) {
                 // The whole identifier, then (documents) its parts at the same position.
                 out.push(Token::new(start, lower.clone(), true));
-                if split_parts {
-                    for part in lower.split(JOINERS).filter(|p| !p.is_empty()) {
+                // Bounded: a long word full of joiners (`a.a.a.a...`) must not cost quadratic
+                // time and memory, so long identifiers are indexed whole only, and at most
+                // MAX_PARTS parts and prefixes are made per word.
+                if split_parts && lower.len() <= MAX_IDENT_LEN {
+                    for part in lower
+                        .split(JOINERS)
+                        .filter(|p| !p.is_empty())
+                        .take(MAX_PARTS)
+                    {
                         let term = self.stem(part.to_string());
                         out.push(Token::new(start, term, false));
                     }
                     // Leading sub-identifiers, so a query for `id_ed25519` also finds
-                    // `id_ed25519_vectorpoint`: every prefix that ends before a joiner.
-                    for (i, c) in lower.char_indices() {
-                        if i > 0 && JOINERS.contains(&c) {
-                            let prefix = &lower[..i];
-                            if prefix.contains(JOINERS) {
-                                out.push(Token::new(start, prefix.to_string(), false));
-                            }
-                        }
+                    // `id_ed25519_vectorpoint`: prefixes that end before a joiner.
+                    let ends = lower
+                        .char_indices()
+                        .filter(|&(i, c)| i > 0 && JOINERS.contains(&c))
+                        .map(|(i, _)| i)
+                        .skip(1) // the first prefix has no joiner in it: it is a part
+                        .take(MAX_PARTS);
+                    for i in ends {
+                        out.push(Token::new(start, lower[..i].to_string(), false));
                     }
                 }
             } else {
@@ -601,6 +613,19 @@ mod tests {
             an.terms("id_ed25519_vectorpoint")
                 .contains(&"id_ed25519".to_string())
         );
+    }
+
+    #[test]
+    fn identifier_splitting_is_bounded() {
+        let mut an = Analyzer::new("none");
+        // A huge joiner-filled word: indexed whole only.
+        let huge = "a.".repeat(5_000);
+        assert_eq!(an.terms(&huge).len(), 1);
+        // A long but allowed one: at most MAX_PARTS parts and MAX_PARTS prefixes.
+        let many = "ab.".repeat(30);
+        let many = many.trim_end_matches('.');
+        assert!(many.len() <= MAX_IDENT_LEN);
+        assert!(an.terms(many).len() <= 1 + 2 * MAX_PARTS);
     }
 
     #[test]
