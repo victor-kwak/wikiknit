@@ -287,6 +287,14 @@ impl Vault {
         self.by_id.get(id).copied()
     }
 
+    /// Notes whose id matches ignoring case (several when ids differ only by case).
+    #[must_use]
+    pub fn ids_ignoring_case(&self, id: &str) -> &[usize] {
+        self.by_id_lower
+            .get(&id.to_lowercase())
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// Map a CLI argument (note id, vault-relative path, or file path) to a note id.
     #[must_use]
     pub fn id_for_arg(&self, arg: &str, cwd: &Path) -> Option<String> {

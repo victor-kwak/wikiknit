@@ -56,12 +56,12 @@ struct Occurrence {
 }
 
 /// Every note-to-note link in the vault, by (source, target).
-struct Index {
+pub(crate) struct Index {
     out: Vec<BTreeMap<usize, Occurrence>>,
     inbound: Vec<BTreeMap<usize, Occurrence>>,
 }
 
-fn build_index(vault: &Vault) -> Index {
+pub(crate) fn build_index(vault: &Vault) -> Index {
     let n = vault.notes.len();
     let mut out: Vec<BTreeMap<usize, Occurrence>> = vec![BTreeMap::new(); n];
     for (i, note) in vault.notes.iter().enumerate() {
@@ -100,7 +100,18 @@ pub fn neighbors(
     dir: Direction,
     filter: &Filter,
 ) -> Vec<Edge> {
-    let index = build_index(vault);
+    neighbors_in(vault, &build_index(vault), start, depth, dir, filter)
+}
+
+/// [`neighbors`] with a link index built once (for many start notes).
+pub(crate) fn neighbors_in(
+    vault: &Vault,
+    index: &Index,
+    start: usize,
+    depth: usize,
+    dir: Direction,
+    filter: &Filter,
+) -> Vec<Edge> {
     let generic = &vault.config.generic_names;
     let mut seen: BTreeSet<usize> = BTreeSet::from([start]);
     let mut frontier = vec![start];

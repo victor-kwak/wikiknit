@@ -20,7 +20,12 @@ Read the vault's own instructions first if it has any (a `CLAUDE.md`, `AGENTS.md
 wikiknit check --changed
 ```
 
-Each finding has a `fix` column: the replacement link, the quoted frontmatter line, the closest existing notes for a broken link, or where a required link goes. Apply it.
+Each finding has a `fix` column: the replacement link, the quoted frontmatter line, the closest existing notes for a broken link, or where a required link goes (for `missing-required-inbound`, the edit is in the other note). Apply it.
+
+Warnings:
+
+- `orphan`: no note links the changed note. Link it from the notes the fix names (the ones it links), or from the note it belongs under.
+- `stale`: a date field such as `last_verified` is past its limit. Update the date only if you checked the note against its source in this task; otherwise leave it.
 
 ## 2. Get suggestions
 
@@ -45,6 +50,7 @@ Suggestions are candidates, not orders. For each, decide with what you know abou
 Suggestions come from the vault's text and links. Your task context knows more. For each changed note, name the things it is about and check they are linked:
 
 ```bash
+wikiknit context <note> --budget 3000       # the note and its neighbors, ranked, in one read
 wikiknit links <note>                       # what it links to and what links to it, with the lines
 wikiknit search <topic words> --limit 10    # find a note by words or meaning
 wikiknit catalog --type project             # or --path Reference/, --where stack=cloudflare
@@ -58,7 +64,11 @@ wikiknit catalog --type project             # or --path Reference/, --where stac
 
 ## 5. Grow the vocabulary
 
-When you link something no `mention` suggestion found (a synonym, a product name, an abbreviation, a client name), add that word to the target note's `aliases:` frontmatter, so the next pass finds it. Keep aliases specific: avoid common words, and do not reuse an alias another note has (`check` reports duplicates).
+```bash
+wikiknit aliases <note>        # terms the vault already uses for it, with evidence and the edit
+```
+
+Apply the ones that really name the note. Also, when you link something no `mention` suggestion found (a synonym, a product name, an abbreviation, a client name), add that word to the target note's `aliases:` frontmatter, so the next pass finds it. Keep aliases specific: avoid common words, and do not reuse an alias another note has (`check` reports duplicates).
 
 ## 6. Verify and record
 

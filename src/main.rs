@@ -179,6 +179,14 @@ struct FilterArgs {
 }
 
 impl FilterArgs {
+    fn is_set(&self) -> bool {
+        !(self.types.is_empty()
+            && self.paths.is_empty()
+            && self.wheres.is_empty()
+            && self.tags.is_empty()
+            && self.linked_to.is_none())
+    }
+
     fn build(&self, vault: &Vault) -> Result<Filter> {
         Ok(Filter::new(
             vault,
@@ -243,6 +251,42 @@ enum Command {
         /// one shared value or two shared links about 0.5-1).
         #[arg(long, default_value_t = 0.75)]
         min_score: f64,
+    },
+    /// A context pack sized to a token budget: the note (or the best search hits for a
+    /// question), then the notes linked to and from it. Whole notes while they fit, an excerpt
+    /// of a large seed, summaries for the rest; each entry says why it is included.
+    Context {
+        /// The note: id, path, name, or alias.
+        #[arg(required_unless_present = "query", conflicts_with = "query")]
+        note: Option<String>,
+        /// A question or topic: its top search hits are the seeds.
+        #[arg(long)]
+        query: Option<String>,
+        /// Token budget (estimated: ~4 characters per token).
+        #[arg(long, default_value_t = 4000, value_parser = clap::value_parser!(u64).range(200..))]
+        budget: u64,
+        /// Link hops from the seeds.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+        depth: u64,
+        /// Search hits used as seeds for --query.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        seeds: u64,
+        #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
+        mode: Mode,
+        /// Filters for the --query seeds.
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// Alias candidates: terms the vault uses for a note that do not name it yet, with the
+    /// evidence and the frontmatter edit.
+    Aliases {
+        /// Only aliases for this note (id, path, name, or alias).
+        note: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Notes that must use a term (as link text, or capitalized in prose) before it counts.
+        #[arg(long, default_value_t = 2)]
+        min_notes: usize,
     },
     /// Build or update the semantic index (downloads the embedding model on first use).
     Embed {
@@ -468,6 +512,45 @@ fn emit_with<T: Serialize>(
     }
 }
 
+/// The pack as text: a header line, then each note in `<note>` tags (note text is Markdown
+/// with its own headings, so tags keep entries apart), then the omitted notes.
+fn print_pack(pack: &wikiknit::context::Pack) {
+    let attr = |s: &str| s.replace('&', "&amp;").replace('"', "&quot;");
+    let body = |s: &str| s.replace("</note>", "&lt;/note>");
+    out!(
+        "# context budget={} used={} entries={} omitted={}",
+        pack.budget,
+        pack.used,
+        pack.entries.len(),
+        pack.omitted.len()
+    );
+    for e in &pack.entries {
+        let content = match e.content {
+            wikiknit::context::Content::Full => "full",
+            wikiknit::context::Content::Excerpt => "excerpt",
+            wikiknit::context::Content::Summary => "summary",
+        };
+        let lines = if e.lines.is_empty() {
+            String::new()
+        } else {
+            format!(" lines=\"{}\"", e.lines)
+        };
+        out!(
+            "<note id=\"{}\" role=\"{}\" content=\"{content}\"{lines} score=\"{:.2}\" tokens=\"{}\">",
+            attr(&e.id),
+            e.role,
+            e.score,
+            e.tokens
+        );
+        out!("<why>{}</why>", body(&field(&e.why.join("; "))));
+        out!("{}", body(e.text.trim_end()));
+        out!("</note>");
+    }
+    if !pack.omitted.is_empty() {
+        out!("<omitted>{}</omitted>", pack.omitted.join("; "));
+    }
+}
+
 #[cfg(feature = "semantic")]
 fn embed(vault: &Vault, fmt: Format, rebuild: bool) -> Result<ExitCode> {
     let name = &vault.config.embedding_model;
@@ -629,6 +712,134 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Embed { rebuild } => embed(&vault, fmt, *rebuild),
+        Command::Context {
+            note,
+            query,
+            budget,
+            depth,
+            seeds,
+            mode,
+            filter,
+        } => {
+            let mut extra = serde_json::Map::new();
+            let seeds: Vec<wikiknit::context::Seed> = if let Some(q) = query {
+                if q.trim().is_empty() {
+                    bail!("--query is empty");
+                }
+                let filter = filter.build(&vault)?;
+                let (ranked, used) = meaning(&vault, q, false, *mode)?;
+                extra.insert("mode".into(), format!("{used:?}").to_lowercase().into());
+                let hits = search::search(
+                    &vault,
+                    q,
+                    &filter,
+                    &search::Options {
+                        include_hubs: false,
+                        limit: usize::try_from(*seeds).unwrap_or(usize::MAX),
+                        semantic: ranked.as_deref(),
+                        lexical: used != Mode::Semantic,
+                    },
+                );
+                let top = hits.first().map_or(1.0, |h| h.score.max(1e-9));
+                hits.iter()
+                    .filter_map(|h| {
+                        let note = vault.index_of(&h.id)?;
+                        let sim = h
+                            .similarity
+                            .map(|s| format!("; similarity {s:.2}"))
+                            .unwrap_or_default();
+                        Some(wikiknit::context::Seed {
+                            note,
+                            score: h.score / top,
+                            why: if h.line == 0 {
+                                format!("search hit: matched {}{sim}", h.matched.join(", "))
+                            } else {
+                                format!(
+                                    "search hit: matched {} at line {}{sim}",
+                                    h.matched.join(", "),
+                                    h.line
+                                )
+                            },
+                            line: (h.line > 0).then_some(h.line),
+                            snippet: (!h.snippet.is_empty()).then(|| h.snippet.clone()),
+                        })
+                    })
+                    .collect()
+            } else {
+                if filter.is_set() {
+                    bail!(
+                        "filters choose --query seeds; with a note, use `wikiknit links` to filter its neighbors"
+                    );
+                }
+                let start = vault.find_note(note.as_deref().expect("required by clap"))?;
+                vec![wikiknit::context::Seed {
+                    note: start,
+                    score: 1.0,
+                    why: "the note asked for".into(),
+                    line: None,
+                    snippet: None,
+                }]
+            };
+            if seeds.is_empty() {
+                eprintln!("wikiknit: no note matches the query");
+            }
+            let size = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+            let pack = wikiknit::context::build(&vault, &seeds, size(*depth), size(*budget));
+            match fmt {
+                Format::Json => {
+                    extra.insert("budget".into(), pack.budget.into());
+                    extra.insert("used".into(), pack.used.into());
+                    extra.insert("omitted".into(), pack.omitted.clone().into());
+                    emit_with(fmt, "context", &[], &pack.entries, |_| Vec::new(), extra);
+                }
+                Format::Text => print_pack(&pack),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Aliases {
+            note,
+            limit,
+            min_notes,
+        } => {
+            let only = note.as_deref().map(|n| vault.find_note(n)).transpose()?;
+            if let Some(i) = only
+                && vault.config.is_hub(&vault.notes[i].id)
+            {
+                eprintln!(
+                    "wikiknit: {} is a hub; hubs get no aliases",
+                    vault.notes[i].id
+                );
+            }
+            let found = wikiknit::aliases::suggest(&vault, only, *limit, (*min_notes).max(1));
+            let joined =
+                |a: &wikiknit::aliases::AliasSuggestion,
+                 f: &dyn Fn(&wikiknit::aliases::Term) -> String,
+                 sep: &str| { a.terms.iter().map(f).collect::<Vec<_>>().join(sep) };
+            emit(
+                fmt,
+                "aliases",
+                &[
+                    "target", "score", "terms", "notes", "reasons", "line", "edit",
+                ],
+                &found,
+                |a| {
+                    vec![
+                        a.target.clone(),
+                        format!("{:.2}", a.score),
+                        joined(a, &|x| x.term.clone(), ";"),
+                        joined(a, &|x| x.notes.to_string(), ";"),
+                        joined(
+                            a,
+                            &|x| format!("{}: {}", x.term, x.reasons.join(", ")),
+                            " | ",
+                        ),
+                        a.line.to_string(),
+                        a.edit.clone(),
+                    ]
+                },
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Suggest {
             note,
             changed,

@@ -61,6 +61,12 @@ struct RawConfig {
     #[serde(default)]
     require_link: Vec<RawRequireLink>,
     #[serde(default)]
+    require_inbound: Vec<RawRequireInbound>,
+    #[serde(default)]
+    orphan_exempt: Vec<String>,
+    #[serde(default)]
+    stale: Vec<RawStale>,
+    #[serde(default)]
     severity: BTreeMap<String, Severity>,
 }
 
@@ -69,6 +75,24 @@ struct RawConfig {
 struct RawRequireLink {
     when: RawWhen,
     target: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRequireInbound {
+    when: RawWhen,
+    from: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStale {
+    field: String,
+    days: u32,
+    path: Option<String>,
+    #[serde(default)]
+    required: bool,
+    fix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,6 +172,28 @@ pub struct RequireLink {
     pub target: String,
 }
 
+/// Notes matching `when` must be linked from note `from`.
+#[derive(Debug, Clone)]
+pub struct RequireInbound {
+    pub when: When,
+    /// Note id that must link them; `$1`, `$2`, ... are capture groups from `when`.
+    pub from: String,
+}
+
+/// A note whose date `field` is older than `days` is stale.
+#[derive(Debug, Clone)]
+pub struct Stale {
+    /// Frontmatter field holding a date (`YYYY-MM-DD`, optionally followed by a time).
+    pub field: String,
+    pub days: u32,
+    /// Only notes whose id matches; `None` = every note.
+    pub path: Option<Regex>,
+    /// A matching note without the field is reported too.
+    pub required: bool,
+    /// The fix to show instead of the default ("check the note against its source, ...").
+    pub fix: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Absolute vault root.
@@ -180,6 +226,11 @@ pub struct Config {
     /// Prefixes of notes whose links do not ask for a link back (logs: `Sessions/`).
     pub no_backlink_from: Vec<String>,
     pub require_link: Vec<RequireLink>,
+    pub require_inbound: Vec<RequireInbound>,
+    /// Prefixes of notes that need no inbound link (logs, inboxes): the `orphan` rule skips them.
+    pub orphan_exempt: Vec<String>,
+    /// Freshness rules; the first whose `path` matches a note applies to it.
+    pub stale: Vec<Stale>,
     severity: BTreeMap<String, Severity>,
 }
 
@@ -203,6 +254,9 @@ impl Config {
             semantic_margin: default_semantic_margin(),
             no_backlink_from: Vec::new(),
             require_link: Vec::new(),
+            require_inbound: Vec::new(),
+            orphan_exempt: Vec::new(),
+            stale: Vec::new(),
             severity: BTreeMap::new(),
         }
     }
@@ -263,27 +317,48 @@ impl Config {
             path: path.to_path_buf(),
             message,
         };
+        let when = |w: RawWhen, key: &str| -> Result<When, Error> {
+            match (w.field, w.matches, w.path) {
+                (Some(field), Some(m), None) => Ok(When::Field {
+                    field,
+                    pattern: Regex::new(&m).map_err(|e| bad(format!("{key}.when.matches: {e}")))?,
+                }),
+                (None, None, Some(p)) => Ok(When::Path {
+                    pattern: Regex::new(&p).map_err(|e| bad(format!("{key}.when.path: {e}")))?,
+                }),
+                _ => Err(bad(format!(
+                    "{key}.when needs either `field` + `matches`, or `path`"
+                ))),
+            }
+        };
         let mut require_link = Vec::new();
         for r in raw.require_link {
-            let when = match (r.when.field, r.when.matches, r.when.path) {
-                (Some(field), Some(m), None) => When::Field {
-                    field,
-                    pattern: Regex::new(&m)
-                        .map_err(|e| bad(format!("require_link.when.matches: {e}")))?,
-                },
-                (None, None, Some(p)) => When::Path {
-                    pattern: Regex::new(&p)
-                        .map_err(|e| bad(format!("require_link.when.path: {e}")))?,
-                },
-                _ => {
-                    return Err(bad(
-                        "require_link.when needs either `field` + `matches`, or `path`".into(),
-                    ));
-                }
-            };
             require_link.push(RequireLink {
-                when,
-                target: r.target,
+                when: when(r.when, "require_link")?,
+                target: note_ref(&r.target),
+            });
+        }
+        let mut require_inbound = Vec::new();
+        for r in raw.require_inbound {
+            require_inbound.push(RequireInbound {
+                when: when(r.when, "require_inbound")?,
+                from: note_ref(&r.from),
+            });
+        }
+        let mut stale = Vec::new();
+        for s in raw.stale {
+            if s.field.trim().is_empty() {
+                return Err(bad("stale.field must name a frontmatter field".into()));
+            }
+            stale.push(Stale {
+                field: s.field,
+                days: s.days,
+                path: s
+                    .path
+                    .map(|p| Regex::new(&p).map_err(|e| bad(format!("stale.path: {e}"))))
+                    .transpose()?,
+                required: s.required,
+                fix: s.fix,
             });
         }
         let stemmer = raw.stemmer.to_lowercase();
@@ -331,6 +406,13 @@ impl Config {
                 .map(|p| p.trim_start_matches("./").to_string())
                 .collect(),
             require_link,
+            require_inbound,
+            orphan_exempt: raw
+                .orphan_exempt
+                .into_iter()
+                .map(|p| p.trim_start_matches("./").to_string())
+                .collect(),
+            stale,
             severity: raw.severity,
         })
     }
@@ -367,6 +449,19 @@ impl Config {
     }
 
     #[must_use]
+    pub fn is_orphan_exempt(&self, id: &str) -> bool {
+        under_any(&self.orphan_exempt, id)
+    }
+
+    /// The freshness rule for a note: the first `[[stale]]` whose `path` matches it.
+    #[must_use]
+    pub fn stale_rule(&self, id: &str) -> Option<&Stale> {
+        self.stale
+            .iter()
+            .find(|s| s.path.as_ref().is_none_or(|p| p.is_match(id)))
+    }
+
+    #[must_use]
     pub fn is_alias_only(&self, id: &str) -> bool {
         under_any(&self.alias_only, id)
     }
@@ -375,6 +470,12 @@ impl Config {
     pub fn is_hub(&self, id: &str) -> bool {
         self.hubs.iter().any(|h| h == id)
     }
+}
+
+/// A note named in config as written (`./INDEX.md`) -> its id form (`INDEX`).
+fn note_ref(s: &str) -> String {
+    let s = s.trim().trim_start_matches("./").trim_start_matches('/');
+    s.strip_suffix(".md").unwrap_or(s).to_string()
 }
 
 /// `path` equals one of the prefixes or sits under it.

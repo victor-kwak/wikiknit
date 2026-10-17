@@ -121,7 +121,10 @@ fn links_into_ignored_folders_resolve() {
     // a links only to an ignored note: no unresolved links, but no note link either.
     assert_eq!(
         rules(&f),
-        [("a".to_string(), "no-outbound-links".to_string())]
+        [
+            ("a".to_string(), "no-outbound-links".to_string()),
+            ("a".to_string(), "orphan".to_string())
+        ]
     );
     let msg = wk(v.path(), state.path())
         .args(["check", "Archive/old.md"])

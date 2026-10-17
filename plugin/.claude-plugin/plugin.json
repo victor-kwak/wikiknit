@@ -1,8 +1,8 @@
 {
   "name": "wikiknit",
   "displayName": "wikiknit",
-  "version": "0.4.0",
-  "description": "Keeps wikilinks in a Markdown vault complete: hooks hold vault commits until changed notes get a link pass, and the link skill adds related links in both directions. Needs the wikiknit CLI on PATH.",
+  "version": "0.5.0",
+  "description": "Context and links for AI agents on a Markdown vault: the context skill builds ranked, token-budgeted context packs; hooks hold vault commits until changed notes get a link pass, and the link skill adds related links in both directions. Needs the wikiknit CLI on PATH.",
   "author": {
     "name": "Victor Kwak"
   },

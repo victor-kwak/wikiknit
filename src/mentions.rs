@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::vault::{Note, Target, Vault};
 
 /// Bare URLs and autolinks: a name inside a URL (`github.com/<user>/<repo>`) is not prose.
-static URL: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>()\[\]"'`]+"#).expect("valid regex")
 });
 
@@ -34,16 +34,16 @@ struct Terms {
 }
 
 /// Lowercased text plus, for each byte of it, the byte offset of the original char.
-struct Folded {
-    text: String,
+pub(crate) struct Folded {
+    pub(crate) text: String,
     /// `orig[i]` = original offset for folded byte `i`; one extra entry for the end.
-    orig: Vec<usize>,
+    pub(crate) orig: Vec<usize>,
 }
 
 /// Unicode lowercasing (per char, not full case folding) that keeps a map back to the
 /// original offsets: `É` and `é` match, so do `Москва` and `москва`; `STRASSE` and `straße`
 /// do not.
-fn fold(text: &str) -> Folded {
+pub(crate) fn fold(text: &str) -> Folded {
     let mut out = String::with_capacity(text.len());
     let mut orig = Vec::with_capacity(text.len() + 1);
     for (i, c) in text.char_indices() {
@@ -59,7 +59,7 @@ fn fold(text: &str) -> Folded {
 
 /// The word that names a note in prose, if any: its stem, or its folder for generic stems
 /// (`Projects/x/overview` -> `x`). A generic stem at the vault root (`index.md`) names nothing.
-fn prose_name<'a>(note: &'a Note, generic: &[String]) -> Option<&'a str> {
+pub(crate) fn prose_name<'a>(note: &'a Note, generic: &[String]) -> Option<&'a str> {
     let stem = note.stem();
     if generic.iter().any(|g| g.eq_ignore_ascii_case(stem)) && !note.id.contains('/') {
         return None;
@@ -105,7 +105,7 @@ fn build_terms(vault: &Vault) -> Option<Terms> {
 }
 
 /// Letters, digits, `_`, and combining marks (so `café` written as `cafe` + U+0301 is one word).
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric()
         || c == '_'
         || matches!(c as u32,
@@ -114,7 +114,7 @@ fn is_word_char(c: char) -> bool {
 
 /// Scripts written without spaces between words (CJK, kana, Thai, ...) and Korean, whose
 /// particles attach to nouns: a match there needs no word boundary on that side.
-fn is_unspaced(c: char) -> bool {
+pub(crate) fn is_unspaced(c: char) -> bool {
     matches!(c as u32,
         0x0E00..=0x0EFF      // Thai, Lao
         | 0x1100..=0x11FF    // Hangul Jamo
@@ -128,7 +128,7 @@ fn is_unspaced(c: char) -> bool {
         | 0x20000..=0x2FA1F) // CJK extensions B-F, compatibility supplement
 }
 
-fn inside(ranges: &[Range<usize>], r: &Range<usize>) -> bool {
+pub(crate) fn inside(ranges: &[Range<usize>], r: &Range<usize>) -> bool {
     ranges.iter().any(|x| r.start < x.end && x.start < r.end)
 }
 

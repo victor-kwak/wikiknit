@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::config::{LinkStyle, Severity, When};
 use crate::parse::{LinkKind, Location};
+use crate::vault::Note;
 use crate::vault::{Form, Target, Vault};
 
 /// Every rule and its default severity.
@@ -19,6 +20,9 @@ pub const RULES: &[(&str, Severity)] = &[
     ("link-in-html", Severity::Warn),
     ("no-outbound-links", Severity::Error),
     ("missing-required-link", Severity::Error),
+    ("missing-required-inbound", Severity::Error),
+    ("orphan", Severity::Warn),
+    ("stale", Severity::Warn),
     ("duplicate-alias", Severity::Error),
     ("file-not-utf8", Severity::Warn),
 ];
@@ -247,6 +251,14 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
         .collect();
     closest.prefetch(broken);
     let is_selected = |id: &str| selected.is_none_or(|s| s.contains(id));
+    let today = today();
+    // Notes linking each note (hubs count: a note listed in an index is reachable).
+    let mut inbound: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); vault.notes.len()];
+    for (i, outs) in vault.outbound_all().iter().enumerate() {
+        for &j in outs {
+            inbound[j].insert(i);
+        }
+    }
 
     for note in &vault.notes {
         if !is_selected(&note.id) {
@@ -413,6 +425,95 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             }
         }
 
+        if let Some(me) = me
+            && inbound[me].is_empty()
+            && !cfg.is_hub(&note.id)
+            && !cfg.is_orphan_exempt(&note.id)
+        {
+            // The notes it links are the natural places to link it from.
+            let back: Vec<String> = outbound
+                .iter()
+                .filter(|&&t| !cfg.is_hub(&vault.notes[t].id))
+                .take(3)
+                .map(|&t| format!("[[{}]]", vault.notes[t].id))
+                .collect();
+            let fix = if back.is_empty() {
+                "link it from a related note (`wikiknit search` finds one), or add its folder to `orphan_exempt`"
+                    .to_string()
+            } else {
+                format!(
+                    "link it from {} ({}); `wikiknit suggest {}` gives the edits",
+                    back.join(" or "),
+                    if back.len() == 1 {
+                        "it links that note"
+                    } else {
+                        "it links them"
+                    },
+                    note.id
+                )
+            };
+            sink.push_fix("orphan", &note.id, 1, "no note links here".into(), fix);
+        }
+
+        if let Some(rule) = cfg.stale_rule(&note.id)
+            && rule.required
+            && p.frontmatter
+                .value
+                .as_ref()
+                .and_then(|v| v.get(&rule.field))
+                .is_none()
+        {
+            sink.push_fix(
+                "stale",
+                &note.id,
+                1,
+                format!("has no `{}` date", rule.field),
+                rule.fix.clone().unwrap_or_else(|| {
+                    format!(
+                        "check the note against its source, then add `{}: {}` to the frontmatter",
+                        rule.field,
+                        format_date(today)
+                    )
+                }),
+            );
+        }
+        if let Some(rule) = cfg.stale_rule(&note.id)
+            && let Some(value) = p
+                .frontmatter
+                .value
+                .as_ref()
+                .and_then(|v| v.get(&rule.field))
+        {
+            let line = frontmatter_line(note, &rule.field);
+            let field = &rule.field;
+            match value.as_str().and_then(parse_date) {
+                Some(day) if today - day > i64::from(rule.days) => sink.push_fix(
+                    "stale",
+                    &note.id,
+                    line,
+                    format!(
+                        "`{field}` is {} days old (limit {})",
+                        today - day,
+                        rule.days
+                    ),
+                    rule.fix.clone().unwrap_or_else(|| {
+                        format!(
+                            "check the note against its source, then set `{field}: {}`",
+                            format_date(today)
+                        )
+                    }),
+                ),
+                Some(_) => {}
+                None => sink.push_fix(
+                    "stale",
+                    &note.id,
+                    line,
+                    format!("`{field}` is not a date"),
+                    format!("write it as YYYY-MM-DD: `{field}: {}`", format_date(today)),
+                ),
+            }
+        }
+
         if !cfg.is_hub(&note.id) && outbound.is_empty() {
             sink.push_fix(
                 "no-outbound-links",
@@ -460,6 +561,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
         }
     }
 
+    required_inbound(vault, &is_selected, &mut sink);
     duplicate_aliases(vault, &is_selected, &mut sink);
     sink.out
         .sort_by(|a, b| (&a.note, a.line, a.rule).cmp(&(&b.note, b.line, b.rule)));
@@ -488,6 +590,233 @@ fn unquoted_targets(v: Option<&serde_json::Value>) -> Vec<String> {
         walk(v, 0, &mut out);
     }
     out
+}
+
+/// `require_inbound`: a matching note must be linked from its `from` note. Checked when either
+/// note is selected, since editing either one can break the link.
+fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mut Sink<'_>) {
+    let cfg = &vault.config;
+    if cfg.require_inbound.is_empty() {
+        return;
+    }
+    let out = vault.outbound_all();
+    // `from` by id, exactly or ignoring case: Ok(note), Ok(None) for no note, Err(ids) when
+    // several ids differ only by case. Cached: many notes share one `from`.
+    let mut lookup: HashMap<String, Result<Option<usize>, Vec<String>>> = HashMap::new();
+    let mut resolve = |from: &str| {
+        lookup
+            .entry(from.to_string())
+            .or_insert_with(|| {
+                if let Some(i) = vault.index_of(from) {
+                    return Ok(Some(i));
+                }
+                match vault.ids_ignoring_case(from) {
+                    [] => Ok(None),
+                    [i] => Ok(Some(*i)),
+                    many => Err(many.iter().map(|&i| vault.notes[i].id.clone()).collect()),
+                }
+            })
+            .clone()
+    };
+    for (i, note) in vault.notes.iter().enumerate() {
+        for req in &cfg.require_inbound {
+            let caps = match &req.when {
+                When::Field { field, pattern } => note
+                    .parsed
+                    .frontmatter
+                    .str_field(field)
+                    .and_then(|v| pattern.captures(v).map(|c| captures(&c))),
+                When::Path { pattern } => pattern.captures(&note.id).map(|c| captures(&c)),
+            };
+            let Some(caps) = caps else { continue };
+            let from = expand(&req.from, &caps);
+            if from.eq_ignore_ascii_case(&note.id) {
+                continue;
+            }
+            // Cheap selection test first: most notes are not selected in a hook run.
+            let target_selected = is_selected(&note.id);
+            if !target_selected && !is_selected(&from) && vault.index_of(&from).is_some() {
+                continue;
+            }
+            let from_note = match resolve(&from) {
+                Ok(f) => f,
+                Err(ids) => {
+                    if target_selected {
+                        sink.push_fix(
+                            "missing-required-inbound",
+                            &note.id,
+                            1,
+                            format!("must be linked from [[{from}]], which names several notes"),
+                            format!("fix the `require_inbound` rule: one of {}", ids.join(", ")),
+                        );
+                    }
+                    continue;
+                }
+            };
+            let from = from_note.map_or(from, |f| vault.notes[f].id.clone());
+            if from == note.id {
+                continue;
+            }
+            let from_selected = is_selected(&from);
+            if !target_selected && !from_selected {
+                continue;
+            }
+            match from_note {
+                Some(f) if out[f].contains(&i) => {}
+                Some(f) => {
+                    let editor = &vault.notes[f];
+                    let (line, edit) = sibling_edit(vault, editor, &req.when, note)
+                        .unwrap_or_else(|| crate::suggest::add_link_edit(vault, editor, note));
+                    if target_selected {
+                        sink.push_fix(
+                            "missing-required-inbound",
+                            &note.id,
+                            1,
+                            format!("must be linked from [[{from}]]"),
+                            format!("in {from}: {edit}"),
+                        );
+                    } else {
+                        // Only the `from` note is being checked: the finding is about it.
+                        sink.push_fix(
+                            "missing-required-inbound",
+                            &from,
+                            line.max(1),
+                            format!("must link [[{}]] (require_inbound)", note.id),
+                            edit,
+                        );
+                    }
+                }
+                None if !target_selected => {}
+                None => sink.push_fix(
+                    "missing-required-inbound",
+                    &note.id,
+                    1,
+                    format!("must be linked from [[{from}]] (that note does not exist yet)"),
+                    format!("create [[{from}]] with a link to [[{}]]", note.id),
+                ),
+            }
+        }
+    }
+}
+
+/// Where `editor` already links other notes matching `when` (an index section listing
+/// projects), the edit puts the new link after the last of them, as the same kind of line.
+fn sibling_edit(
+    vault: &Vault,
+    editor: &Note,
+    when: &When,
+    target: &Note,
+) -> Option<(usize, String)> {
+    let matches = |n: &Note| match when {
+        When::Field { field, pattern } => n
+            .parsed
+            .frontmatter
+            .str_field(field)
+            .is_some_and(|v| pattern.is_match(v)),
+        When::Path { pattern } => pattern.is_match(&n.id),
+    };
+    let last = vault
+        .resolve_links(editor)
+        .into_iter()
+        .filter(|r| r.raw.location == Location::Body)
+        .filter(|r| matches!(r.target, Target::Note(i) if matches(&vault.notes[i])))
+        .map(|r| r.raw.span.start)
+        .max()?;
+    let (line, text, _) = editor.line_at(last);
+    let indent: String = text.chars().take_while(|c| c.is_whitespace()).collect();
+    let rest = text.trim_start();
+    let link = crate::suggest::link_text(vault, target);
+    if rest.starts_with('|') {
+        return Some((
+            line,
+            format!("insert after line {line}: a table row for {link}, like line {line}"),
+        ));
+    }
+    let marker = ["- ", "* ", "+ "]
+        .into_iter()
+        .find(|m| rest.starts_with(m))
+        .unwrap_or("- ");
+    Some((
+        line,
+        format!("insert after line {line}: {indent}{marker}{link}"),
+    ))
+}
+
+/// Line of frontmatter `key:` (line 2, the first YAML line, if not found).
+fn frontmatter_line(note: &Note, key: &str) -> usize {
+    note.parsed
+        .frontmatter
+        .yaml
+        .as_ref()
+        .and_then(|r| {
+            let src = &note.text[r.clone()];
+            src.find(&format!("\n{key}:"))
+                .map(|i| i + 1)
+                .or_else(|| src.starts_with(&format!("{key}:")).then_some(0))
+                .map(|i| note.line_of(r.start + i))
+        })
+        .unwrap_or(2)
+}
+
+/// Days since 1970-01-01 (UTC) for a civil date (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// `YYYY-MM-DD`, optionally followed by a time (`2026-10-17T09:00`, `2026-10-17 09:00`).
+fn parse_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let date = s.get(..10)?;
+    if s.len() > 10 && !s[10..].starts_with(['T', 't', ' ']) {
+        return None;
+    }
+    let mut parts = date.split('-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let days_in_month = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (1..=days_in_month)
+        .contains(&d)
+        .then(|| days_from_civil(y, m, d))
+}
+
+fn format_date(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Today in UTC, as days since 1970-01-01.
+fn today() -> i64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    i64::try_from(secs / 86_400).unwrap_or(0)
 }
 
 fn captures(c: &regex::Captures<'_>) -> Vec<String> {
@@ -555,6 +884,23 @@ mod tests {
         assert_eq!(distance_within("kitten", "sitting", 3), Some(3));
         assert_eq!(distance_within("kitten", "sitting", 2), None);
         assert_eq!(distance_within("a", "abcdef", 2), None);
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(parse_date("1970-01-01"), Some(0));
+        assert_eq!(parse_date("2026-10-17"), Some(20_743));
+        assert_eq!(parse_date("2026-10-17T09:30:00Z"), Some(20_743));
+        assert_eq!(parse_date("2024-02-29"), Some(19_782));
+        assert_eq!(parse_date("2023-02-29"), None);
+        assert_eq!(parse_date("2026-13-01"), None);
+        assert_eq!(parse_date("2026-10-170"), None);
+        assert_eq!(parse_date("17/10/2026"), None);
+        assert_eq!(format_date(20_743), "2026-10-17");
+        assert_eq!(format_date(19_782), "2024-02-29");
+        for d in [-1000, 0, 59, 60, 10_000, 20_743] {
+            assert_eq!(parse_date(&format_date(d)), Some(d));
+        }
     }
 
     #[test]

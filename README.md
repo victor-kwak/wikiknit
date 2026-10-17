@@ -6,13 +6,19 @@ Context for AI agents working on a Markdown vault (Obsidian, and anything else t
 - **search**: hybrid search. Words (BM25F over title, aliases, headings, frontmatter, body) and
   meaning (local embeddings, no API), fused into one ranking, with filters by type, folder,
   frontmatter field, tag, and linked notes.
+- **context**: a context pack for a note or a question, sized to a token budget: the note (or the
+  best search hits), then the notes linked to and from it; whole notes while they fit, then excerpts
+  and summaries, each with the reason it is included.
 - **suggest**: ranked link candidates for a note, each with its reasons and the exact edit to apply.
 - **links**: the notes linked to or from a note, each with the line the link is written on, so an agent
   sees how two notes relate without opening either.
 - **catalog**: one line per note (id, type, tags, aliases, title, summary), filterable.
 - **check**: broken links, wrong link style, unquoted links in frontmatter, links hidden in code or HTML,
-  notes with no outgoing link, notes missing a link your rules require, aliases two notes share. Every
+  notes with no outgoing link, orphans (no note links them), notes missing a link your rules require
+  (in either direction), stale notes (a date field past its limit), aliases two notes share. Every
   finding comes with a fix (for a broken link: the closest existing notes).
+- **aliases**: terms the vault already uses for a note that do not name it yet, with the evidence and
+  the frontmatter edit, so `mentions` and `suggest` find them next time.
 - **mentions**: text that names another note (by its name or an alias) without linking it.
 - **graph**: connected components with index ("hub") notes left out, so isolated clusters show up.
 - **Claude Code plugin**: hooks that hold a vault commit until the changed notes had a link pass.
@@ -45,7 +51,10 @@ wikiknit search '"ssh key"' github --limit 5       # a quoted phrase must appear
 wikiknit links gatehouse                           # neighbors of a note (id, path, name, or alias)
 wikiknit links gatehouse --depth 2 --in            # notes linking to it, two hops
 wikiknit catalog --path Projects/ --where status=active
+wikiknit context gatehouse --budget 4000           # the note and its neighborhood, in budget
+wikiknit context --query "why is DP-1 dropping"    # the best hits for a question, and their links
 wikiknit suggest gatehouse                         # link candidates, with reasons and edits
+wikiknit aliases                                   # alias candidates, with evidence and edits
 wikiknit check                                     # every note; exit 1 on errors; each with a fix
 wikiknit mentions
 wikiknit graph
@@ -74,6 +83,10 @@ field are `;`-separated.
 
 `schema_version` changes only when a record's fields change incompatibly.
 
+`context` is the exception in text form: note text is Markdown with its own headings, so each entry is
+wrapped in `<note id=... role=... content=... lines=... score=... tokens=...>` tags with a `<why>` line,
+after a `# context budget=... used=...` header; notes left out are listed in `<omitted>`.
+
 wikiknit looks for `wikiknit.toml` in the current directory and its parents. `--vault <dir>` uses
 the `wikiknit.toml` in or above that folder that names it as its vault, else defaults.
 
@@ -95,6 +108,7 @@ min_similarity = 0.5            # semantic match: at least this cosine similarit
 semantic_margin = 0.12          # ...and this far above the median note for the query
 link_section = "## Related"     # where suggested links go; or "frontmatter:related"
 no_backlink_from = ["Sessions/"]  # logs: their links do not ask for a link back
+orphan_exempt = ["Sessions/"]   # notes that need no inbound link (the `orphan` rule skips them)
 
 # A note whose frontmatter `scope` is "project/<name>" must link Projects/<name>/overview.
 [[require_link]]
@@ -105,6 +119,23 @@ target = "Projects/$1/overview"
 [[require_link]]
 when = { path = "^Research/notes/([^/]+)/" }
 target = "Research/reports/$1"
+
+# The notes a rule matches must be linked from another note ($1... are capture groups).
+[[require_inbound]]
+when = { path = "^Projects/([^/]+)/overview$" }
+from = "INDEX"
+
+# Freshness: the first rule whose `path` matches a note applies; no `path` matches every note.
+[[stale]]
+field = "last_verified"         # frontmatter date, YYYY-MM-DD (a time after it is fine)
+days = 30
+path = "^Systems/"
+fix = "run scripts/snapshot.sh"  # optional: the fix to show instead of the default
+
+[[stale]]
+field = "last_verified"
+days = 120
+required = true                 # a note without the field is reported too
 
 [severity]                      # per rule: "error", "warn", or "off"
 link-in-code = "warn"
@@ -122,6 +153,9 @@ link-in-code = "warn"
 | `link-in-code` | warn | `[[x]]` inside a code span or block (not a link) |
 | `no-outbound-links` | error | A note (not a hub) that links to no other note |
 | `missing-required-link` | error | A note matching a `[[require_link]]` rule without that link |
+| `missing-required-inbound` | error | A note matching a `[[require_inbound]]` rule that its `from` note does not link; the fix is the edit in the `from` note, next to its links to similar notes. Checked when either note is selected; with only the `from` note selected, the finding is on it |
+| `orphan` | warn | A note (not a hub, not in `orphan_exempt`) that no note links to; the fix names the notes it links, the natural places to link it from |
+| `stale` | warn | A note whose `[[stale]]` date field is older than `days`, is not a date, or (with `required`) is missing |
 | `duplicate-alias` | error | An alias another note also uses as its name or alias |
 | `link-in-html` | warn | `[[x]]` inside raw HTML (not rendered as a link) |
 | `file-not-utf8` | warn | A note that is not valid UTF-8 (read with replacement characters) |
@@ -188,6 +222,50 @@ Each row has the file to edit, the action (`mention`, `link`, `backlink`), the r
 where it goes (`link_section`, `## Related` by default, or `frontmatter:related` for a frontmatter list)
 and the link text in the vault's `link_style`. wikiknit never applies edits; an agent decides which
 suggestions are right and makes them.
+
+### Context
+
+`context <note>` or `context --query "..."` builds what an agent should read first, within
+`--budget` tokens (default 4000, at least 200). Tokens are estimated: four ASCII characters per token,
+one per Chinese, Japanese, Korean, or Thai character, two per other character (accented Latin,
+Cyrillic, emoji). The estimate errs high, so a pack stays inside a real model budget.
+
+- Seeds: the note, or the top `--seeds` search hits (default 5; hybrid search, with the same filters as
+  `search`; filters apply only to `--query`).
+- Then the notes the seeds link (weight 0.6), link the seeds (0.5), or both (0.75), more for repeated
+  links, halved per hop (`--depth`, default 1). A note linked to several seeds ranks higher. Hub notes
+  are left out; logs (`no_backlink_from`) count less.
+- The budget fills in rank order. Seeds share it evenly (what one does not use goes to the next), so
+  one long note cannot crowd out the other hits; up to 15% is kept for summaries of the rest. A note
+  that fits goes in whole; a seed that does not gets an excerpt (small frontmatter, the title, and the
+  section holding the matching line, extended down and then up while it fits; a matching line too long
+  to fit is cut to the part around the match); others get their one-line summary; the rest are listed
+  as omitted.
+
+Each entry has `role` (`seed` or `linked`), `content` (`full`, `excerpt`, `summary`), the file `lines`
+included, its `tokens`, and `why` (the search match, or the link and the line it is written on).
+
+### Aliases
+
+`aliases [note]` lists terms the vault uses for a note that are not yet its name or an alias:
+
+- link text: `[[Reference/acme|ACME Corp]]` names the note `ACME Corp`, when `--min-notes` notes
+  (default 2) write it, or one does and other notes use the term in prose. Link text written for
+  several different notes, links to a heading (`[[install#Linux|Linux]]`), and paths or URLs as link
+  text do not count;
+- the note's title (up to four words, not only ordinary words), when another note writes it the
+  same way;
+- a capitalized term (`Proton VPN`, `KWin`) that at least three notes use, where at least two thirds of
+  those lines link that same note. A term whose lines link several different notes is related to them,
+  not a name for one, and is left out.
+
+One row per note, with one frontmatter edit that adds all its terms (separate edits to one
+`aliases:` line would overwrite each other). Each term (best first) has how many notes use it and
+its evidence, including how many notes use it without a link: they become `mentions` once the alias
+is added. In text output, `terms` and `notes` are `;`-separated, and `reasons` is
+`term: reason, reason` per term with ` | ` between terms. The edit keeps the YAML valid (a trailing
+comment stays; a scalar alias is quoted whole; a block scalar gets an instruction, not an edit). A
+term goes to one note only.
 
 ### Mentions
 

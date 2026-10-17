@@ -3,9 +3,11 @@
 //! The library loads a vault into a [`Vault`], resolves every link, and runs
 //! rules over it. The binary in `main.rs` is a thin CLI on top.
 
+pub mod aliases;
 pub mod catalog;
 pub mod chunk;
 pub mod config;
+pub mod context;
 #[cfg(feature = "semantic")]
 pub mod embedder;
 pub mod filter;
