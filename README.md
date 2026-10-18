@@ -331,12 +331,34 @@ This repo is also a Claude Code plugin marketplace. The plugin adds:
 
 - **SessionStart hook**: records the session start and exports `WIKIKNIT_SESSION` for later commands.
   After `/clear` (a new session id), notes still pending from before carry over.
-- **PreToolUse hook on Bash**: a `git commit` in the vault's repository while changed notes lack a link
-  pass is held, with the list of notes and a pointer to the skill. It parses the command: commits
-  behind `if`/`for`/`&&`, wrappers (`sudo`, `timeout`, `xargs`, `env`), `bash -c`, `eval`, `$(...)`, and
-  git aliases that run `commit` (from git config or `-c alias.*`) are caught. When it cannot tell (config
-  from `GIT_CONFIG_*`, an external `git-<name>` program), it holds. Text in quotes, quoted heredocs, and
-  comments is not a commit.
+- **PreToolUse hook on Bash**: a commit in the vault's repository while changed notes lack a link
+  pass is held, with the list of notes and a pointer to the skill.
+  - *What counts as a commit*: `git commit`, `git commit-tree`, and `--continue` of a rebase,
+    cherry-pick, merge, revert, or am; found behind `if`/`for`/`&&`, wrappers (`sudo`, `timeout`,
+    `xargs`, `env`, `time -p`, `command`), redirections (`2>/dev/null git commit`), `bash -c`, `eval`,
+    `$(...)`, `find -exec`, scripts fed to a shell (`bash <<EOF`, `bash <<< '...'`,
+    `echo '...' | sh`, `source <(...)`), and git aliases that run one (from git config or
+    `-c alias.*`). When it cannot tell, it counts as a commit: a script it cannot read
+    (`curl ... | sh`), a program word that is not literal (`$G commit`), config from `GIT_CONFIG*`,
+    `GIT_DIR`, `HOME`, or `PATH`, an external `git-<name>` program (except `git lfs`, other than
+    `lfs migrate`). Text in quotes, quoted heredocs, and comments is not a commit.
+  - *Which repository*: the one the commit runs in, after `cd`, `env -C`, `-C`, `--git-dir`, and an
+    exported or inline `GIT_DIR`. The `wikiknit.toml` is looked up from there, from the session's
+    folder, and from `$CLAUDE_PROJECT_DIR`, and each vault found is checked.
+  - *Write and commit in one command*: wikiknit reads the vault before the command runs, so a command
+    that commits in the vault's repository and may also change vault files (a redirection or `tee`,
+    `cp`, `mv`, `rm`, `sed -i` into the vault, `git checkout`/`restore`/`stash`, any program or script
+    wikiknit does not know) is held with a request to run the two as separate commands. Redirections
+    to paths outside the vault (`2>/dev/null`, `>&2`, `> /tmp/msg`) are fine.
+  - *Fails closed*: once the command is known to commit, any problem holds it: a config that does not
+    load, a state or vault error, or a check that takes longer than 8 s (`WIKIKNIT_HOOK_TIMEOUT_MS`;
+    keep it below the hook's 10 s timeout, after which Claude Code would let the commit through).
+    Other commands are never held.
+  - *Lost state*: if the state for a vault is missing (first use, a new `XDG_STATE_HOME`), notes that
+    differ from git `HEAD` count as needing a link pass. The hold message says how to clear them: the
+    link pass, then `wikiknit mark`.
+  - A commit is held even when no vault note is staged yet: `-a`, pathspecs, and earlier `git add`s in
+    the same command decide what it takes.
 - **Stop hook**: if changed notes sit unlinked for a full turn without further edits, one reminder.
 - **`link` skill**: the link pass itself. The agent reads the catalog, decides which notes each changed
   note is about (by meaning, using what it knows about the task), adds links both ways, adds missing

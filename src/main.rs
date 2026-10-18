@@ -389,8 +389,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Hook errors exit 1 (non-blocking in Claude Code); only a real hold exits 2.
+/// Hook errors exit 1 (non-blocking in Claude Code); a hold exits 2. `pre-commit` holds a
+/// commit it cannot check (an error, bad input that mentions a commit, running out of time):
+/// exit 1 would let the commit through.
 fn run_hook(event: hook::Event) -> ExitCode {
+    let pre_commit = event == hook::Event::PreCommit;
     let mut stdin = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut stdin) {
         eprintln!("wikiknit hook: reading stdin: {e}");
@@ -399,11 +402,23 @@ fn run_hook(event: hook::Event) -> ExitCode {
     let input: hook::Input = match serde_json::from_str(&stdin) {
         Ok(i) => i,
         Err(e) => {
+            if pre_commit && stdin.contains("commit") {
+                eprintln!(
+                    "Commit held by wikiknit: it could not read the hook input ({e}), so it \
+                     cannot check this commit."
+                );
+                return ExitCode::from(2);
+            }
             eprintln!("wikiknit hook: bad input JSON: {e}");
             return ExitCode::from(1);
         }
     };
-    match hook::run(event, &input) {
+    let result = if pre_commit {
+        pre_commit_within_deadline(input)
+    } else {
+        hook::run(event, &input)
+    };
+    match result {
         Ok(Outcome::Allow) => ExitCode::SUCCESS,
         Ok(Outcome::Block(msg)) => {
             eprintln!("{msg}");
@@ -413,6 +428,38 @@ fn run_hook(event: hook::Event) -> ExitCode {
             eprintln!("wikiknit hook: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Default time the pre-commit check may take; below the plugin's 10 s hook timeout, after
+/// which Claude Code would go ahead with the commit.
+const HOOK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Run the pre-commit check, holding a commit that cannot be checked in time
+/// (`$WIKIKNIT_HOOK_TIMEOUT_MS` overrides the deadline).
+fn pre_commit_within_deadline(input: hook::Input) -> Result<Outcome, wikiknit::Error> {
+    let deadline = std::env::var("WIKIKNIT_HOOK_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(HOOK_DEADLINE, std::time::Duration::from_millis);
+    // From the command text alone, so it is known even if the check hangs.
+    let may_commit = hook::may_commit(&input);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(hook::run(hook::Event::PreCommit, &input));
+    });
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) if may_commit => Ok(Outcome::Block(format!(
+            "Commit held by wikiknit: checking the vault ran out of time ({} ms), so this \
+             commit was not checked. Retry; if it keeps timing out, run `wikiknit changed` to \
+             see why.",
+            deadline.as_millis()
+        ))),
+        Err(_) => Err(wikiknit::Error::Usage(format!(
+            "pre-commit check timed out after {} ms",
+            deadline.as_millis()
+        ))),
     }
 }
 
