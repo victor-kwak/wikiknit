@@ -52,6 +52,10 @@ const NOTE_SIMILARITY_LOW: f32 = 0.75;
 /// A frontmatter value shared by more than this share of notes is not a signal (a value only
 /// two notes have always is).
 const COMMON_VALUE: f64 = 0.3;
+/// Semantic signal (0..1, from note similarity) strong enough to stand alone: cosine >= 0.85.
+const STRONG_SEMANTIC: f64 = 0.5;
+/// A weak signal's weighted contribution below this does not count as evidence.
+const WEAK_FLOOR: f64 = 0.25;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Suggestion {
@@ -63,7 +67,7 @@ pub struct Suggestion {
     pub target: String,
     pub score: f64,
     pub reasons: Vec<String>,
-    /// Where the edit goes (0 = end of the note).
+    /// The line the edit is at or after (for an append, the note's last line).
     pub line: usize,
     /// The edit, ready to apply.
     pub edit: String,
@@ -91,31 +95,54 @@ pub fn link_text(vault: &Vault, target: &Note) -> String {
     }
 }
 
-/// Where and how to add a link to `target` in `editor`, following `link_section`:
-/// a heading (`## Related`) or `frontmatter:<key>`.
-#[must_use]
-pub fn add_link_edit(vault: &Vault, editor: &Note, target: &Note) -> (usize, String) {
-    let link = link_text(vault, target);
+/// Where new links go in a note.
+enum Place {
+    /// As list items after this 1-based line, under the existing `link_section` heading.
+    AfterLine(usize),
+    /// Into the frontmatter list `key`, written on `line`.
+    Key { key: String, line: usize },
+    /// A new frontmatter line `key: [...]` after `after` (`None`: no frontmatter yet).
+    NewKey { key: String, after: Option<usize> },
+    /// A new `link_section` heading after the last line, `after`.
+    NewSection { section: String, after: usize },
+}
+
+/// 1-based line of top-level frontmatter `key:`.
+fn key_line(note: &Note, key: &str) -> Option<usize> {
+    let yaml = note.parsed.frontmatter.yaml.as_ref()?;
+    let src = &note.text[yaml.clone()];
+    src.find(&format!("\n{key}:"))
+        .map(|i| i + 1)
+        .or_else(|| src.starts_with(&format!("{key}:")).then_some(0))
+        .map(|i| note.line_of(yaml.start + i))
+}
+
+/// Where links go in `editor`, following `link_section`: a heading (`## Related`) or
+/// `frontmatter:<key>`. A note without the heading that already lists links in a
+/// frontmatter key named like it (`related:` for `## Related`) gets them there.
+fn place(vault: &Vault, editor: &Note) -> Place {
     let section = vault.config.link_section.trim();
-    if let Some(key) = section.strip_prefix("frontmatter:") {
-        let key = key.trim();
-        if let Some(yaml) = &editor.parsed.frontmatter.yaml {
-            let src = &editor.text[yaml.clone()];
-            if let Some(i) = src
-                .find(&format!("\n{key}:"))
-                .map(|i| i + 1)
-                .or_else(|| src.starts_with(&format!("{key}:")).then_some(0))
-            {
-                let line = editor.line_of(yaml.start + i);
-                return (line, format!("add \"{link}\" to frontmatter `{key}`"));
-            }
-            let end = editor.line_of(yaml.end.saturating_sub(1).max(yaml.start));
-            return (end, format!("add frontmatter line: {key}: [\"{link}\"]"));
+    let new_key = |key: &str| {
+        if let Some(line) = key_line(editor, key) {
+            return Place::Key {
+                key: key.to_string(),
+                line,
+            };
         }
-        return (
-            1,
-            format!("add frontmatter: ---\\n{key}: [\"{link}\"]\\n---"),
-        );
+        let after = editor.parsed.frontmatter.yaml.as_ref().map(|yaml| {
+            if yaml.is_empty() {
+                1 // empty frontmatter: after the opening `---`
+            } else {
+                editor.line_of(yaml.end - 1)
+            }
+        });
+        Place::NewKey {
+            key: key.to_string(),
+            after,
+        }
+    };
+    if let Some(key) = section.strip_prefix("frontmatter:") {
+        return new_key(key.trim());
     }
     // A heading: insert after the last non-blank line of that section.
     let body_start_line = editor.line_of(editor.parsed.body_start);
@@ -142,12 +169,136 @@ pub fn add_link_edit(vault: &Vault, editor: &Note, target: &Note) -> (usize, Str
             .rev()
             .find(|&k| !lines[k].trim().is_empty())
             .unwrap_or(h);
-        return (
-            body_start_line + last,
-            format!("insert after line {}: - {link}", body_start_line + last),
-        );
+        return Place::AfterLine(body_start_line + last);
     }
-    (0, format!("append at the end: {section}\\n\\n- {link}"))
+    // No heading: a frontmatter list of links named like it (`related:`), if there is one.
+    let name = section.trim_start_matches('#').trim().to_lowercase();
+    let holds_links = |key: &str| {
+        editor.parsed.links.iter().any(
+            |l| matches!(&l.location, crate::parse::Location::Frontmatter { key: k } if k == key),
+        )
+    };
+    if let Some(serde_json::Value::Object(map)) = &editor.parsed.frontmatter.value
+        && let Some(key) = map.keys().find(|k| {
+            let k_norm = k.to_lowercase().replace(['_', '-'], " ");
+            k_norm == name && holds_links(k)
+        })
+    {
+        return new_key(key);
+    }
+    Place::NewSection {
+        section: section.to_string(),
+        after: editor.line_of(editor.text.len().saturating_sub(1)),
+    }
+}
+
+/// Edits that add links to `targets` (in order) to `editor`, one per target, so that applying
+/// them in order gives a valid note: the first creates the section or frontmatter key when it
+/// is missing, the others add to it. Line numbers count the earlier edits of the list.
+#[must_use]
+pub fn add_link_edits(vault: &Vault, editor: &Note, targets: &[&Note]) -> Vec<(usize, String)> {
+    let links: Vec<String> = targets.iter().map(|t| link_text(vault, t)).collect();
+    let mut out = Vec::with_capacity(links.len());
+    match place(vault, editor) {
+        Place::AfterLine(line) => {
+            for (k, link) in links.iter().enumerate() {
+                let at = line + k;
+                let edit = if k == 0 {
+                    format!("insert after line {at}: - {link}")
+                } else {
+                    format!(
+                        "insert after line {at} (the `- {}` line): - {link}",
+                        links[k - 1]
+                    )
+                };
+                out.push((at, edit));
+            }
+        }
+        Place::Key { key, line } => {
+            for link in &links {
+                out.push((line, format!("add \"{link}\" to frontmatter `{key}`")));
+            }
+        }
+        Place::NewKey { key, after } => {
+            for (k, link) in links.iter().enumerate() {
+                out.push(match (k, after) {
+                    (0, Some(after)) => (
+                        after,
+                        format!("insert after line {after}: {key}: [\"{link}\"]"),
+                    ),
+                    (0, None) => (
+                        1,
+                        format!("insert at line 1: ---\\n{key}: [\"{link}\"]\\n---"),
+                    ),
+                    // The key the first edit added: one line further, or line 2 of the new
+                    // frontmatter.
+                    (_, after) => (
+                        after.map_or(2, |a| a + 1),
+                        format!(
+                            "add \"{link}\" to frontmatter `{key}` (added by the edit for {})",
+                            links[0]
+                        ),
+                    ),
+                });
+            }
+        }
+        Place::NewSection { section, after } => {
+            for (k, link) in links.iter().enumerate() {
+                out.push(if k == 0 {
+                    (
+                        after,
+                        format!("append after line {after}: {section}\\n\\n- {link}"),
+                    )
+                } else {
+                    // `after` + heading, blank line, and the k items so far.
+                    let at = after + 2 + k;
+                    (
+                        at,
+                        format!(
+                            "insert after line {at} (the `- {}` line under {section}): - {link}",
+                            links[k - 1]
+                        ),
+                    )
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Where and how to add one link to `target` in `editor` ([`add_link_edits`]).
+#[must_use]
+pub fn add_link_edit(vault: &Vault, editor: &Note, target: &Note) -> (usize, String) {
+    add_link_edits(vault, editor, &[target])
+        .pop()
+        .expect("one edit per target")
+}
+
+/// Give the `link` and `backlink` suggestions that edit the same note edits that apply in
+/// sequence (output order): one creates a missing section or key, the rest add to it.
+fn sequence_edits(vault: &Vault, out: &mut [Suggestion]) {
+    let mut by_editor: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (k, s) in out.iter().enumerate() {
+        if s.action != "mention" {
+            by_editor.entry(s.note.as_str()).or_default().push(k);
+        }
+    }
+    let mut edits: Vec<(usize, (usize, String))> = Vec::new();
+    for (editor, ks) in by_editor {
+        let (Some(editor), Some(targets)) = (
+            vault.get(editor),
+            ks.iter()
+                .map(|&k| vault.get(&out[k].target))
+                .collect::<Option<Vec<&Note>>>(),
+        ) else {
+            continue;
+        };
+        edits.extend(ks.into_iter().zip(add_link_edits(vault, editor, &targets)));
+    }
+    for (k, (line, edit)) in edits {
+        out[k].line = line;
+        out[k].edit = edit;
+    }
 }
 
 /// Headings (lowercase) that more than 5% of notes have: template headings like
@@ -300,7 +451,10 @@ impl<'a> Suggester<'a> {
             .par_iter()
             .map(|&s| self.suggest(s, limit, min_score))
             .collect();
-        per.into_iter().flatten().collect()
+        let mut out: Vec<Suggestion> = per.into_iter().flatten().collect();
+        // Two start notes may both ask for a link in one note: one sequence of edits there.
+        sequence_edits(self.vault, &mut out);
+        out
     }
 
     /// Link candidates for note `start`: see [`suggest`].
@@ -333,11 +487,24 @@ impl<'a> Suggester<'a> {
             let in_table =
                 m.context.trim_start().starts_with('|') || m.context.matches('|').count() >= 2;
             let pipe = if in_table { "\\|" } else { "|" };
+            // A name in an inline code span is replaced with its backticks.
+            let (from, start) = match &m.code_span {
+                Some(r) => (&note.text[r.clone()], r.start),
+                None => (m.term.as_str(), m.start),
+            };
+            // Where the text also occurs earlier on the line (in code, in another word), the
+            // column says which occurrence.
+            let (_, line_text, at) = note.line_at(start);
+            let at_col = if line_text[..at].contains(from) {
+                format!(", column {}", line_text[..at].chars().count() + 1)
+            } else {
+                String::new()
+            };
             s.mention_edit = Some((
                 m.line,
                 format!(
-                    "line {}: replace \"{}\" with [[{inner}{pipe}{}]]",
-                    m.line, m.term, m.term
+                    "line {}{at_col}: replace \"{from}\" with [[{inner}{pipe}{}]]",
+                    m.line, m.term
                 ),
             ));
         }
@@ -382,9 +549,7 @@ impl<'a> Suggester<'a> {
                 if rel > 0.0 {
                     let s = sig.entry(i).or_default();
                     s.semantic = f64::from(rel);
-                    if rel >= 0.25 {
-                        s.reasons.push(format!("similar meaning ({sim:.2})"));
-                    }
+                    s.reasons.push(format!("similar meaning ({sim:.2})"));
                 }
             }
         }
@@ -430,9 +595,7 @@ impl<'a> Suggester<'a> {
             rank += 1;
             let s = sig.entry(i).or_default();
             s.lexical = 1.0 / rank as f64;
-            if rank <= 5 {
-                s.reasons.push(format!("similar text (#{rank})"));
-            }
+            s.reasons.push(format!("similar text (#{rank})"));
         }
 
         // 4. shared neighbors (Adamic-Adar), hubs left out
@@ -487,10 +650,16 @@ impl<'a> Suggester<'a> {
                 if common.is_empty() {
                     continue;
                 }
-                let score: f64 = common.iter().map(|kv| (n / df[*kv] as f64).ln()).sum();
+                // Each value by its rarity, squared so values several notes share count
+                // little: 1 for a value only these two notes have, ~0.5 for one in 6 of 70
+                // notes (`stack: bun`), ~0.1 at the COMMON_VALUE share.
+                let rare = (n / 2.0).ln().max(1.0);
+                let score: f64 = common
+                    .iter()
+                    .map(|kv| ((n / df[*kv] as f64).ln() / rare).clamp(0.0, 1.0).powi(2))
+                    .sum();
                 let s = sig.entry(t).or_default();
-                // Absolute: one value only these two notes share (~ln(n/2)) counts fully.
-                s.frontmatter = (score / (n / 2.0).ln().max(1.0)).min(1.0);
+                s.frontmatter = score.min(1.0);
                 let shown: Vec<String> = common
                     .iter()
                     .take(3)
@@ -517,6 +686,24 @@ impl<'a> Suggester<'a> {
             })
             // Back-links only where the other note does not already link here.
             .filter(|(_, t, _)| !(linked.contains(t) && out_links[*t].contains(&start)))
+            // One weak signal alone (similar text, one shared value) is often chance: it takes
+            // a strong one or two weak ones. Every candidate says why it is there.
+            .filter(|(_, _, s)| {
+                let strong = s.mention > 0.0
+                    || s.links_here > 0.0
+                    || s.no_link_back > 0.0
+                    || s.semantic >= STRONG_SEMANTIC;
+                let weak = [
+                    s.lexical / m_lex,
+                    1.5 * s.semantic,
+                    s.neighbors,
+                    s.frontmatter,
+                ]
+                .iter()
+                .filter(|&&w| w >= WEAK_FLOOR)
+                .count();
+                (strong || weak >= 2) && !s.reasons.is_empty()
+            })
             .collect();
         let id_of = |t: usize, linked_t: bool| {
             if linked_t {
@@ -532,7 +719,7 @@ impl<'a> Suggester<'a> {
         });
         ranked.retain(|(score, _, _)| *score >= min_score);
         ranked.truncate(limit);
-        ranked
+        let mut out = ranked
             .into_iter()
             .map(|(score, t, s)| {
                 let target = &vault.notes[t];
@@ -559,6 +746,8 @@ impl<'a> Suggester<'a> {
                     edit,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        sequence_edits(vault, &mut out);
+        out
     }
 }

@@ -153,7 +153,7 @@ link-in-code = "warn"
 | `ambiguous-link` | warn | A short link several notes match |
 | `frontmatter-invalid` | error | Frontmatter that is not valid YAML |
 | `frontmatter-unquoted-link` | error | `key: [[x]]` or `- [[x]]` in YAML (a nested list, not a link); quote it |
-| `link-in-code` | warn | `[[x]]` naming a note or file inside a code span or block (not a link); other `[[...]]` in code, such as a TOML `[[table]]`, is left alone |
+| `link-in-code` | warn | `[[x]]` naming a note or file inside a code span or block, or `$math$` (not a link); other `[[...]]` in code, such as a TOML `[[table]]`, is left alone |
 | `no-outbound-links` | error | A note (not a hub) that links to no other note |
 | `missing-required-link` | error | A note matching a `[[require_link]]` rule without that link |
 | `missing-required-inbound` | error | A note matching a `[[require_inbound]]` rule that its `from` note does not link; the fix is the edit in the `from` note, next to its links to similar notes. Checked when either note is selected; with only the `from` note selected, the finding is on it |
@@ -218,14 +218,23 @@ chooses explicitly. `embedding_model` picks the model (any fastembed text model,
 - rare frontmatter values both notes have (`stack: cloudflare`, tags).
 
 Scores are absolute, so they compare across notes: one strong signal (a mention, a link here) scores
-2-3, a weak text match alone under 0.5; `--min-score` (default 0.75) leaves out the weak ones. Template
-headings shared by many notes and single shared neighbors do not count as similarity. Notes under
-`no_backlink_from` (logs, like session notes) linking here do not ask for a link back.
+2-3, a weak text match alone under 0.5; `--min-score` (default 0.75) leaves out the weak ones. A
+candidate needs a strong signal (a mention, a link either way, or note similarity of 0.85 or more) or
+two weak ones (similar text, similar meaning, shared neighbors, shared values): one weak signal alone
+is often chance. A shared frontmatter value counts by its rarity: a value only the two notes have
+counts fully, one that 6 of 70 notes have about half. Template headings shared by many notes and
+single shared neighbors do not count as similarity. Notes under `no_backlink_from` (logs, like session
+notes) linking here do not ask for a link back. Every row lists its reasons.
 
 Each row has the file to edit, the action (`mention`, `link`, `backlink`), the reasons, and the edit:
 where it goes (`link_section`, `## Related` by default, or `frontmatter:related` for a frontmatter list)
-and the link text in the vault's `link_style`. wikiknit never applies edits; an agent decides which
-suggestions are right and makes them.
+and the link text in the vault's `link_style`. Without the heading, a note that already lists links in
+a frontmatter key named like it (`related:` for `## Related`) gets the link there. The edits for one
+note apply in output order: the first creates a missing section or key (`append after line 12: ...`,
+the last line), the others add to it (`insert after line 15 (the `- [[a]]` line under ## Related): ...`),
+with line numbers that count the earlier edits. A mention edit names a column when the text also
+occurs earlier on the line, and replaces a name written as inline code backticks and all. wikiknit
+never applies edits; an agent decides which suggestions are right and makes them.
 
 ### Context
 
@@ -278,7 +287,13 @@ and the edit names its lines: `lines 2-3: replace with: ...`). A term goes to on
 `overview`) and its `aliases:` against the text of other notes. Matching ignores case in any
 script by lowercasing (`Émile` matches `émile`; it is not full case folding, so `STRASSE` does not
 match `straße`), needs word boundaries except in scripts written without spaces
-(Chinese, Japanese, Korean, Thai), and skips frontmatter, code, links, URLs, and raw HTML.
+(Chinese, Japanese, Korean, Thai), and skips frontmatter, code, math, links, URLs, and raw HTML. An
+alias that reads as a domain or path (`example.com`, no spaces) is also found as the whole text of an
+inline code span (`` `example.com` ``), where such names are often written; not inside longer code or a
+longer domain (`www.example.com.au`).
+
+Links: `$math$` and `$$math$$` are not links (as code). `%% comments %%` are: Obsidian counts links in
+comments for backlinks and the graph.
 
 ## AI agents: keep links complete as notes change
 

@@ -107,7 +107,7 @@ fn suggest_ranks_mentions_backlinks_and_shared_values_with_edits() {
     assert_eq!(back["target"], "Projects/alpha/overview");
     assert_eq!(
         back["edit"],
-        "append at the end: ## Related\\n\\n- [[Projects/alpha/overview]]"
+        "append after line 2: ## Related\\n\\n- [[Projects/alpha/overview]]"
     );
 
     // Hubs are never suggested.
@@ -178,7 +178,7 @@ fn check_findings_carry_fixes() {
     );
     assert_eq!(
         fix("missing-required-link"),
-        ["append at the end: ## Related\\n\\n- [[Projects/alpha/overview]]"]
+        ["append after line 7: ## Related\\n\\n- [[Projects/alpha/overview]]"]
     );
 }
 

@@ -274,3 +274,251 @@ fn alias_edits_use_the_parsed_yaml_value() {
         "line 2: replace with: aliases: [\"Enn Note\"] # none yet"
     );
 }
+
+#[test]
+fn domain_aliases_are_found_in_inline_code() {
+    let v = vault(
+        "",
+        &[
+            (
+                "Reference/cogno.md",
+                "---\naliases: [cognopraxis.com]\n---\n# Cogno\n[[b]]\n",
+            ),
+            (
+                "Reference/canvas.md",
+                "---\naliases: [canvas.vectorpoint.io]\n---\n# Canvas\n[[b]]\n",
+            ),
+            (
+                "b.md",
+                "# b\nSite: `cognopraxis.com`.\nRun `dig cognopraxis.com` first.\n\n```\ncanvas.vectorpoint.io\n```\nAlso www.cognopraxis.com.au and sub.canvas.vectorpoint.io here.\n",
+            ),
+        ],
+    );
+    let m = items(v.path(), &["mentions", "b"]);
+    let pairs: Vec<(String, u64, u64)> = m
+        .iter()
+        .map(|x| {
+            (
+                x["target"].as_str().unwrap().to_string(),
+                x["line"].as_u64().unwrap(),
+                x["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    // Only the code span that holds just the domain; not a command, a code block, or a
+    // longer domain.
+    assert_eq!(pairs, [("Reference/cogno".to_string(), 2, 1)], "{m:?}");
+    // The suggested edit replaces the whole code span, backticks included.
+    let s = items(v.path(), &["suggest", "b"]);
+    let cogno = s.iter().find(|x| x["target"] == "Reference/cogno").unwrap();
+    assert_eq!(
+        cogno["edit"], "line 2: replace \"`cognopraxis.com`\" with [[cogno|cognopraxis.com]]",
+        "{cogno}"
+    );
+}
+
+#[test]
+fn links_in_math_are_not_links() {
+    let v = vault(
+        "",
+        &[
+            ("a.md", "# a\n[[b]]\n"),
+            (
+                "b.md",
+                "# b\n[[a]] costs $5 and [[a]] $10.\n\n$$\n\\text{[[gone]]}\n$$\n\nInline $x = [[nope]]$ too.\n",
+            ),
+        ],
+    );
+    let f = items(v.path(), &["check"]);
+    assert!(
+        f.iter().all(|x| x["rule"] != "unresolved-link"),
+        "math is not links: {f:?}"
+    );
+    // Dollar amounts are not math: links between them still count.
+    let l = items(v.path(), &["links", "b", "--out"]);
+    assert_eq!(l.len(), 1, "{l:?}");
+}
+
+/// `s` plus three notes linking it (each a `link` suggestion edited in `s`).
+fn linked_from_three(config: &str, s: &str) -> TempDir {
+    vault(
+        config,
+        &[
+            ("s.md", s),
+            ("a.md", "# a\n[[s]]\n"),
+            ("b.md", "# b\n[[s]]\n"),
+            ("c.md", "# c\n[[s]]\n"),
+        ],
+    )
+}
+
+fn edits_in(s: &[Value], note: &str) -> Vec<(u64, String)> {
+    s.iter()
+        .filter(|x| x["note"] == note && x["action"] != "mention")
+        .map(|x| {
+            (
+                x["line"].as_u64().unwrap(),
+                x["edit"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn several_links_into_one_note_create_the_section_once() {
+    let v = linked_from_three("", "# s\nText.\n");
+    let s = items(v.path(), &["suggest", "s"]);
+    assert_eq!(
+        edits_in(&s, "s"),
+        [
+            (
+                2,
+                "append after line 2: ## Related\\n\\n- [[a]]".to_string()
+            ),
+            (
+                5,
+                "insert after line 5 (the `- [[a]]` line under ## Related): - [[b]]".to_string()
+            ),
+            (
+                6,
+                "insert after line 6 (the `- [[b]]` line under ## Related): - [[c]]".to_string()
+            ),
+        ],
+        "{s:?}"
+    );
+    // An existing section: each edit after the previous one.
+    let v = linked_from_three("", "# s\n\n## Related\n\n- [[x]]\n");
+    let s = items(v.path(), &["suggest", "s"]);
+    let e = edits_in(&s, "s");
+    assert_eq!(
+        e[0],
+        (5, "insert after line 5: - [[a]]".to_string()),
+        "{e:?}"
+    );
+    assert_eq!(
+        e[2],
+        (
+            7,
+            "insert after line 7 (the `- [[b]]` line): - [[c]]".to_string()
+        )
+    );
+}
+
+#[test]
+fn several_links_into_one_frontmatter_key_add_it_once() {
+    let cfg = "link_section = \"frontmatter:related\"\n";
+    let v = linked_from_three(cfg, "---\ntype: x\n---\n# s\n");
+    let s = items(v.path(), &["suggest", "s"]);
+    let e = edits_in(&s, "s");
+    assert_eq!(
+        e[0],
+        (2, "insert after line 2: related: [\"[[a]]\"]".to_string()),
+        "{e:?}"
+    );
+    assert_eq!(
+        e[1],
+        (
+            3,
+            "add \"[[b]]\" to frontmatter `related` (added by the edit for [[a]])".to_string()
+        )
+    );
+    assert!(
+        e[1..].iter().all(|(_, x)| !x.contains("related: [")),
+        "{e:?}"
+    );
+    // No frontmatter: one `---` block, then additions to it.
+    let v = linked_from_three(cfg, "# s\n");
+    let s = items(v.path(), &["suggest", "s"]);
+    let e = edits_in(&s, "s");
+    assert_eq!(
+        e.iter().filter(|(_, x)| x.contains("---")).count(),
+        1,
+        "{e:?}"
+    );
+    assert_eq!(e[0].0, 1);
+    assert!(e[1..].iter().all(|(l, _)| *l == 2), "{e:?}");
+}
+
+#[test]
+fn heading_section_prefers_an_existing_related_frontmatter_list() {
+    let v = linked_from_three("", "---\nrelated: [\"[[x]]\"]\n---\n# s\n");
+    let s = items(v.path(), &["suggest", "s"]);
+    let e = edits_in(&s, "s");
+    assert_eq!(e.len(), 3, "{s:?}");
+    assert!(
+        e.iter().all(|(l, x)| *l == 2
+            && x.starts_with("add \"[[")
+            && x.ends_with("to frontmatter `related`")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn mention_edit_gives_a_column_when_the_term_occurs_earlier_on_the_line() {
+    let v = vault(
+        "",
+        &[
+            ("s.md", "# s\nRun `ACME Corp` then call ACME Corp today.\n"),
+            ("acme.md", "---\naliases: [ACME Corp]\n---\n# acme\n[[s]]\n"),
+        ],
+    );
+    let s = items(v.path(), &["suggest", "s"]);
+    let m = s.iter().find(|x| x["action"] == "mention").unwrap();
+    assert_eq!(
+        m["edit"], "line 2, column 27: replace \"ACME Corp\" with [[acme|ACME Corp]]",
+        "{m}"
+    );
+}
+
+#[test]
+fn one_weak_signal_is_not_a_suggestion_and_every_one_has_a_reason() {
+    // 70 notes (the dogfood vault's size); `stack: bun` in 6 of them. The start note's title
+    // matches 10 notes well and the other bun notes weakly (search ranks past 5, which gave no
+    // reason). A moderately common value plus that faint text match is not a link.
+    let fruits = ["apple", "kiwi", "mango", "pear", "plum"];
+    let mut files: Vec<(String, String)> = vec![(
+        "bun0.md".into(),
+        "---\nstack: [bun]\n---\n# Deploy pipeline\n[[f0]]\n".into(),
+    )];
+    for (i, fruit) in fruits.iter().enumerate() {
+        files.push((
+            format!("bun{}.md", i + 1),
+            format!("---\nstack: [bun]\n---\n# Deploy {fruit}\n[[f{i}]]\n"),
+        ));
+    }
+    for i in 0..10 {
+        files.push((
+            format!("step{i}.md"),
+            format!("---\nstack: [go]\n---\n# Deploy pipeline step{i}\n[[f{i}]]\n"),
+        ));
+    }
+    for i in 0..54 {
+        files.push((
+            format!("f{i}.md"),
+            format!("# filler{i}\n[[f{}]]\n", (i + 1) % 54),
+        ));
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let v = vault("", &refs);
+    let s = items(v.path(), &["suggest", "bun0"]);
+    assert!(
+        s.iter()
+            .filter(|x| x["note"] == "bun0")
+            .all(|x| !x["target"].as_str().unwrap().starts_with("bun")),
+        "a shared value and a faint text match are not enough: {s:?}"
+    );
+    let all = items(
+        v.path(),
+        &["suggest", "bun0", "--min-score", "0", "--limit", "100"],
+    );
+    assert!(
+        !all.is_empty()
+            && all
+                .iter()
+                .all(|x| !x["reasons"].as_array().unwrap().is_empty()),
+        "{all:?}"
+    );
+}
