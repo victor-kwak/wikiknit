@@ -696,13 +696,15 @@ fn simple(
         return;
     }
     let Some((program, args)) = p.words.split_first() else {
-        // `exec` with only redirections: a new stdin for every later command.
-        if words.iter().any(|w| w == "exec")
-            && redirects.iter().any(|r| {
-                let op = r.op.trim_start_matches('0');
-                op.starts_with('<')
-            })
-        {
+        // `exec` with only redirections changes descriptors for every later command. Only
+        // stdout/stderr to a file or to each other is modelled (`exec 2>/dev/null`); any
+        // other (stdin, `0>&3`, `3<file`, ...) makes the rest unknown.
+        let plain_output = |op: &str| {
+            let fd = op.trim_end_matches(['>', '&', '|']);
+            matches!(fd, "" | "1" | "2" | "&")
+                && matches!(&op[fd.len()..], ">" | ">>" | ">&" | ">|" | "&>" | "&>>")
+        };
+        if words.iter().any(|w| w == "exec") && redirects.iter().any(|r| !plain_output(&r.op)) {
             ctx.opaque_rest = true;
         }
         // Only assignments: shell variables, exported only under `set -a`.
@@ -3412,6 +3414,8 @@ mod tests {
         // Review: every stdin redirect of exec, namerefs, printf -vNAME, clustered set flags.
         for c in [
             "exec <<-EOF\n\tgit commit -m x\n\tEOF\ngit status",
+            "exec 0>&3; git status",
+            "exec 3<f 0<&3; git status",
             "declare -n r=GIT_DIR; r=x/.git; git status",
             "printf -vGIT_DIR %s x/.git; git status",
             "printf -x y; git status",
