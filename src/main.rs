@@ -401,11 +401,15 @@ fn load_config(cli: &Cli) -> Result<Config> {
         // A wikiknit.toml in the vault, or above it naming this vault.
         for dir in root.ancestors() {
             let file = dir.join(CONFIG_FILE);
-            if file.is_file()
-                && let Ok(cfg) = Config::load(&file)
-                && cfg.vault == root
-            {
-                return Ok(cfg);
+            if !file.is_file() {
+                continue;
+            }
+            match Config::load(&file) {
+                Ok(cfg) if cfg.vault == root => return Ok(cfg),
+                Ok(_) => {}
+                // The vault's own config is broken: its rules must not silently fall away.
+                Err(e) if dir == root => return Err(e.into()),
+                Err(e) => eprintln!("wikiknit: ignoring {}: {e}", file.display()),
             }
         }
         return Ok(Config::for_vault(root));
@@ -452,13 +456,11 @@ fn ids_for(vault: &Vault, paths: &[String]) -> Result<BTreeSet<String>> {
     paths
         .iter()
         .map(|p| {
-            vault.id_for_arg(p, &cwd).with_context(|| {
-                if vault.is_ignored_arg(p, &cwd) {
-                    format!("`{p}` is in a folder the config ignores")
-                } else {
-                    format!("`{p}` is not a note in the vault")
-                }
-            })
+            if vault.id_for_arg(p, &cwd).is_none() && vault.is_ignored_arg(p, &cwd) {
+                bail!("`{p}` is in a folder the config ignores");
+            }
+            // The same note references as `links` and `suggest`: id, path, name, alias.
+            Ok(vault.notes[vault.find_note(p)?].id.clone())
         })
         .collect()
 }

@@ -128,10 +128,22 @@ pub struct Resolved {
     pub form: Form,
 }
 
+/// Two files with the same note id (`a.md` and `a.MD`): `kept` is the note, `shadowed`
+/// resolves as a file.
+#[derive(Debug, Clone)]
+pub struct IdCollision {
+    pub id: String,
+    /// Vault-relative paths.
+    pub kept: String,
+    pub shadowed: String,
+}
+
 #[derive(Debug)]
 pub struct Vault {
     pub config: Config,
     pub notes: Vec<Note>,
+    /// Files that lost their note id to another file, sorted.
+    pub id_collisions: Vec<IdCollision>,
     by_id: HashMap<String, usize>,
     by_id_lower: HashMap<String, Vec<usize>>,
     files: BTreeSet<String>,
@@ -243,6 +255,44 @@ impl Vault {
                 })
             })
             .collect();
+        // `a.md` and `a.MD` both have id `a`: one note keeps the id (the exact `.md`
+        // extension, else the first in walk order); the other resolves as a file.
+        let mut keep: HashMap<String, usize> = HashMap::new();
+        let mut lost = vec![false; notes.len()];
+        let mut id_collisions = Vec::new();
+        let exact = |n: &Note| n.path.extension().is_some_and(|e| e == "md");
+        for (i, n) in notes.iter().enumerate() {
+            let Some(&j) = keep.get(&n.id) else {
+                keep.insert(n.id.clone(), i);
+                continue;
+            };
+            let (kept, shadowed) = if exact(n) && !exact(&notes[j]) {
+                (i, j)
+            } else {
+                (j, i)
+            };
+            lost[shadowed] = true;
+            keep.insert(n.id.clone(), kept);
+            let rel = |k: usize| rel_id(&root, &notes[k].path).unwrap_or_default();
+            id_collisions.push(IdCollision {
+                id: n.id.clone(),
+                kept: rel(kept),
+                shadowed: rel(shadowed),
+            });
+        }
+        let notes: Vec<Note> = notes
+            .into_iter()
+            .zip(lost)
+            .filter_map(|(n, lost)| {
+                if lost {
+                    files.insert(rel_id(&root, &n.path).unwrap_or_default());
+                    None
+                } else {
+                    Some(n)
+                }
+            })
+            .collect();
+        id_collisions.sort_by(|a, b| (&a.id, &a.shadowed).cmp(&(&b.id, &b.shadowed)));
         let mut by_id = HashMap::new();
         let mut by_id_lower: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, n) in notes.iter().enumerate() {
@@ -268,6 +318,7 @@ impl Vault {
         Ok(Self {
             config,
             notes,
+            id_collisions,
             by_id,
             by_id_lower,
             files,

@@ -64,7 +64,8 @@ Filters (`search`, `links`, `catalog`): `--type`, `--path <prefix>`, `--where ke
 case-insensitive and matching anywhere in the value, so anchor with `^...$` for an exact value; lists match
 any element), `--tag` (frontmatter `tags` and inline `#tags`; a tag also matches its nested tags),
 `--linked-to <note>`. Repeat a flag to accept any of its values. A note can be named by its id, path,
-link target, name, alias, or folder (`Projects/x` for `Projects/x/overview`).
+link target, name, alias, or folder (`Projects/x` for `Projects/x/overview`), in every command that
+takes notes (`check`, `mentions`, and `mark` too).
 
 `links` rows give `dir` (`out`, `in`, `both`), `depth`, the note, `via` (the note one hop closer to the
 start), `source`/`line`/`context` (where the link is written, and the text around it), and for `both`
@@ -88,7 +89,8 @@ wrapped in `<note id=... role=... content=... lines=... score=... tokens=...>` t
 after a `# context budget=... used=...` header; notes left out are listed in `<omitted>`.
 
 wikiknit looks for `wikiknit.toml` in the current directory and its parents. `--vault <dir>` uses
-the `wikiknit.toml` in or above that folder that names it as its vault, else defaults.
+the `wikiknit.toml` in or above that folder that names it as its vault, else defaults; a broken
+`wikiknit.toml` in the vault folder itself is an error, not a silent fallback to defaults.
 
 ## Configure
 
@@ -99,6 +101,7 @@ vault = "notes"                 # vault folder: a relative path inside this file
 link_style = "full-path"        # or "shortest" (Obsidian's default; resolution is best-effort)
 ignore = ["Templates/"]         # folders not checked (links to notes there still resolve)
 hubs = ["INDEX"]                # index notes: not mention targets, left out of graph components
+                                # (note ids; `./INDEX.md` works too)
 alias_only = ["Systems/"]       # notes named with common words: found in prose by aliases only
 min_alias_len = 4               # shorter names and aliases are not matched as mentions
 generic_names = ["overview", "index", "readme"]  # stems that take their folder's name
@@ -159,6 +162,7 @@ link-in-code = "warn"
 | `duplicate-alias` | error | An alias another note also uses as its name or alias |
 | `link-in-html` | warn | `[[x]]` inside raw HTML (not rendered as a link) |
 | `file-not-utf8` | warn | A note that is not valid UTF-8 (read with replacement characters) |
+| `duplicate-note-id` | warn | Two files with one note id (`a.md` and `a.MD`); the exact `.md` file is the note, the other resolves as a file |
 
 ### How links resolve
 

@@ -208,6 +208,64 @@ fn split_frontmatter(text: &str) -> (Option<Range<usize>>, usize) {
     (None, 0)
 }
 
+/// Byte offset where a YAML line's `# comment` starts (the line length if none). A `#`
+/// starts a comment at the line start or after whitespace, outside quotes; a quote opens a
+/// quoted scalar only where a scalar can start (`it's` is plain text).
+#[must_use]
+pub fn yaml_comment_start(line: &str) -> usize {
+    let mut quote: Option<char> = None;
+    let mut prev = ' ';
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if (c == '"' || c == '\'')
+                && (prev.is_whitespace() || matches!(prev, '[' | '{' | ',' | ':' | '-')) =>
+            {
+                quote = Some(c);
+            }
+            None if c == '#' && prev.is_whitespace() => return i,
+            None => {}
+        }
+        prev = c;
+    }
+    line.len()
+}
+
+/// Byte offset in `src` of `needle` at or after `from`, outside `# comments`.
+fn find_outside_comments(src: &str, from: usize, needle: &str) -> Option<usize> {
+    let mut line_start = src[..from].rfind('\n').map_or(0, |i| i + 1);
+    while line_start < src.len() {
+        let end = src[line_start..]
+            .find('\n')
+            .map_or(src.len(), |i| line_start + i);
+        let line = &src[line_start..end];
+        let code_end = line_start + yaml_comment_start(line);
+        let begin = from.max(line_start);
+        if begin < code_end
+            && let Some(i) = src[begin..code_end].find(needle)
+        {
+            return Some(begin + i);
+        }
+        line_start = end + 1;
+    }
+    None
+}
+
+/// Byte offset of the line `key:` (top level) in the YAML source.
+fn yaml_key_offset(src: &str, key: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in src.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix(key)
+            && rest.trim_start_matches([' ', '\t']).starts_with(':')
+        {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
 fn collect_frontmatter_links(v: &Value, text: &str, yaml: &Range<usize>, out: &mut Parsed) {
     let Value::Object(map) = v else { return };
     let src = &text[yaml.clone()];
@@ -217,11 +275,17 @@ fn collect_frontmatter_links(v: &Value, text: &str, yaml: &Range<usize>, out: &m
         }
         let mut strings = Vec::new();
         string_leaves(val, &mut strings);
+        // Search from the key's line, past each link found, outside comments: the line is
+        // where the value is written, not the first textual occurrence anywhere.
+        let mut cursor = yaml_key_offset(src, key).unwrap_or(0);
         for s in strings {
             for m in WIKILINK.captures_iter(s) {
                 let whole = m.get(0).expect("match").as_str();
                 // Locate the text in the YAML for a line number; fall back to the block start.
-                let span = src.find(whole).map_or(yaml.start..yaml.start, |i| {
+                let found = find_outside_comments(src, cursor, whole)
+                    .or_else(|| find_outside_comments(src, 0, whole));
+                let span = found.map_or(yaml.start..yaml.start, |i| {
+                    cursor = i + whole.len();
                     yaml.start + i..yaml.start + i + whole.len()
                 });
                 let kind = if &m[1] == "!" {

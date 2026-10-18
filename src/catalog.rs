@@ -56,8 +56,11 @@ fn normalize(s: &str) -> String {
 #[must_use]
 pub fn title(note: &Note, generic: &[String]) -> Option<String> {
     let body = &note.text[note.parsed.body_start..];
+    // A `# comment` in a fenced shell block is not a heading.
+    let mut fence = Fence::default();
     let h1 = body
         .lines()
+        .filter(|l| !fence.line(l))
         .map(str::trim)
         .find_map(|l| l.strip_prefix("# "))?
         .trim();

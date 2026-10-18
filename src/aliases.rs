@@ -568,19 +568,7 @@ pub fn suggest(
 
 /// A YAML value with a trailing `# comment` removed (a `#` inside quotes is kept).
 fn strip_comment(v: &str) -> &str {
-    let mut quote: Option<char> = None;
-    let mut prev = ' ';
-    for (i, c) in v.char_indices() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c == '#' && prev.is_whitespace() => return v[..i].trim_end(),
-            None => {}
-        }
-        prev = c;
-    }
-    v.trim_end()
+    v[..crate::parse::yaml_comment_start(v)].trim_end()
 }
 
 /// The edit that adds `terms` to the note's `aliases` (one edit for all of them).
