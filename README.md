@@ -390,7 +390,12 @@ This repo is also a Claude Code plugin marketplace. The plugin adds:
     exported or inline `GIT_DIR`. The `wikiknit.toml` is looked up from there, from the session's
     folder, and from `$CLAUDE_PROJECT_DIR`, and each vault found is checked. Repositories are
     compared by their common git dir: a commit in a linked worktree is checked against that
-    worktree's copy of the vault.
+    worktree's copy of the vault, and the hold names it (`wikiknit --vault <copy> mark ...`). A `cd`
+    counts only where it surely ran: not in a pipeline or a background job, and after a `cd` that may
+    not have run (after `&&`/`||`, inside `if`/`for`/`case`, `cd $UNSET`) the folder is unknown and
+    the commit is checked against every vault found, with a message that says so. `cd -`,
+    `cd "$HOME/..."`, `cd ~/...`, and `cd $VAR` with a literal value are followed. A vault that git
+    ignores is outside git.
   - *Repository config does not run*: the hook runs git in folders the command names, which may be a
     cloned repository. Its git calls disable `core.fsmonitor`, hooks, and fetching, and read only
     objects (never the work tree or index), so filters, textconv, and external diff cannot run.
@@ -398,14 +403,20 @@ This repo is also a Claude Code plugin marketplace. The plugin adds:
     that commits in the vault's repository and may also change vault files (a redirection or `tee`,
     `cp`, `mv`, `rm`, `sed -i` into the vault, `git checkout`/`restore`/`stash`, any program or script
     wikiknit does not know) is held with a request to run the two as separate commands. Redirections
-    to paths outside the vault (`2>/dev/null`, `>&2`, `> /tmp/msg`) are fine.
+    to paths outside the vault (`2>/dev/null`, `>&2`, `> /tmp/msg`) are fine, as are writes after
+    the last commit (`git commit ... && gh pr create`), unless a loop, a background job, a pipeline,
+    or a heredoc fed to a shell can run them first. `mkdir` and `git checkout -b`/`switch -c` with
+    no start point do not change notes.
   - *Fails closed*: once the command is known to commit, any problem holds it: a config that does not
-    load, a state or vault error, or a check that takes longer than 8 s (`WIKIKNIT_HOOK_TIMEOUT_MS`;
-    keep it below the hook's 10 s timeout, after which Claude Code would let the commit through).
-    Other commands are never held.
-  - *Lost state*: if the state for a vault is missing (first use, a new `XDG_STATE_HOME`), notes that
-    differ from git `HEAD` count as needing a link pass. The hold message says how to clear them: the
-    link pass, then `wikiknit mark`.
+    load, a state or vault error, a crash, or a check (parsing included) that takes longer than 8 s
+    (`WIKIKNIT_HOOK_TIMEOUT_MS`; keep it below the hook's 10 s timeout, after which Claude Code would
+    let the commit through). A command whose parse does not finish in time is held too, since it
+    cannot be told from a commit. Other commands are not held.
+  - *Lost state*: if the state for a vault is missing (first use, a new `XDG_STATE_HOME`), each
+    note's committed content counts as linked: notes that differ from git `HEAD`, or are new and not
+    ignored, need a link pass (a note put back to its committed content does not). The hold message
+    says how to clear them: the link pass, then `wikiknit mark`. `wikiknit mark --session <id>`
+    refuses a session it has no record of (a typo would otherwise take every pending note).
   - A commit is held even when no vault note is staged yet: `-a`, pathspecs, and earlier `git add`s in
     the same command decide what it takes.
 - **Stop hook**: if changed notes sit unlinked for a full turn without further edits, one reminder.

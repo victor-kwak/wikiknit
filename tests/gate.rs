@@ -238,8 +238,11 @@ fn a_timeout_holds_a_commit() {
     let out = s.pre_commit_in(&repo, Some(&repo), "git commit -m x", &slow);
     assert_eq!(code(&out), Some(2), "{}", stderr(&out));
     assert!(stderr(&out).contains("time"), "{}", stderr(&out));
-    let out = s.pre_commit_in(&repo, Some(&repo), "git status", &slow);
-    assert_ne!(code(&out), Some(2), "{}", stderr(&out));
+    // The parse runs under the deadline too (with no time at all, even `git status` may be
+    // held: whether its parse finishes first is a race); with time to parse it passes.
+    let enough = [("WIKIKNIT_HOOK_TIMEOUT_MS", "5000")];
+    let out = s.pre_commit_in(&repo, Some(&repo), "git status", &enough);
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
 }
 
 /// M1: commits the parser used to miss.
@@ -577,4 +580,203 @@ fn substitutions_program_words_and_env_options() {
         let out = s.pre_commit(command);
         assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));
     }
+}
+
+/// Final review 1: Claude Code's standard commit form, a heredoc inside `"$( ... )"`, must
+/// pass when nothing is pending, whatever the message says (`1)`, `:)`, `it's`, backticks).
+#[test]
+fn heredoc_commit_message_in_double_quotes_is_not_a_write() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.mark("s1");
+    let command = "git add -A && git commit -m \"$(cat <<'EOF'\nSteps:\n1) ran tests\n2) ran \
+                   `cargo test` (it's green)\nDone :)\n\nCo-Authored-By: x <x@y>\nEOF\n)\"";
+    let out = s.pre_commit(command);
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    s.edit();
+    let out = s.pre_commit(command);
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+}
+
+/// Final review 2: a very long pipeline must not crash the hook (a crash lets the commit
+/// through) and must stay fast.
+#[test]
+fn long_pipelines_are_held_not_crashed() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.edit();
+    let pipeline = vec!["cat"; 4000].join(" | ");
+    let start = std::time::Instant::now();
+    let out = s.pre_commit(&format!("{pipeline} ; git commit -m x"));
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    let out = s.pre_commit(&pipeline);
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// Final review 3: `cd` that may not change this shell's folder (background, pipeline,
+/// conditional, `cd -`) must not move later commits elsewhere.
+#[test]
+fn cd_that_may_not_run_does_not_move_the_commit() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.edit();
+    git(&s.other(), &["init", "-q"]);
+    for command in [
+        "cd ../other & git commit -am x",
+        "cd ../other | cat; git commit -am x",
+        "false && cd ../other; git commit -am x",
+        "cd ../other || echo no; git commit -am x",
+        "if false; then cd ../other; fi; git commit -am x",
+        "for d in x; do cd ../other; done; git commit -am x",
+        "cd ../other; cd -; git commit -am x",
+    ] {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(2), "not held: {command}: {}", stderr(&out));
+    }
+    for command in [
+        "cd ../other && git commit -m x",
+        "cd ../other || exit 1; git commit -m x",
+        "cd ../other; git commit -m x",
+        "true && cd ../other && git commit -m x",
+        "(cd ../other; cd -); cd ../other && git commit -m x",
+    ] {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));
+    }
+}
+
+/// Final review 4: commands that cannot change the notes a commit takes are not held.
+#[test]
+fn writes_that_cannot_reach_the_commit_are_not_held() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.mark("s1");
+    for command in [
+        "git checkout -b feat && git add -A && git commit -m x",
+        "git switch -c feat2 && git commit -m x",
+        "git checkout --orphan o && git commit -m x",
+        "git commit -m x && gh pr create --fill",
+        "git commit -m x && echo done > vault/log.md",
+        "mkdir -p vault/Sessions/2026/10 && git commit -m x",
+    ] {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));
+    }
+    for command in [
+        "git checkout -b feat origin/x && git commit -m x",
+        "git switch -c feat main && git commit -m x",
+        "for i in 1 2; do git commit -m x; echo y > vault/c.md; done",
+        "git commit -m x & echo y > vault/c.md",
+        "echo y > vault/c.md & git commit -am x",
+        "git commit -am x | tee vault/c.md",
+        "git commit -m x; git commit -am y; echo z > vault/c.md; git commit -am z",
+        "bash <<'EOF'\necho y > vault/c.md\nEOF\ngit commit -am x",
+    ] {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(2), "not held: {command}: {}", stderr(&out));
+    }
+}
+
+/// Final review 5a: a vault git ignores is not in git: its notes are not all pending.
+#[test]
+fn an_ignored_vault_is_outside_git() {
+    let s = Setup::new("vault = \"notes\"\n");
+    let repo = s.repo();
+    fs::create_dir_all(repo.join("notes")).unwrap();
+    fs::write(repo.join("notes/n.md"), "# n\n").unwrap();
+    fs::write(repo.join(".gitignore"), "notes/\n").unwrap();
+    let out = s.pre_commit("git add -A && git commit -m x");
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+}
+
+/// Final review 5b: after a lost-state rebuild, a note put back to its committed content is
+/// not pending any more.
+#[test]
+fn a_reverted_note_is_not_pending_after_a_rebuild() {
+    let s = Setup::standard();
+    s.edit();
+    let out = s.pre_commit("git commit -am x");
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    fs::write(s.repo().join("vault/a.md"), "# a\n[[b]]\n").unwrap();
+    let out = s.pre_commit("git commit -am x");
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+}
+
+/// Final review 8: a hold for a worktree's copy of the vault names that copy in the
+/// `wikiknit mark` it asks for, and that command clears the hold.
+#[test]
+fn a_worktree_hold_names_its_vault() {
+    let s = Setup::standard();
+    let repo = s.repo();
+    git(&repo, &["rm", "-q", "--cached", "wikiknit.toml"]);
+    git(&repo, &["commit", "-q", "-m", "untrack config"]);
+    let wt = s.root.path().join("wt");
+    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    s.session_start("s1");
+    fs::write(wt.join("vault/a.md"), "# a\nedited in wt [[b]]\n").unwrap();
+    let out = s.pre_commit_in(&wt, Some(&repo), "git commit -am x", &[]);
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    let copy = wt.join("vault").canonicalize().unwrap();
+    let wanted = format!("wikiknit --vault {} mark --session s1", copy.display());
+    assert!(stderr(&out).contains(&wanted), "{}", stderr(&out));
+    s.wk(&repo)
+        .args(["--vault", copy.to_str().unwrap(), "mark", "--session", "s1"])
+        .assert()
+        .success();
+    let out = s.pre_commit_in(&wt, Some(&repo), "git commit -am x", &[]);
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+}
+
+/// Final review 11: `cd "$HOME/..."` and `cd $VAR` with a literal value are followed; a
+/// target that stays unknown says so.
+#[test]
+fn cd_targets_with_home_and_variables() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.edit();
+    git(&s.other(), &["init", "-q"]);
+    let repo = s.repo();
+    let home = s.root.path().to_str().unwrap().to_string();
+    let env = [("HOME", home.as_str())];
+    for command in [
+        "cd \"$HOME/other\" && git commit -m x",
+        "cd ${HOME}/other && git commit -m x",
+        "cd ~/other && git commit -m x",
+        "R=../other; cd $R && git commit -m x",
+        "export R=../other; cd \"$R\" && git commit -m x",
+    ] {
+        let out = s.pre_commit_in(&repo, Some(&repo), command, &env);
+        assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));
+    }
+    let out = s.pre_commit_in(&repo, Some(&repo), "cd $UNSET && git commit -am x", &env);
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("cannot tell which repository"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Final review 13: `mark --session` with a session that does not exist refuses, instead of
+/// starting it and marking every pending note.
+#[test]
+fn mark_refuses_an_unknown_session() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.edit();
+    let out = s
+        .wk(&s.repo())
+        .args(["mark", "--session", "typo"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("s1"), "{}", stderr(&out));
+    let out = s.pre_commit("git commit -am x");
+    assert_eq!(
+        code(&out),
+        Some(2),
+        "a typo marked the notes: {}",
+        stderr(&out)
+    );
 }

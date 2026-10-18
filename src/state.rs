@@ -212,14 +212,22 @@ impl Store {
             return Ok(l.hashes);
         }
         if let Some(committed) = committed_hashes(&self.vault) {
-            // A note whose content is not the committed one is pending.
+            // Each note's committed content counts as linked (a note put back to it is not
+            // pending); a note git ignores cannot be committed and counts as linked as it is;
+            // any other new note is pending.
+            let new: Vec<String> = now
+                .keys()
+                .filter(|id| !committed.contains_key(*id))
+                .cloned()
+                .collect();
+            let ignored = ignored_notes(&self.vault, &new);
             let hashes: Hashes = now
                 .iter()
                 .map(|(id, h)| {
-                    let linked = if committed.get(id) == Some(h) {
-                        h.clone()
-                    } else {
-                        String::new()
+                    let linked = match committed.get(id) {
+                        Some(c) => c.clone(),
+                        None if ignored.contains(id) => h.clone(),
+                        None => String::new(),
                     };
                     (id.clone(), linked)
                 })
@@ -374,6 +382,21 @@ impl Store {
         }
     }
 
+    /// Ids of the sessions this vault has records for.
+    #[must_use]
+    pub fn sessions(&self) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(self.sessions_dir())
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| Some(e.path().file_stem()?.to_string_lossy().into_owned()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Which session a CLI call refers to: the flag, then `$WIKIKNIT_SESSION`, then the one
     /// session active in the last 12 hours. Several active sessions is an error: guessing
     /// could report another session's work.
@@ -448,6 +471,72 @@ pub fn safe_git(dir: &Path) -> std::process::Command {
     .stdin(std::process::Stdio::null())
     .stderr(std::process::Stdio::null());
     cmd
+}
+
+/// Whether git ignores the folder `dir` (so nothing in it can be committed without
+/// `git add -f`). False when `dir` is not in a git work tree or is its top.
+#[must_use]
+pub fn git_ignores_dir(dir: &Path) -> bool {
+    let run = |dir: &Path, args: &[&str]| -> Option<Vec<u8>> {
+        let out = safe_git(dir).args(args).output().ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    let Some(prefix) = run(dir, &["rev-parse", "--show-prefix"]) else {
+        return false;
+    };
+    let prefix = String::from_utf8_lossy(&prefix).trim_end().to_string();
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return false;
+    }
+    let Some(top) = run(dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    let top = PathBuf::from(String::from_utf8_lossy(&top).trim_end());
+    // Exit 0: ignored. `--no-index`: by the ignore rules alone.
+    safe_git(&top)
+        .args(["check-ignore", "-q", "--no-index", "--", prefix])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The ids among `ids` whose note file git ignores.
+fn ignored_notes(vault: &Path, ids: &[String]) -> BTreeSet<String> {
+    use std::io::Write as _;
+    if ids.is_empty() {
+        return BTreeSet::new();
+    }
+    let Ok(mut child) = safe_git(vault)
+        .args(["check-ignore", "--no-index", "-z", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return BTreeSet::new();
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return BTreeSet::new();
+    };
+    let paths: Vec<String> = ids.iter().map(|id| format!("{id}.md")).collect();
+    let writer = std::thread::spawn(move || {
+        for p in paths {
+            if stdin.write_all(p.as_bytes()).is_err() || stdin.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+    });
+    let out = child.wait_with_output();
+    let _ = writer.join();
+    let Ok(out) = out else {
+        return BTreeSet::new();
+    };
+    out.stdout
+        .split(|b| *b == 0)
+        .filter_map(|p| {
+            let p = String::from_utf8_lossy(p);
+            p.strip_suffix(".md").map(str::to_string)
+        })
+        .collect()
 }
 
 /// Content hash (as [`current_hashes`] computes it) of each note committed at `HEAD` under

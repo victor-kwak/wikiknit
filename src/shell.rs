@@ -12,7 +12,7 @@
 //! an *opaque* call: it may commit anywhere. `cd` and `export` inside a subshell or
 //! substitution do not leak out of it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A git invocation found in a command.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -38,6 +38,14 @@ pub struct GitCall {
     /// What runs cannot be seen (`$G commit`, `curl ... | sh`): it may commit, in a
     /// repository that cannot be known.
     pub opaque: bool,
+    /// The folder it runs in cannot be told (a `cd` that may or may not have run, `cd $X`):
+    /// its repository is unknown.
+    pub dir_unknown: bool,
+    /// Position among the calls and writes of the command, in the order they run.
+    pub seq: usize,
+    /// May run at another time than `seq` says: in a loop, a background job, a pipeline (its
+    /// parts run at once), or a heredoc fed to a shell.
+    pub unordered: bool,
 }
 
 /// Where a command other than git may write.
@@ -58,6 +66,10 @@ pub struct Write {
     /// The command, shortened, for messages.
     pub what: String,
     pub target: WriteTarget,
+    /// As for [`GitCall::seq`].
+    pub seq: usize,
+    /// As for [`GitCall::unordered`].
+    pub unordered: bool,
 }
 
 /// What a command would run and write.
@@ -68,6 +80,28 @@ pub struct Analysis {
     /// Possible file writes by commands other than git (redirections, `tee`, `cp`, unknown
     /// programs). Git's own work-tree changes are judged from `calls`.
     pub writes: Vec<Write>,
+}
+
+impl Analysis {
+    fn next_seq(&self) -> usize {
+        self.calls.len() + self.writes.len()
+    }
+
+    fn push_call(&mut self, mut call: GitCall, unordered: bool) {
+        call.seq = self.next_seq();
+        call.unordered |= unordered;
+        self.calls.push(call);
+    }
+
+    fn push_write(&mut self, what: impl Into<String>, target: WriteTarget, unordered: bool) {
+        let seq = self.next_seq();
+        self.writes.push(Write {
+            what: what.into(),
+            target,
+            seq,
+            unordered,
+        });
+    }
 }
 
 /// The git calls and possible writes of a Bash command.
@@ -116,6 +150,26 @@ struct Ctx {
     opaque_rest: bool,
     /// `set -a`: every later assignment is exported.
     allexport: bool,
+    /// Runs at another time than its place says (subshell part, heredoc body, trap).
+    unordered: bool,
+    /// Open `while`/`until`/`for`/`select` loops, and open compound commands of any kind.
+    loop_depth: usize,
+    compound_depth: usize,
+    /// The folder cannot be told (a `cd` that may not have run, `cd $X`): `cds` holds only
+    /// what came after.
+    cwd_unknown: bool,
+    /// `OLDPWD` for `cd -` (`None`: unknown).
+    prev: Option<Vec<String>>,
+    /// The next command follows `&&`/`||` in its list; the current command is conditional.
+    cond_next: bool,
+    cond: bool,
+    /// A conditional `cd` in this list (the folder is unknown once the list ends).
+    cd_maybe: bool,
+    /// A `cd` inside a compound command (unknown once it closes).
+    cd_in_compound: bool,
+    /// The last command was a `cd`; a `||` followed it.
+    last_was_cd: bool,
+    or_after_cd: bool,
 }
 
 /// A name `alias` can define that this parser follows.
@@ -127,7 +181,39 @@ fn is_alias_name(name: &str) -> bool {
 }
 
 impl Ctx {
+    fn unordered(&self) -> bool {
+        self.unordered || self.loop_depth > 0
+    }
+
+    /// The folder is unknown from here on.
+    fn lose_cwd(&mut self) {
+        self.cwd_unknown = true;
+        self.cds.clear();
+        self.prev = None;
+    }
+
+    /// A `cd` target with `~`, `$HOME`, and variables of literal value put in (`None` when
+    /// it still depends on something this parser cannot see).
+    fn cd_target(&self, dir: &str) -> Option<String> {
+        let mut d = dir.to_string();
+        for home in ["${HOME}", "$HOME"] {
+            if let Some(rest) = d.strip_prefix(home) {
+                d = format!("~{rest}");
+            }
+        }
+        for (k, v) in &self.vars {
+            if !is_dynamic_word(v) {
+                d = d
+                    .replace(&format!("${{{k}}}"), v)
+                    .replace(&format!("${k}"), v);
+            }
+        }
+        let bad_tilde = d.starts_with('~') && d != "~" && !d.starts_with("~/");
+        (!is_dynamic_word(&d) && !bad_tilde).then_some(d)
+    }
+
     fn export(&mut self, k: &str, v: &str) {
+        self.vars.insert(k.to_string(), v.to_string());
         match k {
             "GIT_DIR" => self.git_dir = Some(v.to_string()),
             "GIT_WORK_TREE" => self.work_tree = Some(v.to_string()),
@@ -169,17 +255,17 @@ fn split_assignment(w: &str) -> Option<(&str, &str)> {
 
 /// A call that cannot be seen into: it may commit anywhere and write anything.
 fn opaque(out: &mut Analysis, ctx: &Ctx, what: &str) {
-    out.calls.push(GitCall {
-        dirs: ctx.cds.clone(),
-        subcommand: "commit".into(),
-        config_overridden: true,
-        opaque: true,
-        ..GitCall::default()
-    });
-    out.writes.push(Write {
-        what: what.to_string(),
-        target: WriteTarget::Unknown,
-    });
+    out.push_call(
+        GitCall {
+            dirs: ctx.cds.clone(),
+            subcommand: "commit".into(),
+            config_overridden: true,
+            opaque: true,
+            ..GitCall::default()
+        },
+        true,
+    );
+    out.push_write(what, WriteTarget::Unknown, true);
 }
 
 fn shorten(words: &[String]) -> String {
@@ -198,10 +284,13 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
         opaque(out, ctx, "commands nested too deep to follow");
         return;
     }
-    // shell state at each open subshell / substitution
+    // shell state at each open subshell / substitution / subshell part
     let mut scopes: Vec<Ctx> = Vec::new();
-    // every simple command so far (heredoc bodies and pipes refer to commands by id)
+    // every simple command so far (heredoc bodies and pipes refer to commands by id), its
+    // position by id, and what each one read on stdin (so a long pipeline is read once)
     let mut commands: Vec<Cmd> = Vec::new();
+    let mut index: HashMap<usize, usize> = HashMap::new();
+    let mut stdin_of: HashMap<usize, Feed> = HashMap::new();
     let mut bodies: Vec<(usize, String, Ctx)> = Vec::new();
     let items = tokenize(command);
     for (k, item) in items.iter().cloned().enumerate() {
@@ -217,28 +306,102 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
             }
         }
         match item {
-            Item::Open => scopes.push(ctx.clone()),
-            Item::Close => {
+            Item::Open => {
+                scopes.push(ctx.clone());
+                ctx.cond_next = false;
+            }
+            Item::ScopeOpen => {
+                scopes.push(ctx.clone());
+                ctx.unordered = true;
+                ctx.cond_next = false;
+            }
+            Item::Close | Item::ScopeClose => {
                 if let Some(saved) = scopes.pop() {
                     *ctx = saved;
                 }
+            }
+            Item::AndOr(or) => {
+                if or {
+                    // `false && cd x || y`: whether the cd ran is unknown from here on.
+                    if ctx.cd_maybe {
+                        ctx.lose_cwd();
+                    }
+                    // `cd x || y`: if the cd fails, `y` runs and the folder did not change.
+                    ctx.or_after_cd = ctx.last_was_cd;
+                }
+                ctx.cond_next = true;
+            }
+            Item::Sep => {
+                if ctx.cd_maybe {
+                    ctx.lose_cwd();
+                }
+                ctx.cd_maybe = false;
+                ctx.cond_next = false;
+                ctx.or_after_cd = false;
             }
             Item::Sub(script) => {
                 let mut inner = ctx.clone();
                 collect(&script, &mut inner, out, depth + 1);
             }
             // Judged once every command is known: the shell it is piped into may come later
-            // (`(cat <<EOF ... EOF\n) | sh`).
-            Item::Body { cmd, text } => bodies.push((cmd, text, ctx.clone())),
+            // (`(cat <<EOF ... EOF\n) | sh`). It runs at another point than it is read.
+            Item::Body { cmd, text } => {
+                let mut inner = ctx.clone();
+                inner.unordered = true;
+                bodies.push((cmd, text, inner));
+            }
             Item::Cmd(cmd) => {
-                let feed = stdin_feed(&commands, &cmd);
+                let first = cmd.words.first().map(String::as_str);
+                // `cd x || exit`: the folder changed for every command that still runs.
+                if std::mem::take(&mut ctx.or_after_cd) {
+                    let p = strip_prefixes(&cmd.words);
+                    if !matches!(p.words.first().map(String::as_str), Some("exit" | "return")) {
+                        ctx.lose_cwd();
+                    }
+                }
+                if matches!(
+                    first,
+                    Some("if" | "while" | "until" | "for" | "case" | "select")
+                ) {
+                    ctx.compound_depth += 1;
+                    if matches!(first, Some("while" | "until" | "for" | "select")) {
+                        ctx.loop_depth += 1;
+                    }
+                }
+                ctx.cond = ctx.cond_next || ctx.compound_depth > 0;
+                let feed = stdin_feed(
+                    &Lookup {
+                        commands: &commands,
+                        index: &index,
+                        stdin_of: &stdin_of,
+                    },
+                    &cmd,
+                );
                 simple(&cmd.words, &cmd.redirects, &feed, ctx, out, depth);
+                if matches!(first, Some("fi" | "done" | "esac")) {
+                    ctx.compound_depth = ctx.compound_depth.saturating_sub(1);
+                    if first == Some("done") {
+                        ctx.loop_depth = ctx.loop_depth.saturating_sub(1);
+                    }
+                    // A `cd` inside `if`/`for`/... may or may not have run.
+                    if ctx.compound_depth == 0 && std::mem::take(&mut ctx.cd_in_compound) {
+                        ctx.lose_cwd();
+                    }
+                }
+                stdin_of.insert(cmd.id, feed);
+                index.insert(cmd.id, commands.len());
                 commands.push(cmd);
             }
         }
     }
     // A heredoc body is a script when its command, or a command it is piped into
     // (`cat <<EOF | sh`), is a shell reading stdin.
+    let mut consumers: HashMap<usize, Vec<usize>> = HashMap::new();
+    for c in &commands {
+        for from in &c.stdin_from {
+            consumers.entry(*from).or_default().push(c.id);
+        }
+    }
     for (cmd, text, mut inner) in bodies {
         // Every command the text can reach through pipes, groups, and substitutions.
         let mut seen = std::collections::BTreeSet::new();
@@ -248,25 +411,29 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
             if !seen.insert(j) {
                 continue;
             }
-            if commands
-                .iter()
-                .find(|c| c.id == j)
-                .is_some_and(|c| reads_stdin_shell(&c.words))
+            if index
+                .get(&j)
+                .is_some_and(|&i| reads_stdin_shell(&commands[i].words))
             {
                 feeds_shell = true;
                 break;
             }
-            todo.extend(
-                commands
-                    .iter()
-                    .filter(|n| n.stdin_from.contains(&j))
-                    .map(|n| n.id),
-            );
+            if let Some(next) = consumers.get(&j) {
+                todo.extend(next.iter().copied());
+            }
         }
         if feeds_shell {
             collect(&text, &mut inner, out, depth + 1);
         }
     }
+}
+
+/// The commands read so far, for working out what a command reads on stdin.
+struct Lookup<'a> {
+    commands: &'a [Cmd],
+    index: &'a HashMap<usize, usize>,
+    /// What each command (by id) read on stdin.
+    stdin_of: &'a HashMap<usize, Feed>,
 }
 
 /// What a command reads on stdin.
@@ -284,8 +451,9 @@ enum Feed {
     Opaque,
 }
 
-/// The stdin of `cmd`; `commands` are the commands before it.
-fn stdin_feed(commands: &[Cmd], cmd: &Cmd) -> Feed {
+/// The stdin of `cmd`. Its producers came before it, so what they read is known: no
+/// recursion, however long the pipeline.
+fn stdin_feed(l: &Lookup, cmd: &Cmd) -> Feed {
     // The last redirection of fd 0 wins.
     for r in cmd.redirects.iter().rev() {
         let digits = r.op.len() - r.op.trim_start_matches(|c: char| c.is_ascii_digit()).len();
@@ -309,10 +477,9 @@ fn stdin_feed(commands: &[Cmd], cmd: &Cmd) -> Feed {
         .stdin_from
         .iter()
         .map(|from| {
-            commands
-                .iter()
-                .find(|c| c.id == *from)
-                .map_or(Feed::Opaque, |producer| output_of(commands, producer))
+            l.index
+                .get(from)
+                .map_or(Feed::Opaque, |&i| output_of(l, &l.commands[i]))
         })
         .collect();
     match feeds.len() {
@@ -335,7 +502,7 @@ fn stdin_feed(commands: &[Cmd], cmd: &Cmd) -> Feed {
 }
 
 /// What `cmd` writes to stdout.
-fn output_of(commands: &[Cmd], cmd: &Cmd) -> Feed {
+fn output_of(l: &Lookup, cmd: &Cmd) -> Feed {
     let p = strip_prefixes(&cmd.words);
     let Some((program, args)) = p.words.split_first() else {
         // Only redirections or assignments: what reaches the pipe cannot be told.
@@ -353,9 +520,9 @@ fn output_of(commands: &[Cmd], cmd: &Cmd) -> Feed {
         }
         // Pass stdin through.
         "cat" if args.iter().all(|a| a.len() > 1 && a.starts_with('-')) => {
-            stdin_feed(commands, cmd)
+            l.stdin_of.get(&cmd.id).cloned().unwrap_or(Feed::Opaque)
         }
-        "tee" => stdin_feed(commands, cmd),
+        "tee" => l.stdin_of.get(&cmd.id).cloned().unwrap_or(Feed::Opaque),
         _ => Feed::Opaque,
     }
 }
@@ -407,19 +574,41 @@ fn process_substitution(word: &str) -> Option<&str> {
 
 /// What the commands of a process substitution print.
 fn process_output(inner: &str) -> Feed {
-    let mut cmds = Vec::new();
+    let mut cmds: Vec<Cmd> = Vec::new();
+    let mut index = HashMap::new();
+    let mut stdin_of = HashMap::new();
     let mut bodies = Vec::new();
     for item in tokenize(inner) {
         match item {
-            Item::Cmd(c) => cmds.push(c),
+            Item::Cmd(c) => {
+                let feed = stdin_feed(
+                    &Lookup {
+                        commands: &cmds,
+                        index: &index,
+                        stdin_of: &stdin_of,
+                    },
+                    &c,
+                );
+                stdin_of.insert(c.id, feed);
+                index.insert(c.id, cmds.len());
+                cmds.push(c);
+            }
             Item::Body { cmd, text } => bodies.push((cmd, text)),
+            // A pipeline's parts: one output.
+            Item::ScopeOpen | Item::ScopeClose => {}
+            // Several lists, subshells, substitutions: cannot be told.
             _ => return Feed::Opaque,
         }
     }
     let Some(last) = cmds.last() else {
         return Feed::Terminal;
     };
-    match output_of(&cmds, last) {
+    let l = Lookup {
+        commands: &cmds,
+        index: &index,
+        stdin_of: &stdin_of,
+    };
+    match output_of(&l, last) {
         Feed::Heredoc(j) => bodies
             .into_iter()
             .find(|(c, _)| *c == j)
@@ -438,10 +627,7 @@ fn run_fed(feed: &Feed, ctx: &Ctx, out: &mut Analysis, depth: usize, what: &str)
         // Heredoc bodies are parsed where they appear; nothing comes from the terminal.
         Feed::Heredoc(_) | Feed::Terminal => {}
         // A script file: like `bash script.sh`, it may write anything.
-        Feed::File => out.writes.push(Write {
-            what: what.to_string(),
-            target: WriteTarget::Unknown,
-        }),
+        Feed::File => out.push_write(what.to_string(), WriteTarget::Unknown, ctx.unordered()),
         Feed::Opaque => opaque(out, ctx, what),
     }
 }
@@ -625,8 +811,10 @@ fn program_effect(name: &str, args: &[String]) -> Effect {
                 .map(str::to_string)
                 .collect(),
         ),
-        "tee" | "cp" | "mv" | "install" | "ln" | "link" | "rm" | "unlink" | "rmdir" | "mkdir"
-        | "touch" | "truncate" | "shred" | "mktemp" => {
+        // Folders are not notes.
+        "mkdir" | "rmdir" => Effect::None,
+        "tee" | "cp" | "mv" | "install" | "ln" | "link" | "rm" | "unlink" | "touch"
+        | "truncate" | "shred" | "mktemp" => {
             let mut paths = operands(args);
             paths.extend(
                 args.iter()
@@ -649,6 +837,7 @@ fn simple(
     out: &mut Analysis,
     depth: usize,
 ) {
+    ctx.last_was_cd = false;
     let mut p = strip_prefixes(words);
     if p.not_run {
         return;
@@ -660,18 +849,26 @@ fn simple(
         }
     }
     let what = shorten(words);
+    let unordered = ctx.unordered();
+    // A folder that cannot be told makes relative paths unknown.
+    let cwd_unknown = ctx.cwd_unknown;
     let write = |out: &mut Analysis, dirs: &[String], paths: Vec<String>, xargs: bool| {
-        out.writes.push(Write {
-            what: what.clone(),
-            target: if xargs {
-                WriteTarget::Unknown
-            } else {
-                WriteTarget::Paths {
-                    dirs: dirs.to_vec(),
-                    paths,
-                }
-            },
-        });
+        let placeable = !cwd_unknown
+            || dirs
+                .iter()
+                .any(|d| d.starts_with('/') || d.starts_with('~'))
+            || paths
+                .iter()
+                .all(|p| p.starts_with('/') || p.starts_with('~'));
+        let target = if xargs || !placeable {
+            WriteTarget::Unknown
+        } else {
+            WriteTarget::Paths {
+                dirs: dirs.to_vec(),
+                paths,
+            }
+        };
+        out.push_write(what.clone(), target, unordered);
     };
     // Redirections (in `[[ ... ]]`, `<` and `>` compare strings).
     if p.words.first().map(String::as_str) != Some("[[") {
@@ -754,11 +951,8 @@ fn simple(
         call.subcommand = "commit".into();
         call.config_overridden = true;
         call.opaque = true;
-        out.calls.push(call);
-        out.writes.push(Write {
-            what,
-            target: WriteTarget::Unknown,
-        });
+        out.push_call(call, true);
+        out.push_write(what, WriteTarget::Unknown, true);
         return;
     }
     match name {
@@ -850,13 +1044,41 @@ fn simple(
                 ctx.unset(a);
             }
         }
-        "cd" | "pushd" => {
-            if let Some(dir) = args.iter().find(|a| !a.starts_with('-')) {
-                ctx.cds.push(dir.clone());
+        "cd" | "pushd" | "popd" => {
+            let target = args
+                .iter()
+                .find(|a| !a.starts_with('-') || a.as_str() == "-")
+                .map(String::as_str);
+            match (name, target) {
+                ("cd", Some("-")) => match ctx.prev.take() {
+                    Some(prev) => {
+                        let now = std::mem::replace(&mut ctx.cds, prev);
+                        ctx.prev = Some(now);
+                    }
+                    None => ctx.lose_cwd(),
+                },
+                ("popd", _) | ("pushd", None) => ctx.lose_cwd(),
+                (_, target) => match ctx.cd_target(target.unwrap_or("~")) {
+                    Some(dir) => {
+                        ctx.prev = Some(ctx.cds.clone());
+                        if dir.starts_with('/') || dir.starts_with('~') {
+                            ctx.cwd_unknown = false;
+                            ctx.cds.clear();
+                        }
+                        ctx.cds.push(dir);
+                    }
+                    None => ctx.lose_cwd(),
+                },
             }
-        }
-        "popd" => {
-            ctx.cds.pop();
+            // A `cd` that may not run: the folder is unknown after its list or compound.
+            if ctx.cond {
+                if ctx.compound_depth > 0 {
+                    ctx.cd_in_compound = true;
+                } else {
+                    ctx.cd_maybe = true;
+                }
+            }
+            ctx.last_was_cd = true;
         }
         name if SHELLS.contains(&name) => {
             let mut inner = ctx.clone();
@@ -906,12 +1128,16 @@ fn simple(
                     call.subcommand = "commit".into();
                     call.config_overridden = true;
                     call.opaque = true;
-                    out.writes.push(Write {
-                        what: what.clone(),
-                        target: WriteTarget::Unknown,
-                    });
+                    call.unordered = true;
+                    out.push_write(what.clone(), WriteTarget::Unknown, true);
                 }
-                out.calls.push(call);
+                // After a `cd` this parser cannot follow, only an absolute `-C` places it.
+                call.dir_unknown = ctx.cwd_unknown
+                    && !call
+                        .dirs
+                        .iter()
+                        .any(|d| d.starts_with('/') || d.starts_with('~'));
+                out.push_call(call, ctx.unordered());
             }
         }
         "alias" => {
@@ -945,6 +1171,7 @@ fn simple(
             match parse_opts(&TRAP_OPTS, args) {
                 // `trap ARG SIGNAL...`; one operand, or ARG `-`, resets.
                 Some(parsed) if parsed.opts.is_empty() => {
+                    inner.unordered = true;
                     if parsed.operands.len() >= 2 && parsed.operands[0] != "-" {
                         collect(&parsed.operands[0], &mut inner, out, depth + 1);
                     }
@@ -1100,10 +1327,7 @@ fn simple(
                         i = j + 1;
                     }
                     "-delete" | "-fprint" | "-fprint0" | "-fprintf" | "-fls" => {
-                        out.writes.push(Write {
-                            what: what.clone(),
-                            target: WriteTarget::Unknown,
-                        });
+                        out.push_write(what.clone(), WriteTarget::Unknown, ctx.unordered());
                         i += 1;
                     }
                     _ => i += 1,
@@ -1113,10 +1337,7 @@ fn simple(
         _ => match program_effect(name, args) {
             Effect::None => {}
             Effect::Paths(paths) => write(out, &dirs, paths, p.xargs),
-            Effect::Unknown => out.writes.push(Write {
-                what,
-                target: WriteTarget::Unknown,
-            }),
+            Effect::Unknown => out.push_write(what, WriteTarget::Unknown, ctx.unordered()),
         },
     }
 }
@@ -1188,10 +1409,7 @@ fn run_file(file: &str, feed: &Feed, ctx: &Ctx, out: &mut Analysis, depth: usize
     } else if let Some(inner) = process_substitution(file) {
         run_fed(&process_output(inner), ctx, out, depth, what);
     } else {
-        out.writes.push(Write {
-            what: what.to_string(),
-            target: WriteTarget::Unknown,
-        });
+        out.push_write(what.to_string(), WriteTarget::Unknown, ctx.unordered());
     }
 }
 
@@ -1220,10 +1438,7 @@ fn source_file(
         Feed::Literal(text) => collect(&text, ctx, out, depth + 1),
         Feed::Terminal => {}
         Feed::File => {
-            out.writes.push(Write {
-                what: what.to_string(),
-                target: WriteTarget::Unknown,
-            });
+            out.push_write(what.to_string(), WriteTarget::Unknown, ctx.unordered());
             ctx.opaque_rest = true;
         }
         // The heredoc body is parsed where it appears, but not in this shell's state.
@@ -1996,6 +2211,17 @@ struct Group {
     stdin: Vec<usize>,
     ids: Vec<usize>,
     kind: GroupKind,
+    /// The enclosing level's list state, restored when the group closes.
+    level: Level,
+}
+
+/// Where the current and-or list and pipeline element start (item indices), and whether a
+/// `|` made the current pipeline.
+#[derive(Debug, Clone, Copy, Default)]
+struct Level {
+    list_start: usize,
+    elem_start: usize,
+    in_pipeline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2032,7 +2258,18 @@ enum Item {
     /// A command substitution found inside double quotes.
     Sub(String),
     /// A heredoc body, fed to the command with this id.
-    Body { cmd: usize, text: String },
+    Body {
+        cmd: usize,
+        text: String,
+    },
+    /// `&&` (false) or `||` (true) between two commands of one and-or list.
+    AndOr(bool),
+    /// The end of an and-or list: `;`, a newline, or `&`.
+    Sep,
+    /// The start and end of a part that runs in its own subshell, at the same time as other
+    /// parts: a pipeline element, or a list run in the background with `&`.
+    ScopeOpen,
+    ScopeClose,
 }
 
 struct Heredoc {
@@ -2054,6 +2291,7 @@ struct Saved {
     cur_id: Option<usize>,
     pipe_from: Vec<usize>,
     groups: Vec<Group>,
+    level: Level,
     start: usize,
 }
 
@@ -2066,7 +2304,7 @@ fn body_substitutions(body: &str) -> Vec<String> {
         match chars[i] {
             '\\' => i += 2,
             '$' if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') => {
-                let end = balanced_close(&chars, i + 1);
+                let end = substitution_end(&chars, i + 1);
                 subs.push(
                     chars[i + 2..end.saturating_sub(1).max(i + 2)]
                         .iter()
@@ -2150,6 +2388,11 @@ fn tokenize(command: &str) -> Vec<Item> {
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut in_backtick = false;
     let mut i = 0;
+    // Subshell parts (pipeline elements, background lists) as item index ranges, and the
+    // current level's list state. After `|`, `&&`, `||` a newline continues the list.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut level = Level::default();
+    let mut after_op = false;
 
     // Each open `(` (None) or `$(`/`<(`/`>(`/backtick (the command it interrupts), and the
     // nesting depth at each open `case`: inside a `case`, a `)` at the same depth ends a
@@ -2178,6 +2421,16 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
         };
     }
+    // End the current pipeline: its last element runs in a subshell too.
+    macro_rules! end_pipeline {
+        () => {
+            if level.in_pipeline {
+                spans.push((level.elem_start, items.len()));
+                level.in_pipeline = false;
+            }
+            level.elem_start = items.len();
+        };
+    }
     macro_rules! end_cmd {
         () => {
             end_word!();
@@ -2188,7 +2441,11 @@ fn tokenize(command: &str) -> Vec<Item> {
                 && groups.last().is_some_and(|g| g.kind == GroupKind::Brace);
             let mut closed = None;
             if closes_brace {
-                closed = groups.pop().map(|g| g.ids);
+                end_pipeline!();
+                if let Some(g) = groups.pop() {
+                    level = g.level;
+                    closed = Some(g.ids);
+                }
                 words.clear();
             }
             let only_redirects = words.is_empty();
@@ -2209,7 +2466,14 @@ fn tokenize(command: &str) -> Vec<Item> {
                         stdin: stdin_from.clone(),
                         ids: vec![id],
                         kind: GroupKind::Brace,
+                        level,
                     });
+                    // The group's own list starts with this command.
+                    level = Level {
+                        list_start: items.len(),
+                        elem_start: items.len(),
+                        in_pipeline: false,
+                    };
                 }
                 items.push(Item::Cmd(Cmd {
                     id,
@@ -2218,6 +2482,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                     stdin_from,
                 }));
                 emitted = Some(id);
+                after_op = false;
                 // `( ... ) 2>/dev/null | sh`: redirections of the group, not a new producer.
                 if !only_redirects {
                     last_group = None;
@@ -2250,6 +2515,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                 cur_id: cur_id.take(),
                 pipe_from: std::mem::take(&mut pipe_from),
                 groups: std::mem::take(&mut groups),
+                level,
                 start: $start,
             }));
             if !sub_stdin.is_empty() {
@@ -2257,16 +2523,23 @@ fn tokenize(command: &str) -> Vec<Item> {
                     stdin: sub_stdin,
                     ids: Vec::new(),
                     kind: GroupKind::Sub,
+                    level,
                 });
             }
             in_word = false;
             items.push(Item::Open);
+            level = Level {
+                list_start: items.len(),
+                elem_start: items.len(),
+                in_pipeline: false,
+            };
         };
     }
     // Close the innermost `(` or substitution at `end` (the closing char).
     macro_rules! close {
         ($end:expr) => {
             end_cmd!();
+            end_pipeline!();
             items.push(Item::Close);
             match opens.pop() {
                 Some(Some(s)) => {
@@ -2277,6 +2550,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                     cur_id = s.cur_id;
                     pipe_from = s.pipe_from;
                     groups = s.groups;
+                    level = s.level;
                     last_group = None;
                     in_word = true;
                     let end = ($end).min(chars.len().saturating_sub(1));
@@ -2287,6 +2561,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                     while groups.last().is_some_and(|g| g.kind != GroupKind::Sub) {
                         let g = groups.pop().expect("checked");
                         if g.kind == GroupKind::Paren {
+                            level = g.level;
                             last_group = Some(g.ids);
                             break;
                         }
@@ -2318,8 +2593,9 @@ fn tokenize(command: &str) -> Vec<Item> {
                             word.push(chars[i]);
                         }
                         '$' if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') => {
-                            // "$(...)": a command inside the string.
-                            let end = balanced_close(&chars, i + 1);
+                            // "$(...)": a command inside the string, read as the shell
+                            // reads it (heredocs, quotes, comments inside).
+                            let end = substitution_end(&chars, i + 1);
                             let inner: String = chars[i + 2..end.saturating_sub(1).max(i + 2)]
                                 .iter()
                                 .collect();
@@ -2384,9 +2660,15 @@ fn tokenize(command: &str) -> Vec<Item> {
                     stdin,
                     ids: Vec::new(),
                     kind: GroupKind::Paren,
+                    level,
                 });
                 items.push(Item::Open);
                 opens.push(None);
+                level = Level {
+                    list_start: items.len(),
+                    elem_start: items.len(),
+                    in_pipeline: false,
+                };
             }
             ')' => {
                 if cases.last() == Some(&opens.len()) {
@@ -2507,6 +2789,12 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '\n' => {
                 end_cmd!();
+                if !after_op {
+                    end_pipeline!();
+                    items.push(Item::Sep);
+                    level.list_start = items.len();
+                    level.elem_start = items.len();
+                }
                 i += 1;
                 // Heredoc bodies start on the next line; the terminator is the exact word
                 // (leading tabs allowed with `<<-`).
@@ -2543,24 +2831,51 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '|' if chars.get(i + 1) == Some(&'|') => {
                 end_cmd!();
+                end_pipeline!();
+                items.push(Item::AndOr(true));
+                level.elem_start = items.len();
+                after_op = true;
+                last_group = None;
+                i += 2;
+                continue;
+            }
+            '&' if chars.get(i + 1) == Some(&'&') => {
+                end_cmd!();
+                end_pipeline!();
+                items.push(Item::AndOr(false));
+                level.elem_start = items.len();
+                after_op = true;
                 last_group = None;
                 i += 2;
                 continue;
             }
             '|' => {
-                // `|` or `|&`: a pipe into the next command.
+                // `|` or `|&`: a pipe into the next command; each element is a subshell.
                 end_cmd!();
                 pipe_from = match (last_group.take(), emitted) {
                     (Some(g), _) => g,
                     (None, Some(id)) => vec![id],
                     (None, None) => Vec::new(),
                 };
+                spans.push((level.elem_start, items.len()));
+                level.in_pipeline = true;
+                level.elem_start = items.len();
+                after_op = true;
                 if chars.get(i + 1) == Some(&'&') {
                     i += 1;
                 }
             }
             ';' | '&' => {
                 end_cmd!();
+                end_pipeline!();
+                if c == '&' {
+                    // A background job: the whole and-or list runs in a subshell.
+                    spans.push((level.list_start, items.len()));
+                }
+                items.push(Item::Sep);
+                level.list_start = items.len();
+                level.elem_start = items.len();
+                after_op = false;
             }
             c if c.is_whitespace() => {
                 end_word!();
@@ -2577,7 +2892,158 @@ fn tokenize(command: &str) -> Vec<Item> {
         close!(chars.len());
     }
     end_cmd!();
-    items
+    end_pipeline!();
+    with_scopes(items, &spans)
+}
+
+/// Put `ScopeOpen` / `ScopeClose` around each span (spans nest or are disjoint).
+fn with_scopes(items: Vec<Item>, spans: &[(usize, usize)]) -> Vec<Item> {
+    let n = items.len();
+    let mut opens = vec![0usize; n + 1];
+    let mut closes = vec![0usize; n + 1];
+    for &(a, b) in spans {
+        if a < b && b <= n {
+            opens[a] += 1;
+            closes[b] += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(n + 2 * spans.len());
+    for (k, item) in items.into_iter().enumerate() {
+        out.extend(std::iter::repeat_n(Item::ScopeClose, closes[k]));
+        out.extend(std::iter::repeat_n(Item::ScopeOpen, opens[k]));
+        out.push(item);
+    }
+    out.extend(std::iter::repeat_n(Item::ScopeClose, closes[n]));
+    out
+}
+
+/// Index just past the `)` that closes the `$(` whose `(` is at `open`, reading the inside
+/// as the shell does: quotes, escapes, nested substitutions and backticks, comments, and
+/// heredoc bodies (whose text may hold `)` or `'`). The end of input if it never closes.
+fn substitution_end(chars: &[char], open: usize) -> usize {
+    let n = chars.len();
+    let mut depth = 0usize;
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    let mut word_start = true;
+    let mut i = open;
+    while i < n {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                i += 2;
+                word_start = false;
+                continue;
+            }
+            '\'' => {
+                i += 1;
+                while i < n && chars[i] != '\'' {
+                    i += 1;
+                }
+                i += 1;
+                word_start = false;
+                continue;
+            }
+            '"' => {
+                i += 1;
+                while i < n && chars[i] != '"' {
+                    match chars[i] {
+                        '\\' => i += 2,
+                        '$' if chars.get(i + 1) == Some(&'(') => i = substitution_end(chars, i + 1),
+                        '`' => {
+                            i += 1;
+                            while i < n && chars[i] != '`' {
+                                i += if chars[i] == '\\' { 2 } else { 1 };
+                            }
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+                word_start = false;
+                continue;
+            }
+            '`' => {
+                i += 1;
+                while i < n && chars[i] != '`' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+                word_start = false;
+                continue;
+            }
+            '#' if word_start => {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '<' if chars.get(i + 1) == Some(&'<') => {
+                if chars.get(i + 2) == Some(&'<') {
+                    i += 3;
+                    continue;
+                }
+                i += 2;
+                let strip_tabs = chars.get(i) == Some(&'-');
+                if strip_tabs {
+                    i += 1;
+                }
+                while i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                    i += 1;
+                }
+                let mut delim = String::new();
+                while i < n
+                    && !chars[i].is_whitespace()
+                    && !matches!(chars[i], ';' | '&' | '|' | ')' | '<' | '>')
+                {
+                    if !matches!(chars[i], '\'' | '"' | '\\') {
+                        delim.push(chars[i]);
+                    }
+                    i += 1;
+                }
+                if !delim.is_empty() {
+                    heredocs.push((delim, strip_tabs));
+                }
+                word_start = false;
+                continue;
+            }
+            '\n' => {
+                i += 1;
+                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    while i < n {
+                        let start = i;
+                        while i < n && chars[i] != '\n' {
+                            i += 1;
+                        }
+                        let line: String = chars[start..i].iter().collect();
+                        i += 1;
+                        let line = line.trim_end_matches('\r');
+                        let line = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line
+                        };
+                        if line == delim {
+                            break;
+                        }
+                    }
+                }
+                word_start = true;
+                continue;
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        word_start = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')');
+        i += 1;
+    }
+    n
 }
 
 #[cfg(test)]
@@ -2671,10 +3137,9 @@ mod tests {
             dirs("(case x in a) ;; esac; cd /o); git commit"),
             vec![none()]
         );
-        assert_eq!(
-            dirs("case $x in (a) cd /o ;; esac; git commit"),
-            vec![v(&["/o"])]
-        );
+        // A `cd` inside `case` may not run: the folder is unknown after it.
+        assert!(git_commits("case $x in (a) cd /o ;; esac; git commit")[0].dir_unknown);
+        assert!(git_commits("pushd /other; popd; git commit")[0].dir_unknown);
     }
 
     #[test]
@@ -3436,5 +3901,82 @@ mod tests {
             git_commits("set -a; set +a; GIT_DIR=r/.git; git commit")[0].git_dir,
             None
         );
+    }
+
+    #[test]
+    fn heredoc_in_a_quoted_substitution() {
+        let c = "git add -A && git commit -m \"$(cat <<'EOF'\nSteps:\n1) ran tests\n2) ran \
+                 `cargo test` (it's green)\nDone :)\nEOF\n)\"";
+        let a = analyze(c);
+        assert_eq!(git_commits(c).len(), 1, "{a:?}");
+        assert!(a.writes.is_empty(), "{a:?}");
+        assert!(!a.calls.iter().any(|g| g.opaque), "{a:?}");
+        // An unquoted heredoc in the substitution still runs its `$(...)`.
+        assert_eq!(
+            git_commits("echo \"$(cat <<EOF\n$(git commit -m x)\nEOF\n)\"").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn long_pipelines_are_read_without_recursion() {
+        let pipeline = vec!["cat"; 20_000].join(" | ");
+        let start = std::time::Instant::now();
+        let a = analyze(&format!("echo 'git commit -m x' | {pipeline} | bash"));
+        assert_eq!(
+            a.calls.iter().filter(|g| g.subcommand == "commit").count(),
+            1
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cd_that_may_not_run() {
+        for c in [
+            "cd a & git commit",
+            "cd a | cat; git commit",
+            "false && cd a; git commit",
+            "cd a || echo no; git commit",
+            "if x; then cd a; fi; git commit",
+            "for d in x; do cd a; done; git commit",
+            "cd $UNSET; git commit",
+            "cd -; git commit",
+        ] {
+            let g = &git_commits(c)[0];
+            assert!(g.dir_unknown || g.dirs.is_empty(), "{c}: {g:?}");
+            assert!(!g.dirs.contains(&"a".to_string()), "{c}: {g:?}");
+        }
+        for (c, want) in [
+            ("cd a && git commit", v(&["a"])),
+            ("cd a || exit 1; git commit", v(&["a"])),
+            ("true && cd a && git commit", v(&["a"])),
+            ("cd a; cd b; cd -; git commit", v(&["a"])),
+            ("R=x/y; cd $R && git commit", v(&["x/y"])),
+            ("cd \"$HOME/r\" && git commit", v(&["~/r"])),
+            ("false && cd a; cd /abs; git commit", v(&["/abs"])),
+        ] {
+            let g = &git_commits(c)[0];
+            assert!(!g.dir_unknown, "{c}: {g:?}");
+            assert_eq!(g.dirs, want, "{c}");
+        }
+    }
+
+    #[test]
+    fn calls_and_writes_are_ordered() {
+        let a = analyze("echo x > f && git commit -m x && echo y > g");
+        let commit = a.calls.iter().find(|g| g.subcommand == "commit").unwrap();
+        assert!(a.writes[0].seq < commit.seq && a.writes[1].seq > commit.seq);
+        assert!(a.writes.iter().all(|w| !w.unordered));
+        for c in [
+            "for i in 1; do git commit; echo y > g; done",
+            "git commit & echo y > g",
+            "git commit | tee g",
+        ] {
+            let a = analyze(c);
+            assert!(
+                a.calls.iter().any(|g| g.unordered) || a.writes.iter().all(|w| w.unordered),
+                "{c}: {a:?}"
+            );
+        }
     }
 }
