@@ -111,6 +111,17 @@ struct Ctx {
     /// `alias NAME=VALUE` earlier in the command (expanded whether or not `expand_aliases`
     /// is on: fail closed).
     aliases: BTreeMap<String, String>,
+    /// Aliases were changed in a way this parser does not follow (`BASH_ALIASES[x]=...`, an
+    /// odd `alias` form): every later command is opaque.
+    opaque_rest: bool,
+}
+
+/// A name `alias` can define that this parser follows.
+fn is_alias_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 impl Ctx {
@@ -244,13 +255,6 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
     }
 }
 
-fn reads_stdin_shell(words: &[String]) -> bool {
-    let p = strip_prefixes(words);
-    p.words
-        .split_first()
-        .is_some_and(|(prog, args)| SHELLS.contains(&program_name(prog)) && shell_reads_stdin(args))
-}
-
 /// What a command reads on stdin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Feed {
@@ -323,9 +327,8 @@ fn output_of(commands: &[Cmd], cmd: &Cmd) -> Feed {
         // Only redirections or assignments: what reaches the pipe cannot be told.
         return Feed::Opaque;
     };
-    // Text the shell expands, or escapes `echo`/`printf` may interpret (`\x74`, `%b`):
-    // the output cannot be read.
-    let unreadable = |text: &str| text.contains('\\') || args.iter().any(|a| is_dynamic_word(a));
+    // Escapes `echo`/`printf` may interpret (`\x74`): the output cannot be read.
+    let unreadable = |text: &str| text.contains('\\');
     match program_name(program) {
         "echo" | "printf" => {
             let feed = output_text(program_name(program), args);
@@ -348,15 +351,27 @@ fn unescape(s: &str) -> String {
     s.replace("\\n", "\n").replace("\\t", "\t")
 }
 
-/// What `echo ARGS` / `printf ARGS` print, when it can be told (`None` for a `printf`
-/// format with directives). Remaining backslashes are left for the caller to refuse.
+/// What `echo ARGS` / `printf ARGS` print, when it can be told. printf prints its format
+/// (no `%` directives): an option other than `--` or `-v VAR` (nothing printed) is unknown.
+/// echo takes leading `-n`/`-e`/`-E` clusters; other words are text. Words the shell expands
+/// are unknown. Remaining backslashes are left for the caller to refuse.
 fn output_text(program: &str, args: &[String]) -> Option<String> {
     if program == "printf" {
-        let text = args.join(" ");
-        if text.contains('%') || args.first().is_some_and(|a| a == "-v") {
+        let mut args = args;
+        if args.first().is_some_and(|a| a == "--") {
+            args = &args[1..];
+        }
+        if let Some(first) = args.first()
+            && first.len() > 1
+            && first.starts_with('-')
+        {
+            return (first == "-v").then(String::new);
+        }
+        let format = args.first().map_or("", String::as_str);
+        if format.contains('%') || is_dynamic_word(format) {
             return None;
         }
-        return Some(unescape(&text));
+        return Some(unescape(format));
     }
     let args: Vec<&str> = args
         .iter()
@@ -365,6 +380,9 @@ fn output_text(program: &str, args: &[String]) -> Option<String> {
             a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))
         })
         .collect();
+    if args.iter().any(|a| is_dynamic_word(a)) {
+        return None;
+    }
     Some(unescape(&args.join(" ")))
 }
 
@@ -652,7 +670,12 @@ fn simple(
             write(out, &ctx.cds, paths, false);
         }
     }
-    if p.unparsed {
+    // After an alias change this parser cannot follow, nothing later can be read.
+    if words.iter().any(|w| w.starts_with("BASH_ALIASES")) {
+        ctx.opaque_rest = true;
+    }
+    // Under xargs, an empty command gets its words from stdin.
+    if p.unparsed || ctx.opaque_rest || (p.xargs && p.words.is_empty()) {
         opaque(out, ctx, &what);
         return;
     }
@@ -688,7 +711,7 @@ fn simple(
     // Under xargs, more arguments come from stdin: a shell runs unknown script files, and
     // git with no subcommand gets one from stdin.
     let xargs_unknown = p.xargs
-        && ((SHELLS.contains(&name) && shell_c_script(args).is_none())
+        && ((SHELLS.contains(&name) && !matches!(shell_run(args), ShellRun::Script(_)))
             || (name == "git" && parse_git(args, &dirs, None, None, false).is_none()));
     // A program word that is not a literal (`$G`, `$(which git)`), or a wrapper option this
     // parser does not know: it may be git, doing anything, in a repository that cannot be
@@ -743,23 +766,22 @@ fn simple(
         name if SHELLS.contains(&name) => {
             let mut inner = ctx.clone();
             inner.cds = dirs;
-            if let Some(script) = shell_c_script(args) {
-                collect(script, &mut inner, out, depth + 1);
-            } else if shell_reads_stdin(args) {
-                // `bash $S`: the word may be a script file, or expand to nothing.
-                if script_operand(args).is_some_and(is_dynamic_word) {
-                    opaque(out, &inner, &what);
-                }
-                run_fed(feed, &inner, out, depth, &what);
-            } else {
-                run_script_arg(args, feed, &inner, out, depth, &what);
+            match shell_run(args) {
+                ShellRun::Script(s) => collect(&s, &mut inner, out, depth + 1),
+                ShellRun::Stdin => run_fed(feed, &inner, out, depth, &what),
+                ShellRun::File(f) => run_file(&f, feed, &inner, out, depth, &what),
+                ShellRun::NotRun => {}
+                ShellRun::Unknown => opaque(out, &inner, &what),
             }
         }
         "source" | "." => {
             let mut inner = ctx.clone();
             inner.cds = dirs;
-            run_script_arg(args, feed, &inner, out, depth, &what);
             // A sourced script runs in this shell: its `cd` and `export` are unknown.
+            match parse_opts(&SOURCE_OPTS, args).and_then(|p| p.operands.first().cloned()) {
+                Some(f) => run_file(&f, feed, &inner, out, depth, &what),
+                None => opaque(out, &inner, &what),
+            }
         }
         "eval" => {
             let mut inner = ctx.clone();
@@ -800,10 +822,21 @@ fn simple(
             }
         }
         "alias" => {
-            for a in args.iter().filter(|a| !a.starts_with('-')) {
-                if let Some((k, v)) = a.split_once('=') {
-                    ctx.aliases.insert(k.to_string(), v.to_string());
+            // `alias NAME=VALUE` is followed; any form this parser cannot follow makes the rest
+            // of the command opaque.
+            match parse_opts(&ALIAS_OPTS, args) {
+                Some(parsed) => {
+                    for a in &parsed.operands {
+                        match a.split_once('=') {
+                            Some((k, v)) if is_alias_name(k) => {
+                                ctx.aliases.insert(k.to_string(), v.to_string());
+                            }
+                            None if is_alias_name(a) => {} // prints it
+                            _ => ctx.opaque_rest = true,
+                        }
+                    }
                 }
+                None => ctx.opaque_rest = true,
             }
         }
         "unalias" => {
@@ -811,55 +844,130 @@ fn simple(
                 ctx.aliases.remove(a.as_str());
             }
         }
-        // Commands that run a script argument.
+        // Commands that run a script or command argument. Each reads its options from a
+        // complete table; an unknown option or a missing command is opaque.
         "trap" => {
-            let script = args
-                .iter()
-                .find(|a| a.as_str() != "--" && !a.starts_with('-'));
-            if let Some(script) = script {
-                let mut inner = ctx.clone();
-                inner.cds = dirs;
-                collect(script, &mut inner, out, depth + 1);
+            let mut inner = ctx.clone();
+            inner.cds = dirs;
+            match parse_opts(&TRAP_OPTS, args) {
+                // `trap ARG SIGNAL...`; one operand, or ARG `-`, resets.
+                Some(parsed) if parsed.opts.is_empty() => {
+                    if parsed.operands.len() >= 2 && parsed.operands[0] != "-" {
+                        collect(&parsed.operands[0], &mut inner, out, depth + 1);
+                    }
+                }
+                Some(_) => {} // `-l`, `-p`: print
+                None => opaque(out, &inner, &what),
             }
         }
         "watch" => {
-            let mut rest = Vec::new();
-            let mut it = args.iter();
-            while let Some(a) = it.next() {
-                if !rest.is_empty() || !a.starts_with('-') {
-                    rest.push(a.clone());
-                } else if matches!(a.as_str(), "-n" | "--interval" | "-q" | "--equexit") {
-                    it.next();
-                }
-            }
             let mut inner = ctx.clone();
             inner.cds = dirs;
-            collect(&rest.join(" "), &mut inner, out, depth + 1);
+            match parse_opts(&WATCH_OPTS, args) {
+                Some(parsed) if parsed.has(&["h", "v", "help", "version"]) => {}
+                Some(parsed) if !parsed.operands.is_empty() => {
+                    collect(&parsed.operands.join(" "), &mut inner, out, depth + 1);
+                }
+                _ => opaque(out, &inner, &what),
+            }
         }
-        "su" | "script" | "runuser" => {
-            if let Some(script) = command_option(args) {
-                let mut inner = ctx.clone();
-                inner.cds = dirs;
-                collect(script, &mut inner, out, depth + 1);
+        "su" | "runuser" => {
+            let mut inner = ctx.clone();
+            inner.cds = dirs;
+            let spec = if name == "su" {
+                &SU_OPTS
+            } else {
+                &RUNUSER_OPTS
+            };
+            match parse_opts(spec, args) {
+                None => opaque(out, &inner, &what),
+                Some(parsed) if parsed.has(&["h", "V", "help", "version"]) => {}
+                Some(parsed) => {
+                    let scripts = parsed.values(&["c", "command", "session-command"]);
+                    if let Some(script) = scripts.last() {
+                        collect(script, &mut inner, out, depth + 1);
+                    } else if parsed.has(&["u", "user"]) {
+                        // `runuser -u USER COMMAND...`
+                        if parsed.operands.is_empty() {
+                            opaque(out, &inner, &what);
+                        } else {
+                            simple(&parsed.operands, &[], feed, &mut inner, out, depth + 1);
+                        }
+                    } else {
+                        // A shell reading stdin; words after the user go to that shell.
+                        let operands = parsed.operands.iter().filter(|o| o.as_str() != "-");
+                        if operands.count() > 1 {
+                            opaque(out, &inner, &what);
+                        } else {
+                            run_fed(feed, &inner, out, depth, &what);
+                        }
+                    }
+                }
+            }
+        }
+        "script" => {
+            let mut inner = ctx.clone();
+            inner.cds = dirs.clone();
+            match parse_opts(&SCRIPT_OPTS, args) {
+                None => opaque(out, &inner, &what),
+                Some(parsed) if parsed.has(&["h", "V", "help", "version"]) => {}
+                Some(parsed) => {
+                    // The typescript and log files.
+                    let mut paths = parsed.operands.clone();
+                    paths.extend(parsed.values(&[
+                        "B",
+                        "I",
+                        "O",
+                        "T",
+                        "t",
+                        "log-io",
+                        "log-in",
+                        "log-out",
+                        "log-timing",
+                        "timing",
+                    ]));
+                    if !paths.is_empty() {
+                        write(out, &dirs, paths, false);
+                    }
+                    match parsed.values(&["c", "command"]).last() {
+                        Some(script) => collect(script, &mut inner, out, depth + 1),
+                        // A shell reading stdin.
+                        None => run_fed(feed, &inner, out, depth, &what),
+                    }
+                }
             }
         }
         "flock" => {
             let mut inner = ctx.clone();
             inner.cds = dirs;
-            if let Some(script) = command_option(args) {
-                collect(script, &mut inner, out, depth + 1);
-            } else {
-                // flock [options] FILE COMMAND [ARGS]
-                let mut i = 0;
-                while i < args.len() && args[i].starts_with('-') {
-                    let takes = matches!(
-                        args[i].as_str(),
-                        "-w" | "--wait" | "--timeout" | "-E" | "--conflict-exit-code"
-                    );
-                    i += if takes { 2 } else { 1 };
-                }
-                if i + 1 < args.len() {
-                    simple(&args[i + 1..], &[], feed, &mut inner, out, depth + 1);
+            match parse_opts(&FLOCK_OPTS, args) {
+                None => opaque(out, &inner, &what),
+                Some(parsed) if parsed.has(&["h", "V", "help", "version"]) => {}
+                Some(parsed) => {
+                    if let Some(script) = parsed.values(&["c", "command"]).last() {
+                        collect(script, &mut inner, out, depth + 1);
+                    } else {
+                        // `flock FILE COMMAND...`, `flock FILE -c COMMAND` (exactly one
+                        // argument after `-c`, as util-linux checks), or `flock FD`.
+                        match parsed.operands.split_first() {
+                            Some((_, command))
+                                if command
+                                    .first()
+                                    .is_some_and(|c| c == "-c" || c == "--command") =>
+                            {
+                                if command.len() == 2 {
+                                    collect(&command[1], &mut inner, out, depth + 1);
+                                } else {
+                                    opaque(out, &inner, &what);
+                                }
+                            }
+                            Some((_, command)) if !command.is_empty() => {
+                                simple(command, &[], feed, &mut inner, out, depth + 1);
+                            }
+                            Some((fd, _)) if fd.chars().all(|c| c.is_ascii_digit()) => {}
+                            _ => opaque(out, &inner, &what),
+                        }
+                    }
                 }
             }
         }
@@ -905,140 +1013,78 @@ fn simple(
     }
 }
 
-/// `bash FILE` / `source FILE`: a process substitution or `/dev/stdin` is parsed; a script
-/// file may write anything (its commits are not seen, as for any program).
-fn run_script_arg(
-    args: &[String],
-    feed: &Feed,
-    ctx: &Ctx,
-    out: &mut Analysis,
-    depth: usize,
-    what: &str,
-) {
-    let mut it = args.iter();
-    let mut file = None;
-    while let Some(a) = it.next() {
-        if shell_opt_takes_arg(a) {
-            it.next();
-            continue;
-        }
-        if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) {
-            continue;
-        }
-        file = Some(a.as_str());
-        break;
+/// What a shell runs, from its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellRun {
+    /// `-c SCRIPT`.
+    Script(String),
+    /// Its script from stdin (no operands, or `-s`).
+    Stdin,
+    /// A script file (the first operand).
+    File(String),
+    /// `--help`, `--version`.
+    NotRun,
+    /// An option not in the table, or `-c` with no script.
+    Unknown,
+}
+
+fn shell_run(args: &[String]) -> ShellRun {
+    let Some(p) = parse_opts(&SHELL_OPTS, args) else {
+        return ShellRun::Unknown;
+    };
+    if p.has(&["help", "version"]) {
+        return ShellRun::NotRun;
     }
-    match file {
-        Some("/dev/stdin" | "-") => run_fed(feed, ctx, out, depth, what),
-        Some(f) if is_dynamic_word(f) => opaque(out, ctx, what),
-        Some(f) => match process_substitution(f) {
-            Some(inner) => run_fed(&process_output(inner), ctx, out, depth, what),
-            None => out.writes.push(Write {
-                what: what.to_string(),
-                target: WriteTarget::Unknown,
-            }),
-        },
-        None => {}
+    if p.has(&["c"]) {
+        return p
+            .operands
+            .first()
+            .map_or(ShellRun::Unknown, |s| ShellRun::Script(s.clone()));
+    }
+    if p.has(&["s"]) || p.operands.is_empty() {
+        return ShellRun::Stdin;
+    }
+    ShellRun::File(p.operands[0].clone())
+}
+
+/// A shell that may read its script from stdin (for heredoc bodies and pipes): one that
+/// reads stdin, names `/dev/stdin`, a word that can expand to nothing, or options this
+/// parser does not know.
+fn reads_stdin_shell(words: &[String]) -> bool {
+    let p = strip_prefixes(words);
+    let Some((prog, args)) = p.words.split_first() else {
+        return false;
+    };
+    if !SHELLS.contains(&program_name(prog)) {
+        return false;
+    }
+    match shell_run(args) {
+        ShellRun::Stdin | ShellRun::Unknown => true,
+        ShellRun::File(f) => f == "/dev/stdin" || f == "-" || is_dynamic_word(&f),
+        ShellRun::Script(_) | ShellRun::NotRun => false,
+    }
+}
+
+/// Run a script file (`bash FILE`, `source FILE`): `/dev/stdin` and process substitutions
+/// are parsed; a word that expands is opaque; a file may write anything (its commits are not
+/// seen, as for any program).
+fn run_file(file: &str, feed: &Feed, ctx: &Ctx, out: &mut Analysis, depth: usize, what: &str) {
+    if file == "/dev/stdin" || file == "-" {
+        run_fed(feed, ctx, out, depth, what);
+    } else if is_dynamic_word(file) {
+        opaque(out, ctx, what);
+    } else if let Some(inner) = process_substitution(file) {
+        run_fed(&process_output(inner), ctx, out, depth, what);
+    } else {
+        out.writes.push(Write {
+            what: what.to_string(),
+            target: WriteTarget::Unknown,
+        });
     }
 }
 
 fn program_name(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
-}
-
-/// Shell options that take a separate argument.
-fn shell_opt_takes_arg(opt: &str) -> bool {
-    matches!(opt, "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file")
-}
-
-/// The script of `bash -c SCRIPT` (also `-lc`, `-ec`, `-o pipefail -c`, `-euo pipefail -c`).
-fn shell_c_script(args: &[String]) -> Option<&str> {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let a = a.as_str();
-        if a == "--" {
-            return None;
-        }
-        if shell_opt_takes_arg(a) {
-            it.next();
-            continue;
-        }
-        if a.starts_with("--") {
-            continue;
-        }
-        if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
-            let cluster = &a[1..];
-            if cluster.contains(['o', 'O']) {
-                it.next(); // `-euo pipefail`
-            }
-            if a.starts_with('-') && cluster.contains('c') {
-                return it.next().map(String::as_str);
-            }
-            continue;
-        }
-        return None; // a script file
-    }
-    None
-}
-
-/// `bash` with only options reads its script from stdin (a heredoc, a pipe).
-/// `bash` with only options, or with `-s` (later words are arguments), reads its script from
-/// stdin (a heredoc, a pipe). So may `bash $X`: the word can expand to nothing.
-fn shell_reads_stdin(args: &[String]) -> bool {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let a = a.as_str();
-        if shell_opt_takes_arg(a) {
-            it.next();
-            continue;
-        }
-        if a.starts_with('-') || a.starts_with('+') {
-            let short = a.len() > 1 && !a.starts_with("--");
-            if short && a[1..].contains('c') {
-                return false;
-            }
-            if short && a.starts_with('-') && a[1..].contains('s') {
-                return true;
-            }
-            if short && a[1..].contains(['o', 'O']) {
-                it.next();
-            }
-            continue;
-        }
-        return is_dynamic_word(a);
-    }
-    true
-}
-
-/// The value of `-c CMD` / `--command CMD` / `--command=CMD` (also at the end of a short
-/// option cluster, `-qc CMD`).
-fn command_option(args: &[String]) -> Option<&str> {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if let Some(v) = a.strip_prefix("--command=") {
-            return Some(v);
-        }
-        if a == "--command" || (a.starts_with('-') && !a.starts_with("--") && a.ends_with('c')) {
-            return it.next().map(String::as_str);
-        }
-    }
-    None
-}
-
-/// The first word of a shell's arguments that is not an option (its script file).
-fn script_operand(args: &[String]) -> Option<&str> {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if shell_opt_takes_arg(a) {
-            it.next();
-            continue;
-        }
-        if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) {
-            continue;
-        }
-        return Some(a);
-    }
-    None
 }
 
 /// A word the shell expands at run time into something this parser cannot see: parameters
@@ -1054,13 +1100,8 @@ fn is_dynamic_word(w: &str) -> bool {
     if w.contains(['*', '?', '[']) {
         return true;
     }
-    // `{a,b}` or `{a..b}`
-    w.find('{').is_some_and(|open| {
-        w[open..].find('}').is_some_and(|close| {
-            let inner = &w[open + 1..open + close];
-            inner.contains(',') || inner.contains("..")
-        })
-    })
+    // `{a,b}` or `{a..b}`, in any group of the word
+    w.contains('{') && (w.contains(',') || w.contains(".."))
 }
 
 fn parse_git(
@@ -1121,37 +1162,436 @@ fn parse_git(
     None
 }
 
-/// Options (of a wrapper) that take a separate argument.
-fn wrapper_arg_opts(wrapper: &str) -> &'static [&'static str] {
-    match wrapper {
-        "sudo" => &["-u", "-g", "-h", "-p", "-C", "-r", "-t", "-U", "-T", "-R"],
-        "timeout" => &["-s", "-k", "--signal", "--kill-after"],
-        "nice" => &["-n", "--adjustment"],
-        "ionice" => &["-c", "-n", "-p", "-P", "-u"],
-        "xargs" => &[
-            "-I",
-            "-n",
-            "-P",
-            "-L",
-            "-l",
-            "-d",
-            "-E",
-            "-e",
-            "-s",
-            "-a",
-            "--max-args",
-            "--max-procs",
-            "--max-lines",
-            "--max-chars",
-            "--delimiter",
-            "--arg-file",
-            "--eof",
-            "--process-slot-var",
-        ],
-        "stdbuf" => &["-i", "-o", "-e"],
-        "doas" => &["-u", "-C"],
-        _ => &[],
+/// One program's command-line options, as `getopt_long` reads them. Every wrapper or runner
+/// this parser models has a complete table; an option not in it makes the call opaque.
+struct Opts {
+    /// Short options without a value.
+    flags: &'static str,
+    /// Short options with a value: the rest of the word, else the next word.
+    args: &'static str,
+    /// Short options with an optional value: only the rest of the word.
+    optional: &'static str,
+    long_flags: &'static [&'static str],
+    /// Long options with a value: `--name=value` or `--name value`.
+    long_args: &'static [&'static str],
+    /// Long options with an optional value: only `--name=value`.
+    long_optional: &'static [&'static str],
+    /// `+x` clusters are options too (shells).
+    plus: bool,
+    /// Options may follow operands (GNU argument permutation); otherwise the first operand
+    /// ends the options.
+    permute: bool,
+}
+
+const NO_OPTS: Opts = Opts {
+    flags: "",
+    args: "",
+    optional: "",
+    long_flags: &[],
+    long_args: &[],
+    long_optional: &[],
+    plus: false,
+    permute: false,
+};
+
+/// Options read from a command line.
+#[derive(Debug, Default)]
+struct OptsParsed {
+    /// (name, value): a short option's letter (`+x` for plus options) or a long option's name.
+    opts: Vec<(String, Option<String>)>,
+    operands: Vec<String>,
+}
+
+impl OptsParsed {
+    fn has(&self, names: &[&str]) -> bool {
+        self.opts.iter().any(|(n, _)| names.contains(&n.as_str()))
     }
+
+    /// Values of the options named `names`, in order.
+    fn values(&self, names: &[&str]) -> Vec<String> {
+        self.opts
+            .iter()
+            .filter(|(n, _)| names.contains(&n.as_str()))
+            .filter_map(|(_, v)| v.clone())
+            .collect()
+    }
+}
+
+/// Parse `words` against `spec`. `None` when an option is not in the table or a required
+/// value is missing: the caller cannot tell what runs.
+fn parse_opts(spec: &Opts, words: &[String]) -> Option<OptsParsed> {
+    let mut p = OptsParsed::default();
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        i += 1;
+        if w == "--" {
+            p.operands.extend(words[i..].iter().cloned());
+            return Some(p);
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            if spec.long_flags.contains(&name) {
+                if value.is_some() {
+                    return None;
+                }
+                p.opts.push((name.to_string(), None));
+            } else if spec.long_optional.contains(&name) {
+                p.opts.push((name.to_string(), value));
+            } else if spec.long_args.contains(&name) {
+                let value = match value {
+                    Some(v) => v,
+                    None => {
+                        i += 1;
+                        words.get(i - 1)?.clone()
+                    }
+                };
+                p.opts.push((name.to_string(), Some(value)));
+            } else {
+                return None;
+            }
+            continue;
+        }
+        let plus = spec.plus && w.starts_with('+');
+        if w.len() > 1 && (w.starts_with('-') || plus) {
+            let chars: Vec<char> = w[1..].chars().collect();
+            let mut k = 0;
+            while k < chars.len() {
+                let c = chars[k];
+                let name = if plus { format!("+{c}") } else { c.to_string() };
+                let rest: String = chars[k + 1..].iter().collect();
+                if spec.flags.contains(c) {
+                    p.opts.push((name, None));
+                    k += 1;
+                } else if spec.optional.contains(c) {
+                    p.opts.push((name, (!rest.is_empty()).then_some(rest)));
+                    break;
+                } else if spec.args.contains(c) {
+                    let value = if rest.is_empty() {
+                        i += 1;
+                        words.get(i - 1)?.clone()
+                    } else {
+                        rest
+                    };
+                    p.opts.push((name, Some(value)));
+                    break;
+                } else {
+                    return None;
+                }
+            }
+            continue;
+        }
+        if !spec.permute {
+            p.operands.extend(words[i - 1..].iter().cloned());
+            return Some(p);
+        }
+        p.operands.push(w.clone());
+    }
+    Some(p)
+}
+
+const SUDO_OPTS: Opts = Opts {
+    flags: "ABbEeHiKklNnPSsVv",
+    args: "CDgpRrTtUu",
+    long_flags: &[
+        "askpass",
+        "bell",
+        "background",
+        "edit",
+        "set-home",
+        "login",
+        "remove-timestamp",
+        "reset-timestamp",
+        "list",
+        "non-interactive",
+        "preserve-groups",
+        "stdin",
+        "shell",
+        "version",
+        "validate",
+        "help",
+    ],
+    long_args: &[
+        "close-from",
+        "chdir",
+        "group",
+        "host",
+        "prompt",
+        "chroot",
+        "role",
+        "type",
+        "command-timeout",
+        "other-user",
+        "user",
+    ],
+    long_optional: &["preserve-env"],
+    ..NO_OPTS
+};
+const DOAS_OPTS: Opts = Opts {
+    flags: "Lns",
+    args: "aCu",
+    ..NO_OPTS
+};
+const TIMEOUT_OPTS: Opts = Opts {
+    flags: "fpv",
+    args: "ks",
+    long_flags: &[
+        "foreground",
+        "preserve-status",
+        "verbose",
+        "help",
+        "version",
+    ],
+    long_args: &["kill-after", "signal"],
+    ..NO_OPTS
+};
+const NICE_OPTS: Opts = Opts {
+    args: "n",
+    long_flags: &["help", "version"],
+    long_args: &["adjustment"],
+    ..NO_OPTS
+};
+const IONICE_OPTS: Opts = Opts {
+    flags: "thV",
+    args: "cnpPu",
+    long_flags: &["ignore", "help", "version"],
+    long_args: &["class", "classdata", "pid", "pgid", "uid"],
+    ..NO_OPTS
+};
+const XARGS_OPTS: Opts = Opts {
+    flags: "0oprtx",
+    args: "adEILnPs",
+    optional: "eil",
+    long_flags: &[
+        "null",
+        "interactive",
+        "no-run-if-empty",
+        "verbose",
+        "exit",
+        "open-tty",
+        "show-limits",
+        "help",
+        "version",
+    ],
+    long_args: &[
+        "arg-file",
+        "delimiter",
+        "max-args",
+        "max-procs",
+        "max-chars",
+        "process-slot-var",
+    ],
+    long_optional: &["eof", "replace", "max-lines"],
+    ..NO_OPTS
+};
+const STDBUF_OPTS: Opts = Opts {
+    args: "ioe",
+    long_flags: &["help", "version"],
+    long_args: &["input", "output", "error"],
+    ..NO_OPTS
+};
+const ENV_OPTS: Opts = Opts {
+    flags: "i0v",
+    args: "uCS",
+    long_flags: &[
+        "ignore-environment",
+        "null",
+        "debug",
+        "list-signal-handling",
+        "help",
+        "version",
+    ],
+    long_args: &["unset", "chdir", "split-string"],
+    long_optional: &["block-signal", "default-signal", "ignore-signal"],
+    ..NO_OPTS
+};
+const CHRONIC_OPTS: Opts = Opts {
+    flags: "ev",
+    ..NO_OPTS
+};
+const SETSID_OPTS: Opts = Opts {
+    flags: "cfwhV",
+    long_flags: &["ctty", "fork", "wait", "help", "version"],
+    ..NO_OPTS
+};
+const UNBUFFER_OPTS: Opts = Opts {
+    flags: "p",
+    ..NO_OPTS
+};
+const HELP_ONLY_OPTS: Opts = Opts {
+    long_flags: &["help", "version"],
+    ..NO_OPTS
+};
+const TIME_OPTS: Opts = Opts {
+    flags: "p",
+    ..NO_OPTS
+};
+const COMMAND_OPTS: Opts = Opts {
+    flags: "pvV",
+    ..NO_OPTS
+};
+const EXEC_OPTS: Opts = Opts {
+    flags: "cl",
+    args: "a",
+    ..NO_OPTS
+};
+/// bash (and sh, dash, zsh, ksh, read with bash's table: an option bash does not have is
+/// unknown).
+const SHELL_OPTS: Opts = Opts {
+    flags: "abBcCDeEfhHiklmnpPrstTuvx",
+    args: "oO",
+    long_flags: &[
+        "debug",
+        "debugger",
+        "dump-po-strings",
+        "dump-strings",
+        "help",
+        "login",
+        "noediting",
+        "noprofile",
+        "norc",
+        "posix",
+        "pretty-print",
+        "restricted",
+        "verbose",
+        "version",
+    ],
+    long_args: &["init-file", "rcfile"],
+    plus: true,
+    ..NO_OPTS
+};
+const SOURCE_OPTS: Opts = Opts {
+    args: "p",
+    ..NO_OPTS
+};
+const SU_OPTS: Opts = Opts {
+    flags: "flmpPhV",
+    args: "cgGsw",
+    long_flags: &[
+        "login",
+        "preserve-environment",
+        "fast",
+        "pty",
+        "help",
+        "version",
+    ],
+    long_args: &[
+        "command",
+        "session-command",
+        "group",
+        "supp-group",
+        "shell",
+        "whitelist-environment",
+    ],
+    permute: true,
+    ..NO_OPTS
+};
+const RUNUSER_OPTS: Opts = Opts {
+    flags: "flmpPhV",
+    args: "cgGsuw",
+    long_flags: &[
+        "login",
+        "preserve-environment",
+        "fast",
+        "pty",
+        "help",
+        "version",
+    ],
+    long_args: &[
+        "command",
+        "session-command",
+        "group",
+        "supp-group",
+        "shell",
+        "user",
+        "whitelist-environment",
+    ],
+    permute: true,
+    ..NO_OPTS
+};
+const SCRIPT_OPTS: Opts = Opts {
+    flags: "aefqhV",
+    args: "cEBIOTmo",
+    optional: "t",
+    long_flags: &[
+        "append", "return", "flush", "force", "quiet", "help", "version",
+    ],
+    long_args: &[
+        "command",
+        "echo",
+        "log-io",
+        "log-in",
+        "log-out",
+        "log-timing",
+        "logging-format",
+        "output-limit",
+    ],
+    long_optional: &["timing"],
+    permute: true,
+    ..NO_OPTS
+};
+const FLOCK_OPTS: Opts = Opts {
+    flags: "sxenuoFhV",
+    args: "wEc",
+    long_flags: &[
+        "shared",
+        "exclusive",
+        "unlock",
+        "nonblock",
+        "nb",
+        "close",
+        "no-fork",
+        "verbose",
+        "help",
+        "version",
+    ],
+    long_args: &["wait", "timeout", "conflict-exit-code", "command"],
+    ..NO_OPTS
+};
+const WATCH_OPTS: Opts = Opts {
+    flags: "bcCegprtwxhv",
+    args: "nqs",
+    optional: "d",
+    long_flags: &[
+        "beep", "color", "no-color", "errexit", "chgexit", "precise", "no-rerun", "no-title",
+        "no-wrap", "exec", "help", "version",
+    ],
+    long_args: &["interval", "equexit", "shotsdir"],
+    long_optional: &["differences"],
+    ..NO_OPTS
+};
+const TRAP_OPTS: Opts = Opts {
+    flags: "lpP",
+    ..NO_OPTS
+};
+const ALIAS_OPTS: Opts = Opts {
+    flags: "p",
+    ..NO_OPTS
+};
+
+/// The options table of a wrapper that runs the rest of its words as a command.
+fn wrapper_opts(name: &str) -> Option<&'static Opts> {
+    Some(match name {
+        "sudo" => &SUDO_OPTS,
+        "doas" => &DOAS_OPTS,
+        "timeout" => &TIMEOUT_OPTS,
+        "nice" => &NICE_OPTS,
+        "ionice" => &IONICE_OPTS,
+        "xargs" => &XARGS_OPTS,
+        "stdbuf" => &STDBUF_OPTS,
+        "env" => &ENV_OPTS,
+        "chronic" => &CHRONIC_OPTS,
+        "setsid" => &SETSID_OPTS,
+        "unbuffer" => &UNBUFFER_OPTS,
+        "nohup" | "builtin" => &HELP_ONLY_OPTS,
+        "time" => &TIME_OPTS,
+        "command" => &COMMAND_OPTS,
+        "exec" => &EXEC_OPTS,
+        _ => return None,
+    })
 }
 
 /// A command with the prefixes in front of its program taken off.
@@ -1169,207 +1609,150 @@ struct Prefixed {
     xargs: bool,
     /// `xargs -I STR` / `-i` / `--replace`: STR in the command is replaced by stdin text.
     xargs_replace: Option<String>,
-    /// Not run at all (`command -v git`).
+    /// Not run at all (`command -v git`, `sudo -l`).
     not_run: bool,
-    /// A wrapper option this parser does not know: what runs cannot be told.
+    /// A wrapper option this parser does not know, or a missing command: what runs cannot
+    /// be told.
     unparsed: bool,
 }
 
 /// Drop shell keywords, env assignments, and wrapper commands (with their options)
 /// in front of the real program.
+#[allow(clippy::too_many_lines)] // one table of wrappers
 fn strip_prefixes(words: &[String]) -> Prefixed {
     let mut w: Vec<String> = words.to_vec();
     let mut p = Prefixed::default();
-    let mut i = 0;
-    while i < w.len() {
-        let t = w[i].clone();
-        if let Some((k, v)) = split_assignment(&t) {
+    loop {
+        while let Some((k, v)) = w.first().and_then(|t| split_assignment(t)) {
             p.assigns.push((k.to_string(), v.to_string()));
-            i += 1;
+            w.remove(0);
+        }
+        let Some(first) = w.first().cloned() else {
+            break;
+        };
+        if matches!(
+            first.as_str(),
+            "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "!" | "coproc"
+        ) {
+            w.remove(0);
             continue;
         }
-        match t.as_str() {
-            "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "!"
-            | "coproc" | "nohup" | "builtin" => {
-                i += 1;
-                continue;
-            }
-            "time" => {
-                i += 1;
-                while i < w.len() && w[i].starts_with('-') {
-                    i += 1;
-                    if w[i - 1] == "--" {
-                        break;
-                    }
+        let name = program_name(&first).to_string();
+        let Some(spec) = wrapper_opts(&name) else {
+            break;
+        };
+        let mut rest: Vec<String> = w[1..].to_vec();
+        // `nice -10 cmd` is `nice -n 10 cmd`.
+        if name == "nice"
+            && let Some(first) = rest.first()
+            && first.len() > 1
+            && first.starts_with('-')
+            && first[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            rest[0] = format!("-n{}", &first[1..]);
+        }
+        let Some(parsed) = parse_opts(spec, &rest) else {
+            p.unparsed = true;
+            return p;
+        };
+        let mut ops = parsed.operands.clone();
+        let help = parsed.has(&["help", "version"]);
+        let mut empty_ok = false;
+        match name.as_str() {
+            "sudo" => {
+                if parsed.has(&["e", "edit", "R", "chroot"]) {
+                    p.unparsed = true;
+                    return p;
                 }
-                continue;
-            }
-            "command" => {
-                i += 1;
-                while i < w.len() && w[i].starts_with('-') {
-                    if w[i].contains(['v', 'V']) {
+                if help || parsed.has(&["l", "list", "v", "validate", "K", "V"]) {
+                    p.not_run = true;
+                }
+                p.dirs.extend(parsed.values(&["D", "chdir"]));
+                if ops.is_empty() {
+                    if parsed.has(&["s", "shell", "i", "login"]) {
+                        ops = vec!["sh".into()]; // a shell reading stdin
+                    } else if parsed.has(&["k", "remove-timestamp", "K"]) {
                         p.not_run = true;
                     }
-                    i += 1;
                 }
-                continue;
             }
-            "exec" => {
-                i += 1;
-                while i < w.len() && w[i].starts_with('-') {
-                    i += if w[i] == "-a" { 2 } else { 1 };
+            "doas" => {
+                if parsed.has(&["C", "L"]) {
+                    p.not_run = true;
                 }
-                continue;
+                if ops.is_empty() && parsed.has(&["s"]) {
+                    ops = vec!["sh".into()];
+                }
+            }
+            "timeout" => {
+                if !help && !ops.is_empty() {
+                    ops.remove(0); // DURATION
+                }
+            }
+            "nice" | "time" | "command" | "exec" | "builtin" => {
+                empty_ok = true;
+                if name == "command" && parsed.has(&["v", "V"]) {
+                    p.not_run = true;
+                }
+            }
+            "ionice" => {
+                empty_ok = true;
+                if parsed.has(&["p", "P", "u", "pid", "pgid", "uid"]) {
+                    p.not_run = true;
+                }
+            }
+            "xargs" => {
+                p.xargs = true;
+                let replace = parsed
+                    .opts
+                    .iter()
+                    .rfind(|(n, _)| matches!(n.as_str(), "I" | "i" | "replace"));
+                if let Some((_, v)) = replace {
+                    p.xargs_replace = Some(v.clone().unwrap_or_else(|| "{}".into()));
+                }
+            }
+            "env" => {
+                empty_ok = true; // prints the environment
+                while ops.first().is_some_and(|o| o == "-") {
+                    ops.remove(0); // `env -` is `env -i`
+                }
+                p.unsets.extend(parsed.values(&["u", "unset"]));
+                p.dirs.extend(parsed.values(&["C", "chdir"]));
+                let mut split = Vec::new();
+                for s in parsed.values(&["S", "split-string"]) {
+                    match env_split(&s) {
+                        // A split string that starts with an option is parsed by env again.
+                        Some(words) if !words.first().is_some_and(|f| f.starts_with('-')) => {
+                            split.extend(words);
+                        }
+                        _ => {
+                            p.unparsed = true;
+                            return p;
+                        }
+                    }
+                }
+                split.extend(ops);
+                ops = split;
             }
             _ => {}
         }
-        let name = program_name(&t).to_string();
-        if !matches!(
-            name.as_str(),
-            "sudo"
-                | "doas"
-                | "timeout"
-                | "nice"
-                | "ionice"
-                | "xargs"
-                | "stdbuf"
-                | "env"
-                | "chronic"
-                | "setsid"
-                | "unbuffer"
-        ) {
-            break;
+        if help {
+            p.not_run = true;
         }
-        p.xargs |= name == "xargs";
-        let arg_opts = wrapper_arg_opts(&name);
-        i += 1;
-        if name == "env" {
-            i = env_options(&mut w, i, &mut p);
-            continue;
+        if p.not_run {
+            return p;
         }
-        while i < w.len() && w[i].starts_with('-') {
-            let opt = w[i].clone();
-            i += 1;
-            if opt == "--" {
-                break;
+        if ops.is_empty() {
+            if !empty_ok {
+                p.unparsed = true;
             }
-            let value = |i: &mut usize| {
-                let v = w.get(*i).cloned();
-                *i += 1;
-                v
-            };
-            match (name.as_str(), opt.as_str()) {
-                ("xargs", "-I") => p.xargs_replace = value(&mut i),
-                ("xargs", "-i" | "--replace") => p.xargs_replace = Some("{}".into()),
-                ("xargs", o) if o.starts_with("--replace=") => {
-                    p.xargs_replace = Some(o["--replace=".len()..].to_string());
-                }
-                ("xargs", o) if o.starts_with("-I") || o.starts_with("-i") => {
-                    p.xargs_replace = Some(o[2..].to_string());
-                }
-                ("sudo", "-D" | "--chdir") => p.dirs.extend(value(&mut i)),
-                ("sudo", o) if o.starts_with("--chdir=") => {
-                    p.dirs.push(o["--chdir=".len()..].to_string());
-                }
-                _ if arg_opts.contains(&opt.as_str()) => i += 1,
-                _ => {}
-            }
+            p.words = ops;
+            return p;
         }
-        // timeout DURATION
-        if name == "timeout" && i < w.len() {
-            i += 1;
-        }
+        w = ops;
     }
-    p.words = w.split_off(i.min(w.len()));
+    p.words = w;
     p
-}
-
-/// Parse `env`'s options from `w[i]` on (GNU coreutils `env`); returns the index after them.
-/// `-S STRING` splits STRING into words in place. An unknown option sets `unparsed`.
-fn env_options(w: &mut Vec<String>, mut i: usize, p: &mut Prefixed) -> usize {
-    while i < w.len() && w[i].starts_with('-') {
-        let opt = w[i].clone();
-        i += 1;
-        if opt == "--" {
-            break;
-        }
-        if opt == "-" {
-            continue; // same as -i
-        }
-        // (option, value) for the options that take one
-        let mut take: Option<(char, String)> = None;
-        if let Some(long) = opt.strip_prefix("--") {
-            let (k, v) = match long.split_once('=') {
-                Some((k, v)) => (k, Some(v.to_string())),
-                None => (long, None),
-            };
-            let short = match k {
-                "ignore-environment"
-                | "null"
-                | "debug"
-                | "block-signal"
-                | "default-signal"
-                | "ignore-signal"
-                | "list-signal-handling" => continue,
-                "help" | "version" => {
-                    p.not_run = true;
-                    continue;
-                }
-                "unset" => 'u',
-                "chdir" => 'C',
-                "split-string" => 'S',
-                _ => {
-                    p.unparsed = true;
-                    return i;
-                }
-            };
-            let v = match v {
-                Some(v) => v,
-                None => {
-                    i += 1;
-                    w.get(i - 1).cloned().unwrap_or_default()
-                }
-            };
-            take = Some((short, v));
-        } else {
-            let chars: Vec<char> = opt[1..].chars().collect();
-            for (k, c) in chars.iter().enumerate() {
-                match c {
-                    'i' | '0' | 'v' => {}
-                    'u' | 'C' | 'S' => {
-                        let rest: String = chars[k + 1..].iter().collect();
-                        let v = if rest.is_empty() {
-                            i += 1;
-                            w.get(i - 1).cloned().unwrap_or_default()
-                        } else {
-                            rest
-                        };
-                        take = Some((*c, v));
-                        break;
-                    }
-                    _ => {
-                        p.unparsed = true;
-                        return i;
-                    }
-                }
-            }
-        }
-        match take {
-            Some(('u', v)) => p.unsets.push(v),
-            Some(('C', v)) => p.dirs.push(v),
-            Some((_, v)) => match env_split(&v) {
-                Some(split) => {
-                    w.splice(i..i, split);
-                }
-                None => {
-                    p.unparsed = true;
-                    return i;
-                }
-            },
-            None => {}
-        }
-    }
-    i
 }
 
 /// Split an `env -S` string into words the way GNU env does, for the part of its rules
@@ -2600,5 +2983,154 @@ mod tests {
         ] {
             assert!(seen_commit(c) || opaque_call(c), "{c}: {:?}", git_calls(c));
         }
+    }
+
+    #[test]
+    fn xargs_options_are_read_from_a_table() {
+        for c in [
+            "echo x | xargs -0I{} {} commit",
+            "echo x | xargs -tI {} {} commit",
+            "echo x | xargs -0i git {} -m x",
+            "echo x | xargs -iZ Z commit",
+            "echo x | xargs --replace=Z Z commit",
+            "echo x | xargs --bogus git status",
+            "echo x | xargs -q git status",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(!opaque_call("ls | xargs -0 -n 1 grep x"));
+        assert!(!opaque_call("ls | xargs -I{} git log -1 -- {}"));
+    }
+
+    #[test]
+    fn missing_commands_are_opaque() {
+        for c in [
+            // Under xargs the command comes from stdin.
+            "echo git commit | xargs",
+            "echo git commit | xargs sudo",
+            "echo git commit | xargs env",
+            "echo git commit | xargs timeout 5",
+            "echo git commit | xargs flock /tmp/l",
+            "echo git commit | xargs watch",
+            "echo git commit | xargs nohup",
+            "echo x | xargs su -c",
+            // A runner with no command at all.
+            "flock /tmp/l",
+            "watch -n 1",
+            "sudo -u me",
+            "timeout 5",
+            "setsid",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        for c in [
+            "command -v git",
+            "sudo -l git",
+            "env",
+            "nice",
+            "flock 9",
+            "trap -p",
+        ] {
+            assert!(git_calls(c).is_empty(), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn wrapper_options_are_read_from_tables() {
+        for c in [
+            "bash -c -e 'git commit -m x'",
+            "bash -ec 'git commit -m x'",
+            "bash +e -c 'git commit -m x'",
+            "sh -o errexit -c 'git commit -m x'",
+            "sudo -u me -- git commit -m x",
+            "sudo -iu me git commit -m x",
+            "nice -10 git commit -m x",
+            "nice -n 5 git commit -m x",
+            "timeout -k 5 -s KILL 30 git commit -m x",
+            "timeout --signal=KILL 30 git commit -m x",
+            "stdbuf -oL git commit -m x",
+            "ionice -c 3 git commit -m x",
+            "time -p git commit -m x",
+            "exec -a x git commit -m x",
+            "echo 'git commit -m x' | sudo -s",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+        for c in [
+            "bash --bogus -c 'git commit'",
+            "bash -c",
+            "sudo -h host git status",
+            "sudo --bogus git status",
+            "timeout --bogus 5 git status",
+            "nice --bogus git status",
+            "stdbuf -q git status",
+            "time -v git status",
+            "sudo -e f",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn su_runuser_and_script_commands() {
+        for c in [
+            "su -c'git commit -m x' me",
+            "su me -c 'git commit -m x'",
+            "su -lc 'git commit -m x' me",
+            "su --session-command='git commit -m x' me",
+            "su --session-command 'git commit -m x' me",
+            "runuser -u me git commit -m x",
+            "runuser -u me -- git commit -m x",
+            "runuser -l me -c 'git commit -m x'",
+            "script -c'git commit -m x' /dev/null",
+            "script -qec 'git commit -m x' /dev/null",
+            "echo 'git commit -m x' | script -q /dev/null",
+            "echo 'git commit -m x' | su me",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+        for c in [
+            "su --bogus me",
+            "su me script.sh",
+            "runuser -u me",
+            "script --bogus",
+            "curl x | su me",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn printf_prints_its_format() {
+        for c in [
+            "printf -- 'git commit -m x' | bash",
+            "printf 'git commit -m x' extra words | bash",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(opaque_call("printf -x 'git commit' | bash"));
+        assert!(git_calls("printf -v v 'git commit' | bash").is_empty());
+    }
+
+    #[test]
+    fn brace_expansion_in_any_group() {
+        for c in ["x{y}{git,z} commit", "git co{m}{mit,}", "{a}{b..c} commit"] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn alias_changes_the_parser_cannot_follow() {
+        for c in [
+            "BASH_ALIASES[g]=git; g commit -m x",
+            "BASH_ALIASES+=([g]=git); g commit -m x",
+            "declare -A BASH_ALIASES=([g]=git); g commit -m x",
+            "alias -x g=git; g commit -m x",
+            "alias 'g/x=git'; g commit -m x",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(seen_commit("alias g=git; g commit -m x"));
+        assert!(!opaque_call("alias -p; git status"));
     }
 }
