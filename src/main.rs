@@ -442,24 +442,65 @@ fn pre_commit_within_deadline(input: hook::Input) -> Result<Outcome, wikiknit::E
         .ok()
         .and_then(|v| v.parse().ok())
         .map_or(HOOK_DEADLINE, std::time::Duration::from_millis);
-    // From the command text alone, so it is known even if the check hangs.
-    let may_commit = hook::may_commit(&input);
+    enum Msg {
+        /// From the command text alone: could it commit?
+        MayCommit(bool),
+        Done(Result<Outcome, wikiknit::Error>),
+        /// The check panicked.
+        Crashed,
+    }
+    let start = std::time::Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(hook::run(hook::Event::PreCommit, &input));
-    });
-    match rx.recv_timeout(deadline) {
-        Ok(result) => result,
-        Err(_) if may_commit => Ok(Outcome::Block(format!(
-            "Commit held by wikiknit: checking the vault ran out of time ({} ms), so this \
-             commit was not checked. Retry; if it keeps timing out, run `wikiknit changed` to \
-             see why.",
-            deadline.as_millis()
-        ))),
-        Err(_) => Err(wikiknit::Error::Usage(format!(
-            "pre-commit check timed out after {} ms",
-            deadline.as_millis()
-        ))),
+    // Everything, the parse included, runs under the deadline, with room for deep input; a
+    // panic is reported, not lost.
+    let worker = std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = tx.send(Msg::MayCommit(hook::may_commit(&input)));
+                hook::run(hook::Event::PreCommit, &input)
+            }));
+            let _ = tx.send(match run {
+                Ok(result) => Msg::Done(result),
+                Err(_) => Msg::Crashed,
+            });
+        });
+    let hold = |why: String| Ok(Outcome::Block(format!("Commit held by wikiknit: {why}")));
+    if worker.is_err() {
+        return hold("it could not start its check, so this commit was not checked.".into());
+    }
+    // `None`: not known yet (the parse itself has not finished), so a commit is assumed.
+    let mut may_commit: Option<bool> = None;
+    loop {
+        let left = deadline.saturating_sub(start.elapsed());
+        match rx.recv_timeout(left) {
+            Ok(Msg::MayCommit(m)) => may_commit = Some(m),
+            Ok(Msg::Done(result)) => return result,
+            Ok(Msg::Crashed) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if may_commit == Some(false) {
+                    return Err(wikiknit::Error::Usage("pre-commit check failed".into()));
+                }
+                return hold(
+                    "its check of this command failed, so the commit was not checked. Split \
+                     the command into simpler ones and retry."
+                        .into(),
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if may_commit == Some(false) {
+                    return Err(wikiknit::Error::Usage(format!(
+                        "pre-commit check timed out after {} ms",
+                        deadline.as_millis()
+                    )));
+                }
+                return hold(format!(
+                    "checking this command ran out of time ({} ms), so the commit was not \
+                     checked. Retry; if it keeps timing out, run `wikiknit changed` to see why, \
+                     or split the command into simpler ones.",
+                    deadline.as_millis()
+                ));
+            }
+        }
     }
 }
 
@@ -1135,7 +1176,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else if !paths.is_empty() {
                 (Store::open(&vault.config.vault)?, ids_for(&vault, paths)?)
             } else {
-                let (store, _, changed) = session_changed(&vault, session.as_deref())?;
+                // A mistyped id must not start a new session that takes every pending note.
+                let store = Store::open(&vault.config.vault)?;
+                let id = store.resolve_session(session.as_deref())?;
+                if store.load_session(&id)?.is_none() {
+                    let known = store.sessions();
+                    bail!(
+                        "no session `{id}` for this vault (known: {}); pass a known --session, \
+                         or --all to mark every pending note",
+                        if known.is_empty() {
+                            "none".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    );
+                }
+                let (store, _, changed) = session_changed(&vault, Some(&id))?;
                 (store, changed)
             };
             let marked: Vec<String> = store.mark(&ids, &now)?.into_iter().collect();

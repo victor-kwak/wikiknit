@@ -150,7 +150,7 @@ impl Target {
             git_dir: call.git_dir.as_deref().map(|g| expand_dir(&dir, g)),
             work_tree: call.work_tree.as_deref().map(|w| expand_dir(&dir, w)),
             dir,
-            opaque: call.opaque,
+            opaque: call.opaque || call.dir_unknown,
         }
     }
 
@@ -236,10 +236,22 @@ fn gate(
     analysis: &shell::Analysis,
     kinds: Vec<(Target, Kind)>,
 ) -> Result<Outcome, Error> {
+    // A write can reach a commit only if it may run before the last one: earlier in the
+    // command, or anywhere when either may run at another time (loop, background job,
+    // pipeline, heredoc fed to a shell).
+    let last_commit = analysis
+        .calls
+        .iter()
+        .zip(&kinds)
+        .filter(|(_, (_, kind))| kind.commit)
+        .map(|(call, _)| if call.unordered { usize::MAX } else { call.seq })
+        .max()
+        .unwrap_or(0);
+    let before_last = |seq: usize, unordered: bool| unordered || seq < last_commit;
     let mut commits = Vec::new();
     let mut writers = Vec::new();
     for ((target, kind), call) in kinds.into_iter().zip(&analysis.calls) {
-        if kind.writes {
+        if kind.writes && before_last(call.seq, call.unordered) {
             writers.push((call.subcommand.clone(), target.repo()));
         }
         if kind.commit {
@@ -247,6 +259,18 @@ fn gate(
             commits.push(Commit { target, repo });
         }
     }
+    let writes: Vec<&shell::Write> = analysis
+        .writes
+        .iter()
+        .filter(|w| before_last(w.seq, w.unordered))
+        .collect();
+    // A commit whose repository cannot be told is checked against every vault found.
+    let unknown_repo = if commits.iter().any(|c| c.repo.is_none()) {
+        "wikiknit cannot tell which repository this commit runs in (a `cd` or a command it \
+         cannot follow), so it checks the commit against every vault it found. "
+    } else {
+        ""
+    };
     // Configs from where each commit runs, and from the session's folders.
     let mut starts: Vec<PathBuf> = commits
         .iter()
@@ -272,10 +296,13 @@ fn gate(
                 continue;
             }
         };
-        // A vault outside git cannot be committed.
+        // A vault outside git, or one git ignores, cannot be committed.
         let Some(vault_repo) = repo_of_dir(&config.vault) else {
             continue;
         };
+        if state::git_ignores_dir(&config.vault) {
+            continue;
+        }
         let same_repo =
             |repo: &Option<Repo>| repo.as_ref().is_none_or(|r| r.common == vault_repo.common);
         // The copies of this vault the commits can take: the vault itself, or the same
@@ -326,18 +353,24 @@ fn gate(
             }
             let what = git_write
                 .clone()
-                .or_else(|| vault_write(analysis, base, &copy));
+                .or_else(|| vault_write(&writes, base, &copy));
             if let Some(what) = what {
                 return Ok(Outcome::Block(format!(
-                    "Commit held by wikiknit: this command commits in the repository of the \
-                     vault {} and may also change files in the vault (`{what}`). wikiknit reads \
-                     the vault before a command runs, so it cannot check notes this command \
-                     writes. Run the command that writes as one command and the commit as a \
-                     separate command; the commit is then checked against the notes as they \
-                     are.",
+                    "Commit held by wikiknit: {unknown_repo}this command commits in the \
+                     repository of the vault {} and may also change files in the vault \
+                     (`{what}`). wikiknit reads the vault before a command runs, so it cannot \
+                     check notes this command writes. Run the command that writes as one \
+                     command and the commit as a separate command; the commit is then checked \
+                     against the notes as they are.",
                     copy.display()
                 )));
             }
+            // Another worktree's copy: `wikiknit` run elsewhere would pick the main vault.
+            let vault_flag = if copy == config.vault {
+                String::new()
+            } else {
+                format!("--vault {} ", copy.display())
+            };
             let mut config = config.clone();
             config.vault = copy;
             let vault = Vault::load(config)?;
@@ -349,8 +382,8 @@ fn gate(
             let changed = store.changed(&s, &now)?;
             if !changed.is_empty() {
                 return Ok(Outcome::Block(format!(
-                    "Commit held by wikiknit. {}",
-                    describe(&vault, &changed, session)
+                    "Commit held by wikiknit. {unknown_repo}{}",
+                    describe(&vault, &changed, session, &vault_flag)
                 )));
             }
         }
@@ -376,8 +409,8 @@ fn broken_config_matters(path: &Path, commits: &[Commit]) -> bool {
 }
 
 /// The first non-git write that may land in `vault` (or cannot be placed).
-fn vault_write(analysis: &shell::Analysis, base: &Path, vault: &Path) -> Option<String> {
-    analysis.writes.iter().find_map(|w| match &w.target {
+fn vault_write(writes: &[&shell::Write], base: &Path, vault: &Path) -> Option<String> {
+    writes.iter().find_map(|w| match &w.target {
         shell::WriteTarget::Unknown => Some(w.what.clone()),
         shell::WriteTarget::Paths { dirs, paths } => {
             let dir = dirs
@@ -443,7 +476,7 @@ fn stop(config: Config, session: &str) -> Result<Outcome, Error> {
             s.last_stop_digest = Some(format!("nudged:{d}"));
             Outcome::Block(format!(
                 "wikiknit: these vault notes have not changed for a full turn. {}",
-                describe(&vault, &changed, session)
+                describe(&vault, &changed, session, "")
             ))
         }
         (Some(d), Some(last)) if last.strip_prefix("nudged:") == Some(d.as_str()) => Outcome::Allow,
@@ -559,8 +592,9 @@ fn commit_like(sub: &str, args: &[String]) -> bool {
 fn changes_worktree(sub: &str, args: &[String]) -> bool {
     let has = |o: &str| args.iter().any(|a| a == o);
     match sub {
-        "checkout" | "switch" | "merge" | "pull" | "rebase" | "cherry-pick" | "revert" | "am"
-        | "mv" | "checkout-index" | "sparse-checkout" | "bisect" | "filter-branch" => true,
+        "checkout" | "switch" => !new_branch_in_place(sub, args),
+        "merge" | "pull" | "rebase" | "cherry-pick" | "revert" | "am" | "mv" | "checkout-index"
+        | "sparse-checkout" | "bisect" | "filter-branch" => true,
         "restore" => !(has("--staged") || has("-S")) || has("--worktree") || has("-W"),
         "reset" => has("--hard") || has("--merge") || has("--keep"),
         "stash" => !matches!(args.first().map(String::as_str), Some("list" | "show")),
@@ -573,6 +607,36 @@ fn changes_worktree(sub: &str, args: &[String]) -> bool {
         "submodule" => args.first().is_some_and(|a| a == "update"),
         _ => false,
     }
+}
+
+/// `git checkout -b NAME`, `git switch -c NAME`, `--orphan NAME` (also `-B`/`-C`) with no
+/// start point and no pathspec: a new branch at `HEAD`, the work tree and index kept.
+fn new_branch_in_place(sub: &str, args: &[String]) -> bool {
+    let creates: &[&str] = if sub == "checkout" {
+        &["-b", "-B", "--orphan"]
+    } else {
+        &["-c", "-C", "--create", "--force-create", "--orphan"]
+    };
+    let mut created = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let a = a.as_str();
+        if creates.contains(&a) {
+            if it.next().is_none() {
+                return false;
+            }
+            created = true;
+        } else if creates
+            .iter()
+            .any(|c| c.starts_with("--") && a.starts_with(&format!("{c}=")))
+        {
+            created = true;
+        } else if !matches!(a, "-q" | "--quiet" | "-t" | "--track" | "--no-track") {
+            // Another option, a start point, or a pathspec.
+            return false;
+        }
+    }
+    created
 }
 
 /// What `git <sub> <args>` may do, resolving aliases (from `-c alias.*` or git config) and
@@ -786,7 +850,9 @@ fn expand_dir(base: &Path, d: &str) -> PathBuf {
     base.join(d)
 }
 
-fn describe(vault: &Vault, changed: &BTreeSet<String>, session: &str) -> String {
+/// The hold message for `changed`; `vault_flag` (`--vault DIR `, or empty) goes into the
+/// commands it names, for a vault the agent's own `wikiknit` would not find.
+fn describe(vault: &Vault, changed: &BTreeSet<String>, session: &str, vault_flag: &str) -> String {
     use std::fmt::Write as _;
     let mut msg = format!(
         "{} vault note(s) changed in this session and have had no link pass:\n",
@@ -805,15 +871,16 @@ fn describe(vault: &Vault, changed: &BTreeSet<String>, session: &str) -> String 
     if errors > 0 {
         let _ = writeln!(
             msg,
-            "`wikiknit check --changed --session {session}` reports {errors} rule error(s) in them."
+            "`wikiknit {vault_flag}check --changed --session {session}` reports {errors} rule \
+             error(s) in them."
         );
     }
     let _ = write!(
         msg,
         "Some may have been changed by another session or editor; any session can do their \
          link pass. The wikiknit `link` skill handles this: it links these notes to related \
-         notes in both directions, then records the pass with `wikiknit mark --session \
-         {session}` (run it as its own command, before the commit)."
+         notes in both directions, then records the pass with `wikiknit {vault_flag}mark \
+         --session {session}` (run it as its own command, before the commit)."
     );
     msg
 }
