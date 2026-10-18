@@ -5,7 +5,10 @@
 //!
 //! - `linked.json` (one per vault): each note's content hash at its last link pass. A note
 //!   whose content differs is *pending*. A pass in any session counts for every session.
-//!   On first use it is a snapshot of the vault (everything starts as linked).
+//!   When it is missing (first use, lost state, a new `XDG_STATE_HOME`), a vault in git
+//!   starts from git: notes that differ from `HEAD` (or are not committed) are pending, the
+//!   rest count as linked. A vault outside git starts from the oldest live session's start,
+//!   else from the vault as it is.
 //! - `sessions/<id>.json` (one per agent session): content hashes when the session started,
 //!   so a session can tell which pending notes changed while it ran.
 
@@ -149,6 +152,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
+    vault: PathBuf,
 }
 
 impl Store {
@@ -162,6 +166,7 @@ impl Store {
         let hash = blake3::hash(vault_root.to_string_lossy().as_bytes()).to_hex();
         Self {
             dir: state_root.join(&hash.as_str()[..16]),
+            vault: vault_root.to_path_buf(),
         }
     }
 
@@ -198,12 +203,33 @@ impl Store {
     }
 
     /// Hashes at each note's last link pass (caller holds the lock). A missing or corrupt
-    /// record is rebuilt: notes take their content at the start of the oldest live session,
-    /// so changes made since then stay pending (fail closed). With no sessions (first use),
-    /// the vault as it is now counts as linked.
+    /// record is rebuilt so that changed notes stay pending (fail closed): in git, every note
+    /// that differs from `HEAD` is pending (a commit already passed the gate, uncommitted
+    /// work may not have); outside git, notes take their content at the start of the oldest
+    /// live session, and with no sessions the vault as it is now counts as linked.
     fn linked_locked(&self, now: &Hashes) -> Result<Hashes, Error> {
         if let Some(l) = read_json::<Linked>(&self.linked_path())? {
             return Ok(l.hashes);
+        }
+        if let Some(uncommitted) = uncommitted_notes(&self.vault) {
+            let hashes: Hashes = now
+                .iter()
+                .map(|(id, h)| {
+                    let linked = if uncommitted.contains(id) {
+                        String::new()
+                    } else {
+                        h.clone()
+                    };
+                    (id.clone(), linked)
+                })
+                .collect();
+            write_json(
+                &self.linked_path(),
+                &Linked {
+                    hashes: hashes.clone(),
+                },
+            )?;
+            return Ok(hashes);
         }
         let mut sessions: Vec<Session> = std::fs::read_dir(self.sessions_dir())
             .ok()
@@ -379,6 +405,71 @@ impl Store {
             ))),
         }
     }
+}
+
+/// Ids of the notes in `vault` that differ from git `HEAD`: changed, staged, or not committed
+/// (all notes when there is no commit yet). `None` when the vault is not in a git work tree
+/// or git fails.
+fn uncommitted_notes(vault: &Path) -> Option<BTreeSet<String>> {
+    let git = |args: &[&str]| -> Option<Vec<u8>> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(vault)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    let inside = git(&["rev-parse", "--is-inside-work-tree"])?;
+    if inside.trim_ascii() != b"true" {
+        return None;
+    }
+    let mut lists = Vec::new();
+    if git(&["rev-parse", "--verify", "-q", "HEAD"]).is_some() {
+        lists.push(git(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-renames",
+            "--relative",
+            "HEAD",
+            "--",
+            ".",
+        ])?);
+        lists.push(git(&[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+        ])?);
+    } else {
+        lists.push(git(&[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+        ])?);
+    }
+    Some(
+        lists
+            .iter()
+            .flat_map(|l| l.split(|b| *b == 0))
+            .filter_map(|p| {
+                let p = String::from_utf8_lossy(p);
+                let n = p.len();
+                (n > 3 && p.is_char_boundary(n - 3) && p[n - 3..].eq_ignore_ascii_case(".md"))
+                    .then(|| p[..n - 3].to_string())
+            })
+            .collect(),
+    )
 }
 
 /// Digest of a set of notes and their current content.
