@@ -25,6 +25,10 @@ The pack lists the best notes first. Each `<note>` entry has:
 
 `<omitted>` lists ranked notes that did not fit.
 
+`weak=true` in the header (and a note on stderr) means no note matched the question by meaning or by most of its words: the vault probably does not cover it. Say so rather than build on the pack; try other words, or `wikiknit catalog` to see what the vault holds.
+
+To read one known note with its neighbors, focused on a topic: `wikiknit context <note> --query "<topic>"`.
+
 Narrow the seeds with the same filters as `search` (`--type project`, `--path Systems/`, `--where status=active`, `--tag x`). Use `--depth 2` for a wider neighborhood. Raise `--budget` when the task needs detail; lower it for a quick check.
 
 ## 2. Read further only where needed

@@ -211,7 +211,7 @@ fn json_keys_follow_the_text_header_order() {
         .unwrap();
     let first = String::from_utf8(header.stdout).unwrap();
     assert!(
-        first.starts_with("# id\tscore\ttype\tsimilarity\tmatched\tline\tsnippet\n"),
+        first.starts_with("# id\tscore\ttype\tsimilarity\tmatched\tcoverage\tline\tsnippet\n"),
         "{first}"
     );
 }

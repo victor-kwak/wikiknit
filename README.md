@@ -25,8 +25,8 @@ Context for AI agents working on a Markdown vault (Obsidian, and anything else t
 
 It reads the Markdown files directly: Obsidian does not need to be running, and wikiknit never edits
 notes (agents do; wikiknit tells them what and where). It is fast enough for hooks: on a 5,000-note
-vault, lexical `search` takes about 0.1 s and `check` 0.06 s (16 cores); hybrid search adds about
-0.15 s to load the model.
+vault (20 MB of text, 16 cores), `check` and lexical `search` take 0.1-0.2 s; hybrid search adds
+about 0.15 s to load the model.
 
 ## Install
 
@@ -78,7 +78,7 @@ field are `;`-separated.
 `--format json` prints one compact object instead:
 
 ```json
-{"schema_version":1,"command":"search","mode":"hybrid","items":[{"id":"...","score":3.23,"type":"reference","similarity":0.712,"matched":["body","semantic"],"line":18,"snippet":"..."}]}
+{"schema_version":1,"command":"search","mode":"hybrid","items":[{"id":"...","score":3.23,"type":"reference","similarity":0.712,"matched":["body","semantic"],"coverage":0.67,"line":18,"snippet":"..."}]}
 ```
 
 `schema_version` changes only when a record's fields change incompatibly.
@@ -188,18 +188,34 @@ unless `--include-hubs`. Each hit shows the fields it matched and its best line.
 `wikiknit embed` splits each note into chunks (by section, then paragraph, about 175 tokens each,
 each prefixed with the note title and heading path) and embeds them with a local model. The index
 lives in the state directory, keyed by note content hash: later runs embed only changed notes, and
-`search` itself refreshes up to 64 changed chunks before answering (about a second). `search` then fuses
-the BM25 ranking and the meaning ranking (each note scored by its best chunk) with reciprocal rank
-fusion; an exact name or alias match still comes first, and quoted phrases still must match. A note
-counts as a semantic match only if its similarity clears `min_similarity` and stands `semantic_margin`
-above the median note for that query (in vaults of 10 or more notes): a real match stands out from the
-rest, so a query about nothing in the vault returns nothing. Hits found by meaning show `semantic` in
-`matched`, their cosine in `similarity`, and point at their chunk's line. The index is used only when it
-covers at least 90% of the notes (otherwise `search` says to run `embed`). Concurrent `embed` and
-`search` runs merge their work under a lock. Without an index (or without the
-`semantic` feature) `search` is lexical and says so on stderr. `--mode lexical|semantic|hybrid`
-chooses explicitly. `embedding_model` picks the model (any fastembed text model, e.g.
-`MultilingualE5Small` for many languages).
+`search` itself embeds up to 64 changed or new chunks before answering (a few seconds at most), so a
+few new notes do not need `embed`.
+
+`search` then fuses the BM25 ranking and the meaning ranking (each note scored by its best chunk)
+with reciprocal rank fusion; an exact name or alias match still comes first, and quoted phrases still
+must match. A note can enter the results by meaning alone only if its similarity clears
+`min_similarity` and stands `semantic_margin` above the median note for that query (in vaults of 10
+or more notes): a real match stands out from the rest. Below that floor, meaning still reorders the
+notes the words found, but adds none. A query none of whose words occur in the vault (`zzzqqq`, a
+typo) must clear one more `semantic_margin`, since its embedding lands near some note by chance.
+
+So a question about something the vault does not cover gets no matches by meaning, but BM25 can still
+return notes that share one word with it. Each hit's `coverage` (0-1) says how much of the query
+(weighted by term rarity) its words match: a hit on one common word of a long query covers little.
+`context` uses it to drop weak seeds and to flag a weak pack.
+
+Hits found by meaning show `semantic` in `matched`, their cosine in `similarity`, and point at their
+chunk's line. The index is used only when it covers at least 90% of the notes (otherwise `search`
+says to run `embed`). Concurrent `embed` and `search` runs merge their work under a lock. Without an
+index (or without the `semantic` feature) `search` is lexical and says so on stderr. `--mode
+lexical|semantic|hybrid` chooses explicitly. `embedding_model` picks the model (any fastembed text
+model, e.g. `MultilingualE5Small` for many languages).
+
+Tuning (2026-10, 58 labeled queries on a 70-note vault, 26 on a 59-note docs vault, a quarter held
+out): hybrid nDCG@10 0.94 against 0.88 lexical and 0.76 semantic; on the docs vault 0.92 / 0.87 /
+0.76. `RRF_K`, semantic depth, chunk size, title weight, and other note scores (mean of chunks,
+top two) changed nothing or did worse; letting meaning below the floor reorder lexical hits gained on
+both vaults.
 
 ### Suggest
 
@@ -225,25 +241,36 @@ suggestions are right and makes them.
 
 ### Context
 
-`context <note>` or `context --query "..."` builds what an agent should read first, within
+`context <note>`, `context --query "..."`, or both builds what an agent should read first, within
 `--budget` tokens (default 4000, at least 200). Tokens are estimated: four ASCII characters per token,
 one per Chinese, Japanese, Korean, or Thai character, two per other character (accented Latin,
-Cyrillic, emoji). The estimate errs high, so a pack stays inside a real model budget.
+Cyrillic, emoji). The estimate errs high. `used` counts the output as printed (tags, reasons, and the
+list of notes left out included), so a pack stays inside a real model budget. The budget is a cap,
+not a target: a pack with little that is relevant stays small.
 
-- Seeds: the note, or the top `--seeds` search hits (default 5; hybrid search, with the same filters as
-  `search`; filters apply only to `--query`).
+- Seeds: the note, or for `--query` up to `--seeds` search hits (default 5; hybrid search, with the
+  same filters as `search`). A hit becomes a seed when it matches by meaning or covers at least 60%
+  of the query, and scores at least half of the best such hit. When no hit does, the best hit alone
+  is the seed and the pack is marked weak (`weak=true`, and a note on stderr): the vault may not
+  cover the question. With a note and `--query`, the note is the seed and its excerpt focuses on the
+  query.
 - Then the notes the seeds link (weight 0.6), link the seeds (0.5), or both (0.75), more for repeated
-  links, halved per hop (`--depth`, default 1). A note linked to several seeds ranks higher. Hub notes
-  are left out; logs (`no_backlink_from`) count less.
-- The budget fills in rank order. Seeds share it evenly (what one does not use goes to the next), so
-  one long note cannot crowd out the other hits; up to 15% is kept for summaries of the rest. A note
-  that fits goes in whole; a seed that does not gets an excerpt (small frontmatter, the title, and the
-  section holding the matching line, extended down and then up while it fits; a matching line too long
-  to fit is cut to the part around the match); others get their one-line summary; the rest are listed
-  as omitted.
+  links, halved per hop (`--depth`, default 1). A note linked to several seeds ranks higher; its
+  reason names the strongest link. Hub notes are left out; logs (`no_backlink_from`) count less.
+- Seeds fill the budget first, best first. Each may use what is left after every later seed is kept
+  300 tokens (or its whole text, when shorter), and after up to 15% kept for summaries of linked notes.
+  A seed that fits goes in whole; one that does not gets an excerpt: small frontmatter, the lead
+  section (the title and the text before the next heading), then the sections that match the query,
+  best first, in note order. A matching section too long to fit gives its heading and its matching
+  lines; a matching line too long to fit is cut to the part around the match.
+- A linked note goes in whole only when closely linked (score 0.7 or more: linked both ways, or
+  repeatedly, from a strong seed) and it fits; others get their one-line summary.
+- In a weak pack, seeds show only their matching sections and linked notes only their summaries.
+- Notes that do not fit are listed in `<omitted>` (at most 20 named, then a count).
 
 Each entry has `role` (`seed` or `linked`), `content` (`full`, `excerpt`, `summary`), the file `lines`
-included, its `tokens`, and `why` (the search match, or the link and the line it is written on).
+included, its `tokens` (as printed), and `why` (the search match and its coverage, or the link and the
+line it is written on).
 
 ### Aliases
 

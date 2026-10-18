@@ -129,9 +129,12 @@ fn tight_budget_excerpts_the_seed_and_omits_the_rest() {
     assert_eq!(big["id"], "big");
     assert_eq!(big["content"], "excerpt");
     let text = big["text"].as_str().unwrap();
-    // The matching section, with the title kept.
-    assert!(text.starts_with("# big\n...\n"), "{text}");
-    assert!(text.contains("## Kubernetes rollout"), "{text}");
+    // The lead (title, start of the intro), then the matching section.
+    assert!(text.starts_with("# big\n\n## Intro\n"), "{text}");
+    assert!(
+        text.contains("...\n## Kubernetes rollout\nThe kubernetes rollout steps."),
+        "{text}"
+    );
     assert!(
         big["why"][0]
             .as_str()
@@ -198,7 +201,14 @@ fn budgets_are_never_exceeded() {
                 .iter()
                 .map(|e| e["tokens"].as_u64().unwrap())
                 .sum();
-            assert_eq!(sum, used, "{a:?}");
+            assert!(sum <= used, "{a:?}");
+            // The text form, as printed, is what counts.
+            let mut t = vec!["context"];
+            t.extend(&a);
+            let out = String::from_utf8(run(v.path(), &t).stdout).unwrap();
+            let real = wikiknit::context::tokens(&out) as u64;
+            assert!(real <= budget as u64, "{a:?}: printed {real} > {budget}");
+            assert!(real <= used + 1, "{a:?}: printed {real}, used {used}");
         }
     }
 }
@@ -274,4 +284,89 @@ fn bad_arguments_are_rejected() {
         let out = run(v.path(), args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
     }
+}
+
+#[test]
+fn excerpts_keep_the_lead_and_every_matching_section() {
+    let filler = "Unrelated filler line about other things.\n".repeat(60);
+    let v = vault(
+        "",
+        &[(
+            "ops.md",
+            &format!(
+                "# ops\n\nRuns the service for the team.\n\n## History\n{filler}\n## Notes\n{filler}- Deploy: run release.sh then deploy.sh\n{filler}- Rollback: deploy the previous tarball\n{filler}\n## Other\n{filler}"
+            ),
+        )],
+    );
+    let p = pack(
+        v.path(),
+        &["--query", "deploy", "--budget", "600", "--mode", "lexical"],
+    );
+    let text = p["items"][0]["text"].as_str().unwrap();
+    assert_eq!(p["items"][0]["content"], "excerpt");
+    // The lead section, the heading of the long section, and both matching lines.
+    assert!(
+        text.starts_with("# ops\n\nRuns the service for the team.\n"),
+        "{text}"
+    );
+    assert!(text.contains("## Notes\n"), "{text}");
+    assert!(
+        text.contains("- Deploy: run release.sh then deploy.sh"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Rollback: deploy the previous tarball"),
+        "{text}"
+    );
+    assert!(!text.contains("## Other"), "{text}");
+}
+
+#[test]
+fn a_note_with_a_query_focuses_its_excerpt() {
+    let v = sample();
+    let p = pack(
+        v.path(),
+        &["big", "--query", "kubernetes rollout", "--budget", "500"],
+    );
+    let e = &p["items"][0];
+    assert_eq!(e["id"], "big");
+    assert_eq!(e["content"], "excerpt");
+    assert!(
+        e["text"]
+            .as_str()
+            .unwrap()
+            .contains("The kubernetes rollout steps.")
+    );
+    assert!(e["why"][0].as_str().unwrap().contains("focused on"));
+}
+
+#[test]
+fn weak_matches_say_so_and_stay_small() {
+    let v = sample();
+    // Only "deploy" matches (in app's heading), "kubernetes"-like words do not.
+    let p = pack(
+        v.path(),
+        &[
+            "--query",
+            "helm chart terraform deploy",
+            "--mode",
+            "lexical",
+            "--budget",
+            "3000",
+        ],
+    );
+    assert_eq!(p["weak"], true, "{p}");
+    let items = p["items"].as_array().unwrap();
+    let seeds = items.iter().filter(|e| e["role"] == "seed").count();
+    assert_eq!(seeds, 1, "{p}");
+    assert!(
+        items
+            .iter()
+            .filter(|e| e["role"] == "linked")
+            .all(|e| e["content"] == "summary"),
+        "{p}"
+    );
+    // A clear match is not weak.
+    let clear = pack(v.path(), &["--query", "postgres", "--mode", "lexical"]);
+    assert_eq!(clear["weak"], false);
 }

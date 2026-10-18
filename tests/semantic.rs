@@ -89,3 +89,36 @@ fn hybrid_search_finds_meaning_without_shared_words() {
         "search already re-embedded it"
     );
 }
+
+#[test]
+#[ignore = "downloads an embedding model on first use"]
+fn search_indexes_a_few_new_notes_itself() {
+    let v = TempDir::new().unwrap();
+    let p = v.path();
+    fs::write(p.join("wikiknit.toml"), "").unwrap();
+    for i in 0..10 {
+        fs::write(
+            p.join(format!("n{i}.md")),
+            format!("# n{i}\nnote number {i} [[n0]]\n"),
+        )
+        .unwrap();
+    }
+    run(p, &["embed"]);
+    // Two new notes: below 90% coverage until indexed, but one refresh covers them.
+    fs::write(
+        p.join("cats.md"),
+        "# Felines\nThey purr and chase mice. [[n0]]\n",
+    )
+    .unwrap();
+    fs::write(
+        p.join("dogs.md"),
+        "# Canines\nThey bark and fetch. [[n0]]\n",
+    )
+    .unwrap();
+    let r = run(
+        p,
+        &["search", "kittens and their hunting", "--mode", "hybrid"],
+    );
+    assert_eq!(r["mode"], "hybrid", "{r}");
+    assert_eq!(ids(&r).first().map(String::as_str), Some("cats"), "{r}");
+}

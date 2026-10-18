@@ -117,6 +117,9 @@ pub struct Hit {
     pub similarity: Option<f64>,
     /// Fields the query matched in, best first.
     pub matched: Vec<&'static str>,
+    /// Share of the query's weight (by term rarity) that the note's words match, 0-1: a hit
+    /// on one common word of a long query covers little. 0 for a match by meaning only.
+    pub coverage: f64,
     /// Line of the snippet (0 when the match is only in title/aliases/frontmatter and the
     /// snippet is the note's summary).
     pub line: usize,
@@ -501,6 +504,13 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
             }
         }
     }
+    // Term weights: rare terms weigh more; a term no note has weighs most (it is unmatched).
+    let idf_q: Vec<f64> = df
+        .iter()
+        .map(|&d| (1.0 + (n_docs - d as f64 + 0.5) / (d as f64 + 0.5)).ln())
+        .collect();
+    let idf_total: f64 = idf_q.iter().sum::<f64>().max(1e-9);
+    let mut coverage: BTreeMap<usize, f64> = BTreeMap::new();
     let inbound = vault.inbound_counts();
     let query_norm = normalize(query.trim_matches('"'));
     let mut hits: Vec<(f64, usize, Vec<&'static str>)> = Vec::new();
@@ -525,10 +535,14 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
                 || catalog::title(note, &cfg.generic_names)
                     .is_some_and(|t| normalize(&t) == query_norm));
         let mut score = 0.0;
+        let mut covered = 0.0;
         let mut matched: Vec<(f64, &'static str)> = Vec::new();
         for (qi, &dft) in df.iter().enumerate() {
             if dft == 0 {
                 continue;
+            }
+            if d.counts[qi].iter().any(|&x| x > 0) {
+                covered += idf_q[qi];
             }
             let idf = (1.0 + (n_docs - dft as f64 + 0.5) / (dft as f64 + 0.5)).ln();
             let mut tf = 0.0;
@@ -550,6 +564,7 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
         if score <= 0.0 {
             continue;
         }
+        coverage.insert(i, covered / idf_total);
         if exact_notes[i] {
             score += 10.0;
         }
@@ -582,13 +597,31 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
         } else {
             cfg.min_similarity
         };
-        let allowed_meaning = meaning
+        // A query none of whose words occur in the vault (`zzzqqq`, a typo) has nothing to
+        // ground its embedding, which then lands near some note by chance: it must clear one
+        // more margin. (A cross-language match with a multilingual model scores well above.)
+        let grounded = df.iter().any(|&d| d > 0);
+        let floor = if grounded {
+            floor
+        } else {
+            floor + cfg.semantic_margin
+        };
+        // The floor decides which notes may enter by meaning alone. Below it, meaning still
+        // reorders the notes the words already found: weak evidence ranks, it does not add.
+        let ranked = meaning
             .iter()
-            .filter(|m| allowed[m.note] && m.similarity >= floor)
+            .filter(|m| allowed[m.note])
             .take(SEMANTIC_DEPTH);
-        for (rank, m) in allowed_meaning.enumerate() {
+        for (rank, m) in ranked.enumerate() {
+            let above = m.similarity >= floor;
+            if !above && !fused.contains_key(&m.note) {
+                continue;
+            }
             let e = fused.entry(m.note).or_insert((0.0, Vec::new()));
             e.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
+            if !above {
+                continue;
+            }
             if rank < SEMANTIC_MATCHED {
                 e.1.push("semantic");
             }
@@ -609,7 +642,7 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
     hits.into_iter()
         .map(|(score, i, matched)| {
             let note = &vault.notes[i];
-            let (line, snippet) = best_line(note, &q, &mut an)
+            let (line, snippet) = best_line(note, &q, &mut an, &idf_q)
                 .or_else(|| {
                     semantic_line.get(&i).filter(|&&l| l > 0).map(|&l| {
                         let (_, text, _) = note.line_at(note.line_start(l));
@@ -628,6 +661,9 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
                 similarity: semantic_sim
                     .get(&i)
                     .map(|s| (f64::from(*s) * 1000.0).round() / 1000.0),
+                coverage: coverage
+                    .get(&i)
+                    .map_or(0.0, |c| (c * 100.0).round() / 100.0),
                 matched,
                 line,
                 snippet,
@@ -636,33 +672,83 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
         .collect()
 }
 
-/// The body line with the most distinct query terms (first on ties), as a window around the
-/// first matching word.
-fn best_line(note: &Note, q: &Query, an: &mut Analyzer) -> Option<(usize, String)> {
+/// Body lines that match the query, scored: the summed weight of the distinct query terms
+/// on the line, more when one is a label at the start of the line (`- **Deploy**: ...`), less
+/// inside code blocks (logs, command output, snapshots). Returns (score, file line, text,
+/// byte of the first matching word).
+fn scored_lines<'a>(
+    note: &'a Note,
+    q: &Query,
+    an: &mut Analyzer,
+    weight: &[f64],
+) -> Vec<(f64, usize, &'a str, usize)> {
     let start_line = note.line_of(note.parsed.body_start);
     let body = &note.text[note.parsed.body_start..];
-    // (distinct hits, file line, line text, focus byte)
-    let mut best: Option<(usize, usize, &str, usize)> = None;
+    let mut fence = text::Fence::default();
+    let mut out = Vec::new();
     for (k, line) in body.lines().enumerate() {
+        let in_code = fence.line(line);
         if line.trim().is_empty() || line.trim_start().starts_with("# ") {
             continue;
         }
         let terms = an.terms_at(line);
         let mut seen = BTreeSet::new();
         let mut focus = None;
+        let mut label = false;
+        // The first few words of the line (after list and emphasis marks).
+        let lead = line
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .len();
+        let lead_start = line.len() - lead;
+        let lead_end = line[lead_start..]
+            .char_indices()
+            .filter(|(_, c)| c.is_whitespace())
+            .nth(2)
+            .map_or(line.len(), |(b, _)| lead_start + b);
         for (at, t) in &terms {
             if let Some(&qi) = q.index.get(t) {
                 seen.insert(qi);
                 focus.get_or_insert(*at);
+                label |= *at < lead_end;
             }
         }
-        if let Some(focus) = focus
-            && best.is_none_or(|(h, _, _, _)| seen.len() > h)
-        {
-            best = Some((seen.len(), start_line + k, line, focus));
+        let Some(focus) = focus else { continue };
+        let mut score: f64 = seen
+            .iter()
+            .map(|&qi| weight.get(qi).copied().unwrap_or(1.0))
+            .sum();
+        if label {
+            score *= 1.25;
+        }
+        if in_code {
+            score *= 0.5;
+        }
+        out.push((score, start_line + k, line, focus));
+    }
+    out
+}
+
+/// The best body line for the query (first on ties), as a window around the first matching
+/// word.
+fn best_line(note: &Note, q: &Query, an: &mut Analyzer, weight: &[f64]) -> Option<(usize, String)> {
+    let mut best: Option<(f64, usize, &str, usize)> = None;
+    for l in scored_lines(note, q, an, weight) {
+        if best.is_none_or(|b| l.0 > b.0) {
+            best = Some(l);
         }
     }
     best.map(|(_, line, text, focus)| (line, text::window(text, focus, SNIPPET_LEN)))
+}
+
+/// File lines of `note` that match `query`, with their scores (equal term weights).
+#[must_use]
+pub fn matching_lines(vault: &Vault, note: &Note, query: &str) -> Vec<(usize, f64)> {
+    let mut an = Analyzer::new(&vault.config.stemmer);
+    let q = parse_query(query, &mut an);
+    scored_lines(note, &q, &mut an, &[])
+        .into_iter()
+        .map(|(s, l, _, _)| (l, s))
+        .collect()
 }
 
 #[cfg(test)]
@@ -706,6 +792,67 @@ mod tests {
     }
 
     #[test]
+    fn a_query_with_no_vault_words_needs_a_clearer_meaning_match() {
+        let v = vault_of(&[
+            ("x.md", "# x\nalpha\n"),
+            ("y.md", "# y\ngamma\n"),
+            ("z.md", "# z\ndelta\n"),
+        ]);
+        let idx = |id: &str| v.index_of(id).unwrap();
+        // 0.58 clears min_similarity (0.5) but not min_similarity + semantic_margin (0.62).
+        let meaning = [
+            Meaning {
+                note: idx("y"),
+                similarity: 0.58,
+                line: 2,
+            },
+            Meaning {
+                note: idx("z"),
+                similarity: 0.70,
+                line: 2,
+            },
+        ];
+        let opts = Options {
+            include_hubs: false,
+            limit: 10,
+            semantic: Some(&meaning),
+            lexical: true,
+        };
+        let ids = |q: &str| -> Vec<String> {
+            search(&v, q, &Filter::default(), &opts)
+                .into_iter()
+                .map(|h| h.id)
+                .collect()
+        };
+        // `zzzqqq` is in no note: only the clear match counts.
+        assert_eq!(ids("zzzqqq"), ["z"]);
+        // `alpha` is a vault word: both meaning matches count.
+        let grounded = ids("alpha");
+        assert!(grounded.contains(&"y".to_string()), "{grounded:?}");
+        assert!(grounded.contains(&"z".to_string()), "{grounded:?}");
+    }
+
+    #[test]
+    fn coverage_weighs_rare_terms() {
+        let v = vault_of(&[
+            ("a.md", "# a\ncommon rare\n"),
+            ("b.md", "# b\ncommon\n"),
+            ("c.md", "# c\ncommon\n"),
+        ]);
+        let opts = Options {
+            include_hubs: false,
+            limit: 10,
+            semantic: None,
+            lexical: true,
+        };
+        let hits = search(&v, "common rare", &Filter::default(), &opts);
+        let cov = |id: &str| hits.iter().find(|h| h.id == id).unwrap().coverage;
+        assert!((cov("a") - 1.0).abs() < 1e-9);
+        // `rare` is in one note, `common` in all: b covers far less than half.
+        assert!(cov("b") < 0.35, "{}", cov("b"));
+    }
+
+    #[test]
     fn hybrid_fuses_and_respects_the_floor() {
         let v = vault_of(&[
             ("x.md", "# x\nalpha beta\n"),
@@ -744,6 +891,50 @@ mod tests {
         // An exact name match stays first even when meaning ranks it lower.
         let exact = search(&v, "y", &Filter::default(), &opts(true));
         assert_eq!(exact[0].id, "y");
+    }
+
+    #[test]
+    fn meaning_below_the_floor_reorders_but_does_not_add() {
+        // a and b match the word equally; c does not match it.
+        let v = vault_of(&[
+            ("a.md", "# a\nalpha\n"),
+            ("b.md", "# b\nalpha\n"),
+            ("c.md", "# c\ngamma\n"),
+        ]);
+        let idx = |id: &str| v.index_of(id).unwrap();
+        // All below min_similarity (0.5); b is the closest note, a the farthest.
+        let meaning = [
+            Meaning {
+                note: idx("b"),
+                similarity: 0.45,
+                line: 2,
+            },
+            Meaning {
+                note: idx("c"),
+                similarity: 0.40,
+                line: 2,
+            },
+            Meaning {
+                note: idx("a"),
+                similarity: 0.30,
+                line: 2,
+            },
+        ];
+        let opts = Options {
+            include_hubs: false,
+            limit: 10,
+            semantic: Some(&meaning),
+            lexical: true,
+        };
+        let hits = search(&v, "alpha", &Filter::default(), &opts);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["b", "a"],
+            "c is below the floor and has no word match"
+        );
+        assert!(hits.iter().all(|h| h.similarity.is_none()));
+        assert!(hits.iter().all(|h| !h.matched.contains(&"semantic")));
     }
 
     #[test]

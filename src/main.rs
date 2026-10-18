@@ -14,6 +14,11 @@ use wikiknit::links::{self, Direction};
 use wikiknit::state::{self, Store};
 use wikiknit::{Vault, catalog, graph, mentions, rules, search};
 
+/// `context --query`: hits after the first must score this share of the best hit...
+const SEED_SCORE: f64 = 0.5;
+/// ...and match by meaning or cover this share of the query's weight.
+const SEED_COVERAGE: f64 = 0.6;
+
 /// Version of the `--format json` envelope and record fields.
 const SCHEMA_VERSION: u32 = 1;
 
@@ -90,6 +95,10 @@ fn meaning(
         );
         return Ok((None, Mode::Lexical));
     };
+    // Keep the index current for a few changed or new notes (a few seconds at most); more
+    // needs `embed`. Done before the coverage check when the missing notes could fit, so a
+    // few new notes do not turn semantic search off.
+    let update = refresh(&mut sem, vault)?;
     // A partial index would rank only the notes it happens to have: use it only when it
     // covers nearly the whole vault.
     let (indexed, total) = sem.coverage(vault);
@@ -99,8 +108,6 @@ fn meaning(
         );
         return Ok((None, Mode::Lexical));
     }
-    // Keep the index current for a few changed notes (about a second); more needs `embed`.
-    let update = sem.update(vault, Some(64))?;
     if update.stale > 0 {
         eprintln!(
             "wikiknit: {} note(s) changed since `wikiknit embed`; their old vectors are used",
@@ -113,12 +120,30 @@ fn meaning(
 
 /// The semantic index for `suggest`, refreshed for a few changed notes when the model is
 /// available; `None` without an index.
+/// Chunks `search` and `suggest` embed themselves before answering; more needs `embed`.
+#[cfg(feature = "semantic")]
+const REFRESH_CHUNKS: usize = 64;
+
+/// Embed up to [`REFRESH_CHUNKS`] changed or new notes, unless the index is so far behind that
+/// one refresh cannot make it cover the vault (then only `embed` helps, and every search
+/// would pay for a partial refresh).
+#[cfg(feature = "semantic")]
+fn refresh(
+    sem: &mut wikiknit::semantic::Semantic,
+    vault: &Vault,
+) -> Result<wikiknit::semantic::Update> {
+    let (indexed, total) = sem.coverage(vault);
+    if !sem.covers(vault) && total - indexed > REFRESH_CHUNKS {
+        return Ok(sem.update(vault, Some(0))?);
+    }
+    Ok(sem.update(vault, Some(REFRESH_CHUNKS))?)
+}
+
 #[cfg(feature = "semantic")]
 fn semantic_index(vault: &Vault) -> Result<Option<wikiknit::vectors::Index>> {
     if let Ok(Some(mut sem)) = wikiknit::semantic::Semantic::open(vault, false) {
-        if sem.covers(vault) {
-            sem.update(vault, Some(64))?;
-        } else {
+        refresh(&mut sem, vault)?;
+        if !sem.covers(vault) {
             let (indexed, total) = sem.coverage(vault);
             eprintln!(
                 "wikiknit: the semantic index covers {indexed} of {total} notes; run `wikiknit embed` for similarity-based suggestions"
@@ -257,9 +282,10 @@ enum Command {
     /// of a large seed, summaries for the rest; each entry says why it is included.
     Context {
         /// The note: id, path, name, or alias.
-        #[arg(required_unless_present = "query", conflicts_with = "query")]
+        #[arg(required_unless_present = "query")]
         note: Option<String>,
-        /// A question or topic: its top search hits are the seeds.
+        /// A question or topic: its top search hits are the seeds. With a note: the
+        /// note's excerpt focuses on the sections about it.
         #[arg(long)]
         query: Option<String>,
         /// Token budget (estimated: ~4 characters per token).
@@ -512,45 +538,6 @@ fn emit_with<T: Serialize>(
     }
 }
 
-/// The pack as text: a header line, then each note in `<note>` tags (note text is Markdown
-/// with its own headings, so tags keep entries apart), then the omitted notes.
-fn print_pack(pack: &wikiknit::context::Pack) {
-    let attr = |s: &str| s.replace('&', "&amp;").replace('"', "&quot;");
-    let body = |s: &str| s.replace("</note>", "&lt;/note>");
-    out!(
-        "# context budget={} used={} entries={} omitted={}",
-        pack.budget,
-        pack.used,
-        pack.entries.len(),
-        pack.omitted.len()
-    );
-    for e in &pack.entries {
-        let content = match e.content {
-            wikiknit::context::Content::Full => "full",
-            wikiknit::context::Content::Excerpt => "excerpt",
-            wikiknit::context::Content::Summary => "summary",
-        };
-        let lines = if e.lines.is_empty() {
-            String::new()
-        } else {
-            format!(" lines=\"{}\"", e.lines)
-        };
-        out!(
-            "<note id=\"{}\" role=\"{}\" content=\"{content}\"{lines} score=\"{:.2}\" tokens=\"{}\">",
-            attr(&e.id),
-            e.role,
-            e.score,
-            e.tokens
-        );
-        out!("<why>{}</why>", body(&field(&e.why.join("; "))));
-        out!("{}", body(e.text.trim_end()));
-        out!("</note>");
-    }
-    if !pack.omitted.is_empty() {
-        out!("<omitted>{}</omitted>", pack.omitted.join("; "));
-    }
-}
-
 #[cfg(feature = "semantic")]
 fn embed(vault: &Vault, fmt: Format, rebuild: bool) -> Result<ExitCode> {
     let name = &vault.config.embedding_model;
@@ -692,6 +679,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     "type",
                     "similarity",
                     "matched",
+                    "coverage",
                     "line",
                     "snippet",
                 ],
@@ -703,6 +691,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         opt(h.kind.as_ref()),
                         h.similarity.map(|s| format!("{s:.3}")).unwrap_or_default(),
                         h.matched.join(";"),
+                        format!("{:.2}", h.coverage),
                         h.line.to_string(),
                         h.snippet.clone(),
                     ]
@@ -722,10 +711,40 @@ fn run(cli: Cli) -> Result<ExitCode> {
             filter,
         } => {
             let mut extra = serde_json::Map::new();
-            let seeds: Vec<wikiknit::context::Seed> = if let Some(q) = query {
-                if q.trim().is_empty() {
-                    bail!("--query is empty");
+            if query.as_deref().is_some_and(|q| q.trim().is_empty()) {
+                bail!("--query is empty");
+            }
+            let focus_for = |i: usize, q: Option<&str>, extra_line: Option<usize>| {
+                let mut f = q.map_or_else(Vec::new, |q| {
+                    search::matching_lines(&vault, &vault.notes[i], q)
+                });
+                if let Some(l) = extra_line.filter(|&l| l > 0)
+                    && !f.iter().any(|&(x, _)| x == l)
+                {
+                    f.push((l, 1.0));
                 }
+                f
+            };
+            let mut weak = false;
+            let seeds: Vec<wikiknit::context::Seed> = if let Some(start) = note {
+                if filter.is_set() {
+                    bail!(
+                        "filters choose --query seeds; with a note, use `wikiknit links` to filter its neighbors"
+                    );
+                }
+                let start = vault.find_note(start)?;
+                vec![wikiknit::context::Seed {
+                    note: start,
+                    score: 1.0,
+                    why: match query {
+                        Some(q) => format!("the note asked for, focused on \"{q}\""),
+                        None => "the note asked for".into(),
+                    },
+                    focus: focus_for(start, query.as_deref(), None),
+                    snippet: None,
+                }]
+            } else {
+                let q = query.as_deref().expect("required by clap");
                 let filter = filter.build(&vault)?;
                 let (ranked, used) = meaning(&vault, q, false, *mode)?;
                 extra.insert("mode".into(), format!("{used:?}").to_lowercase().into());
@@ -735,64 +754,82 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &filter,
                     &search::Options {
                         include_hubs: false,
-                        limit: usize::try_from(*seeds).unwrap_or(usize::MAX),
+                        // A wider pool: weak hits are dropped below, stronger ones further
+                        // down take their place.
+                        limit: usize::try_from(*seeds)
+                            .unwrap_or(usize::MAX)
+                            .saturating_mul(3),
                         semantic: ranked.as_deref(),
                         lexical: used != Mode::Semantic,
                     },
                 );
-                let top = hits.first().map_or(1.0, |h| h.score.max(1e-9));
+                let by_meaning = |h: &search::Hit| h.matched.contains(&"semantic");
+                let strong = |h: &search::Hit| by_meaning(h) || h.coverage >= SEED_COVERAGE;
+                // Seeds are the hits that match by meaning or cover most of the question,
+                // close to the best of them. When none does, the best hit alone, and the
+                // pack says it is weak: the vault may not cover the question.
+                weak = !hits.iter().any(strong);
+                let top = hits
+                    .iter()
+                    .find(|h| strong(h))
+                    .or(hits.first())
+                    .map_or(1.0, |h| h.score.max(1e-9));
+                let max_seeds = usize::try_from(*seeds).unwrap_or(usize::MAX);
                 hits.iter()
-                    .filter_map(|h| {
+                    .enumerate()
+                    .filter(|(k, h)| {
+                        if weak {
+                            *k == 0
+                        } else {
+                            strong(h) && h.score / top >= SEED_SCORE
+                        }
+                    })
+                    .take(max_seeds)
+                    .filter_map(|(_, h)| {
                         let note = vault.index_of(&h.id)?;
                         let sim = h
                             .similarity
                             .map(|s| format!("; similarity {s:.2}"))
                             .unwrap_or_default();
+                        let at = if h.line == 0 {
+                            String::new()
+                        } else {
+                            format!(" at line {}", h.line)
+                        };
                         Some(wikiknit::context::Seed {
                             note,
                             score: h.score / top,
-                            why: if h.line == 0 {
-                                format!("search hit: matched {}{sim}", h.matched.join(", "))
-                            } else {
-                                format!(
-                                    "search hit: matched {} at line {}{sim}",
-                                    h.matched.join(", "),
-                                    h.line
-                                )
-                            },
-                            line: (h.line > 0).then_some(h.line),
+                            why: format!(
+                                "search hit: matched {}{at}; covers {:.0}% of the query{sim}",
+                                h.matched.join(", "),
+                                h.coverage * 100.0
+                            ),
+                            focus: focus_for(note, Some(q), Some(h.line)),
                             snippet: (!h.snippet.is_empty()).then(|| h.snippet.clone()),
                         })
                     })
                     .collect()
-            } else {
-                if filter.is_set() {
-                    bail!(
-                        "filters choose --query seeds; with a note, use `wikiknit links` to filter its neighbors"
-                    );
-                }
-                let start = vault.find_note(note.as_deref().expect("required by clap"))?;
-                vec![wikiknit::context::Seed {
-                    note: start,
-                    score: 1.0,
-                    why: "the note asked for".into(),
-                    line: None,
-                    snippet: None,
-                }]
             };
             if seeds.is_empty() {
                 eprintln!("wikiknit: no note matches the query");
             }
+            if weak {
+                eprintln!(
+                    "wikiknit: the best match covers little of the query; the vault may not cover it"
+                );
+            }
             let size = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
-            let pack = wikiknit::context::build(&vault, &seeds, size(*depth), size(*budget));
+            let pack = wikiknit::context::build(&vault, &seeds, size(*depth), size(*budget), weak);
             match fmt {
                 Format::Json => {
                     extra.insert("budget".into(), pack.budget.into());
                     extra.insert("used".into(), pack.used.into());
+                    extra.insert("weak".into(), pack.weak.into());
                     extra.insert("omitted".into(), pack.omitted.clone().into());
+                    extra.insert("omitted_more".into(), pack.omitted_more.into());
                     emit_with(fmt, "context", &[], &pack.entries, |_| Vec::new(), extra);
                 }
-                Format::Text => print_pack(&pack),
+                Format::Text => out!("{}", wikiknit::context::render(&pack).trim_end()),
             }
             Ok(ExitCode::SUCCESS)
         }
