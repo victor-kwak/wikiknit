@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::LinkStyle;
+use crate::edits::{self, Planned};
 use crate::filter::Filter;
 use crate::mentions;
 use crate::search;
@@ -69,8 +70,11 @@ pub struct Suggestion {
     pub reasons: Vec<String>,
     /// The line the edit is at or after (for an append, the note's last line).
     pub line: usize,
-    /// The edit, ready to apply.
+    /// The edit, ready to apply after the rows above it that edit the same note.
     pub edit: String,
+    /// What the edit does, for writing the edits of one note in order.
+    #[serde(skip)]
+    pub plan: Planned,
 }
 
 /// How to write a link to `target` in the configured style.
@@ -99,22 +103,10 @@ pub fn link_text(vault: &Vault, target: &Note) -> String {
 enum Place {
     /// As list items after this 1-based line, under the existing `link_section` heading.
     AfterLine(usize),
-    /// Into the frontmatter list `key`, written on `line`.
-    Key { key: String, line: usize },
-    /// A new frontmatter line `key: [...]` after `after` (`None`: no frontmatter yet).
-    NewKey { key: String, after: Option<usize> },
+    /// Into the frontmatter list `key` (added, with the frontmatter, if missing).
+    Frontmatter(String),
     /// A new `link_section` heading after the last line, `after`.
     NewSection { section: String, after: usize },
-}
-
-/// 1-based line of top-level frontmatter `key:`.
-fn key_line(note: &Note, key: &str) -> Option<usize> {
-    let yaml = note.parsed.frontmatter.yaml.as_ref()?;
-    let src = &note.text[yaml.clone()];
-    src.find(&format!("\n{key}:"))
-        .map(|i| i + 1)
-        .or_else(|| src.starts_with(&format!("{key}:")).then_some(0))
-        .map(|i| note.line_of(yaml.start + i))
 }
 
 /// Where links go in `editor`, following `link_section`: a heading (`## Related`) or
@@ -122,27 +114,8 @@ fn key_line(note: &Note, key: &str) -> Option<usize> {
 /// frontmatter key named like it (`related:` for `## Related`) gets them there.
 fn place(vault: &Vault, editor: &Note) -> Place {
     let section = vault.config.link_section.trim();
-    let new_key = |key: &str| {
-        if let Some(line) = key_line(editor, key) {
-            return Place::Key {
-                key: key.to_string(),
-                line,
-            };
-        }
-        let after = editor.parsed.frontmatter.yaml.as_ref().map(|yaml| {
-            if yaml.is_empty() {
-                1 // empty frontmatter: after the opening `---`
-            } else {
-                editor.line_of(yaml.end - 1)
-            }
-        });
-        Place::NewKey {
-            key: key.to_string(),
-            after,
-        }
-    };
     if let Some(key) = section.strip_prefix("frontmatter:") {
-        return new_key(key.trim());
+        return Place::Frontmatter(key.trim().to_string());
     }
     // A heading: insert after the last non-blank line of that section.
     let body_start_line = editor.line_of(editor.parsed.body_start);
@@ -184,7 +157,7 @@ fn place(vault: &Vault, editor: &Note) -> Place {
             k_norm == name && holds_links(k)
         })
     {
-        return new_key(key);
+        return Place::Frontmatter(key.clone());
     }
     Place::NewSection {
         section: section.to_string(),
@@ -192,108 +165,54 @@ fn place(vault: &Vault, editor: &Note) -> Place {
     }
 }
 
-/// Edits that add links to `targets` (in order) to `editor`, one per target, so that applying
-/// them in order gives a valid note: the first creates the section or frontmatter key when it
-/// is missing, the others add to it. Line numbers count the earlier edits of the list.
-#[must_use]
-pub fn add_link_edits(vault: &Vault, editor: &Note, targets: &[&Note]) -> Vec<(usize, String)> {
-    let links: Vec<String> = targets.iter().map(|t| link_text(vault, t)).collect();
-    let mut out = Vec::with_capacity(links.len());
-    match place(vault, editor) {
-        Place::AfterLine(line) => {
-            for (k, link) in links.iter().enumerate() {
-                let at = line + k;
-                let edit = if k == 0 {
-                    format!("insert after line {at}: - {link}")
-                } else {
-                    format!(
-                        "insert after line {at} (the `- {}` line): - {link}",
-                        links[k - 1]
-                    )
-                };
-                out.push((at, edit));
-            }
-        }
-        Place::Key { key, line } => {
-            for link in &links {
-                out.push((line, format!("add \"{link}\" to frontmatter `{key}`")));
-            }
-        }
-        Place::NewKey { key, after } => {
-            for (k, link) in links.iter().enumerate() {
-                out.push(match (k, after) {
-                    (0, Some(after)) => (
-                        after,
-                        format!("insert after line {after}: {key}: [\"{link}\"]"),
-                    ),
-                    (0, None) => (
-                        1,
-                        format!("insert at line 1: ---\\n{key}: [\"{link}\"]\\n---"),
-                    ),
-                    // The key the first edit added: one line further, or line 2 of the new
-                    // frontmatter.
-                    (_, after) => (
-                        after.map_or(2, |a| a + 1),
-                        format!(
-                            "add \"{link}\" to frontmatter `{key}` (added by the edit for {})",
-                            links[0]
-                        ),
-                    ),
-                });
-            }
-        }
-        Place::NewSection { section, after } => {
-            for (k, link) in links.iter().enumerate() {
-                out.push(if k == 0 {
-                    (
-                        after,
-                        format!("append after line {after}: {section}\\n\\n- {link}"),
-                    )
-                } else {
-                    // `after` + heading, blank line, and the k items so far.
-                    let at = after + 2 + k;
-                    (
-                        at,
-                        format!(
-                            "insert after line {at} (the `- {}` line under {section}): - {link}",
-                            links[k - 1]
-                        ),
-                    )
-                });
-            }
-        }
-    }
-    out
-}
-
-/// Where and how to add one link to `target` in `editor` ([`add_link_edits`]).
+/// Where and how to add one link to `target` in `editor`: one mechanical edit (a line
+/// insert, or a replacement of a frontmatter key's lines).
 #[must_use]
 pub fn add_link_edit(vault: &Vault, editor: &Note, target: &Note) -> (usize, String) {
-    add_link_edits(vault, editor, &[target])
-        .pop()
-        .expect("one edit per target")
+    let link = link_text(vault, target);
+    match place(vault, editor) {
+        Place::AfterLine(line) => (line, format!("insert after line {line}: - {link}")),
+        Place::Frontmatter(key) => crate::aliases::list_add_edit(
+            editor,
+            &[key.as_str()],
+            &[serde_json::to_string(&link).expect("a string serializes")],
+        ),
+        Place::NewSection { section, after } => (
+            after,
+            format!("append after line {after}: {section}\\n\\n- {link}"),
+        ),
+    }
 }
 
-/// Give the `link` and `backlink` suggestions that edit the same note edits that apply in
-/// sequence (output order): one creates a missing section or key, the rest add to it.
-fn sequence_edits(vault: &Vault, out: &mut [Suggestion]) {
+/// Edits that add links to `targets` (in order) to `editor`, one per target: applied in
+/// order they give a valid note (the section or key is created once; line numbers count the
+/// earlier edits).
+#[must_use]
+pub fn add_link_edits(vault: &Vault, editor: &Note, targets: &[&Note]) -> Vec<(usize, String)> {
+    let plans: Vec<Planned> = targets
+        .iter()
+        .filter_map(|t| vault.index_of(&t.id))
+        .map(|target| Planned::Link { target })
+        .collect();
+    edits::plan(vault, editor, &plans)
+}
+
+/// One row per (note to edit, link target), the first; then the edits for each note written
+/// in output order, so every row applies after the ones above it.
+fn sequence_edits(vault: &Vault, out: &mut Vec<Suggestion>) {
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    out.retain(|s| seen.insert((s.note.clone(), s.target.clone())));
     let mut by_editor: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (k, s) in out.iter().enumerate() {
-        if s.action != "mention" {
-            by_editor.entry(s.note.as_str()).or_default().push(k);
-        }
+        by_editor.entry(s.note.as_str()).or_default().push(k);
     }
     let mut edits: Vec<(usize, (usize, String))> = Vec::new();
     for (editor, ks) in by_editor {
-        let (Some(editor), Some(targets)) = (
-            vault.get(editor),
-            ks.iter()
-                .map(|&k| vault.get(&out[k].target))
-                .collect::<Option<Vec<&Note>>>(),
-        ) else {
+        let Some(editor) = vault.get(editor) else {
             continue;
         };
-        edits.extend(ks.into_iter().zip(add_link_edits(vault, editor, &targets)));
+        let plans: Vec<Planned> = ks.iter().map(|&k| out[k].plan.clone()).collect();
+        edits.extend(ks.into_iter().zip(edits::plan(vault, editor, &plans)));
     }
     for (k, (line, edit)) in edits {
         out[k].line = line;
@@ -363,7 +282,7 @@ struct Signals {
     neighbors: f64,
     frontmatter: f64,
     reasons: Vec<String>,
-    mention_edit: Option<(usize, String)>,
+    mention_edit: Option<Planned>,
 }
 
 /// Link candidates for note `start` scoring at least `min_score`, best first (at most
@@ -495,21 +414,19 @@ impl<'a> Suggester<'a> {
                 Some(r) => (&note.text[r.clone()], r.start),
                 None => (m.term.as_str(), m.start),
             };
-            // Where the text also occurs earlier on the line (in code, in another word), the
-            // column says which occurrence.
+            // Which occurrence on the line: where the text also occurs earlier (in code, in
+            // another word), the edit names a column.
             let (_, line_text, at) = note.line_at(start);
-            let at_col = if line_text[..at].contains(from) {
-                format!(", column {}", line_text[..at].chars().count() + 1)
-            } else {
-                String::new()
-            };
-            s.mention_edit = Some((
-                m.line,
-                format!(
-                    "line {}{at_col}: replace \"{from}\" with [[{inner}{pipe}{}]]",
-                    m.line, m.term
-                ),
-            ));
+            let nth = line_text
+                .match_indices(from)
+                .take_while(|(i, _)| *i < at)
+                .count();
+            s.mention_edit = Some(Planned::Replace {
+                line: m.line,
+                nth,
+                from: from.to_string(),
+                to: format!("[[{inner}{pipe}{}]]", m.term),
+            });
         }
 
         // 2. notes that link here without a link back
@@ -527,9 +444,10 @@ impl<'a> Suggester<'a> {
             }
         }
 
-        // 2b. notes this one links to that do not link back
+        // 2b. notes this one links to that do not link back (a log's links ask for none)
+        let is_log = cfg.is_no_backlink_from(&note.id);
         for &t in linked {
-            if eligible(t) && !out_links[t].contains(&start) {
+            if !is_log && eligible(t) && !out_links[t].contains(&start) {
                 let s = sig.entry(t).or_default();
                 s.no_link_back = 1.0;
                 s.reasons.push("linked from here; no link back".into());
@@ -689,7 +607,8 @@ impl<'a> Suggester<'a> {
                 ((score * 100.0).round() / 100.0, t, s)
             })
             // Back-links only where the other note does not already link here.
-            .filter(|(_, t, _)| !(linked.contains(t) && out_links[*t].contains(&start)))
+            // and never from a log (`no_backlink_from`): its links ask for none.
+            .filter(|(_, t, _)| !(linked.contains(t) && (is_log || out_links[*t].contains(&start))))
             // One weak signal alone (similar text, one shared value) is often chance: it takes
             // a strong one or two weak ones. Every candidate says why it is there.
             .filter(|(_, _, s)| {
@@ -727,13 +646,14 @@ impl<'a> Suggester<'a> {
             .into_iter()
             .map(|(score, t, s)| {
                 let target = &vault.notes[t];
-                let (action, editor, (line, edit)) = if linked.contains(&t) {
+                // The edit text is written by `sequence_edits`, in output order.
+                let (action, editor, plan) = if linked.contains(&t) {
                     // Already linked from here: suggest the link back, edited in the target.
-                    ("backlink", target, add_link_edit(vault, target, note))
+                    ("backlink", target, Planned::Link { target: start })
                 } else if let Some(me) = s.mention_edit.clone() {
                     ("mention", note, me)
                 } else {
-                    ("link", note, add_link_edit(vault, note, target))
+                    ("link", note, Planned::Link { target: t })
                 };
                 let target_id = if action == "backlink" {
                     note.id.clone()
@@ -746,8 +666,9 @@ impl<'a> Suggester<'a> {
                     target: target_id,
                     score,
                     reasons: s.reasons,
-                    line,
-                    edit,
+                    line: 0,
+                    edit: String::new(),
+                    plan,
                 }
             })
             .collect::<Vec<_>>();

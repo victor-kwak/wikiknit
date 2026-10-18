@@ -22,6 +22,19 @@ pub struct Note {
 }
 
 impl Note {
+    /// A note from text (not read from disk): to see a note as planned edits leave it.
+    #[must_use]
+    pub fn from_text(id: &str, path: PathBuf, text: String) -> Self {
+        Self {
+            id: id.to_string(),
+            path,
+            not_utf8: false,
+            parsed: parse::parse(&text),
+            line_starts: line_starts(&text),
+            text,
+        }
+    }
+
     /// 1-based line number of a byte offset.
     #[must_use]
     pub fn line_of(&self, offset: usize) -> usize {

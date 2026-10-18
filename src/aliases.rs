@@ -578,25 +578,39 @@ pub fn alias_edit(note: &Note, terms: &[&str]) -> (usize, String) {
         .iter()
         .map(|t| serde_json::to_string(t).expect("a string serializes"))
         .collect();
+    list_add_edit(note, &["aliases", "alias"], &quoted)
+}
+
+/// The edit that adds `quoted` (YAML-quoted strings) to the frontmatter list under the first
+/// of `keys` the note has, or adds `keys[0]` (and the frontmatter) when it has none. One
+/// mechanical edit: a line insert or a replacement of the key's lines.
+#[must_use]
+pub fn list_add_edit(note: &Note, keys: &[&str], quoted: &[String]) -> (usize, String) {
+    let new_key = keys[0];
     let list = quoted.join(", ");
     let Some(yaml) = &note.parsed.frontmatter.yaml else {
         return (
             1,
-            format!("insert at line 1: ---\\naliases: [{list}]\\n---"),
+            format!("insert at line 1: ---\\n{new_key}: [{list}]\\n---"),
         );
     };
     let src = &note.text[yaml.clone()];
     let lines: Vec<&str> = src.lines().collect();
     // The first YAML line; for empty frontmatter, this is the closing `---`.
     let first_line = note.line_of(yaml.start);
-    let key = lines.iter().position(|l| {
-        let l = l.trim_end();
-        l.starts_with("aliases:") || l.starts_with("alias:")
+    let key = keys.iter().find_map(|k| {
+        lines.iter().position(|l| {
+            l.strip_prefix(k)
+                .is_some_and(|rest| rest.trim_start_matches([' ', '\t']).starts_with(':'))
+        })
     });
     let Some(k) = key else {
         // After the last YAML line (the opening `---` when there is none).
         let last = first_line - 1 + lines.len();
-        return (last, format!("insert after line {last}: aliases: [{list}]"));
+        return (
+            last,
+            format!("insert after line {last}: {new_key}: [{list}]"),
+        );
     };
     let line_no = first_line + k;
     let (name, value) = lines[k].split_once(':').expect("has a colon");

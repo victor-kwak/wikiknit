@@ -375,14 +375,8 @@ fn several_links_into_one_note_create_the_section_once() {
                 2,
                 "append after line 2: ## Related\\n\\n- [[a]]".to_string()
             ),
-            (
-                5,
-                "insert after line 5 (the `- [[a]]` line under ## Related): - [[b]]".to_string()
-            ),
-            (
-                6,
-                "insert after line 6 (the `- [[b]]` line under ## Related): - [[c]]".to_string()
-            ),
+            (5, "insert after line 5: - [[b]]".to_string()),
+            (6, "insert after line 6: - [[c]]".to_string()),
         ],
         "{s:?}"
     );
@@ -395,13 +389,7 @@ fn several_links_into_one_note_create_the_section_once() {
         (5, "insert after line 5: - [[a]]".to_string()),
         "{e:?}"
     );
-    assert_eq!(
-        e[2],
-        (
-            7,
-            "insert after line 7 (the `- [[b]]` line): - [[c]]".to_string()
-        )
-    );
+    assert_eq!(e[2], (7, "insert after line 7: - [[c]]".to_string()));
 }
 
 #[test]
@@ -411,19 +399,18 @@ fn several_links_into_one_frontmatter_key_add_it_once() {
     let s = items(v.path(), &["suggest", "s"]);
     let e = edits_in(&s, "s");
     assert_eq!(
-        e[0],
-        (2, "insert after line 2: related: [\"[[a]]\"]".to_string()),
-        "{e:?}"
-    );
-    assert_eq!(
-        e[1],
-        (
-            3,
-            "add \"[[b]]\" to frontmatter `related` (added by the edit for [[a]])".to_string()
-        )
-    );
-    assert!(
-        e[1..].iter().all(|(_, x)| !x.contains("related: [")),
+        e,
+        [
+            (2, "insert after line 2: related: [\"[[a]]\"]".to_string()),
+            (
+                3,
+                "line 3: replace with: related: [\"[[a]]\", \"[[b]]\"]".to_string()
+            ),
+            (
+                3,
+                "line 3: replace with: related: [\"[[a]]\", \"[[b]]\", \"[[c]]\"]".to_string()
+            ),
+        ],
         "{e:?}"
     );
     // No frontmatter: one `---` block, then additions to it.
@@ -445,10 +432,13 @@ fn heading_section_prefers_an_existing_related_frontmatter_list() {
     let s = items(v.path(), &["suggest", "s"]);
     let e = edits_in(&s, "s");
     assert_eq!(e.len(), 3, "{s:?}");
-    assert!(
-        e.iter().all(|(l, x)| *l == 2
-            && x.starts_with("add \"[[")
-            && x.ends_with("to frontmatter `related`")),
+    assert_eq!(
+        e[2],
+        (
+            2,
+            "line 2: replace with: related: [\"[[x]]\", \"[[a]]\", \"[[b]]\", \"[[c]]\"]"
+                .to_string()
+        ),
         "{e:?}"
     );
 }
