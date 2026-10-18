@@ -211,14 +211,15 @@ impl Store {
         if let Some(l) = read_json::<Linked>(&self.linked_path())? {
             return Ok(l.hashes);
         }
-        if let Some(uncommitted) = uncommitted_notes(&self.vault) {
+        if let Some(committed) = committed_hashes(&self.vault) {
+            // A note whose content is not the committed one is pending.
             let hashes: Hashes = now
                 .iter()
                 .map(|(id, h)| {
-                    let linked = if uncommitted.contains(id) {
-                        String::new()
-                    } else {
+                    let linked = if committed.get(id) == Some(h) {
                         h.clone()
+                    } else {
+                        String::new()
                     };
                     (id.clone(), linked)
                 })
@@ -407,69 +408,107 @@ impl Store {
     }
 }
 
-/// Ids of the notes in `vault` that differ from git `HEAD`: changed, staged, or not committed
-/// (all notes when there is no commit yet). `None` when the vault is not in a git work tree
-/// or git fails.
-fn uncommitted_notes(vault: &Path) -> Option<BTreeSet<String>> {
-    let git = |args: &[&str]| -> Option<Vec<u8>> {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(vault)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
+/// A `git` command for `dir` that cannot run programs from repository config. The hooks run
+/// git in folders named by a command the agent has not run yet (a cloned repository), so
+/// config such as `core.fsmonitor` or hooks must not execute. Callers use only commands that
+/// do not touch the work tree (`rev-parse`, `ls-tree`, `cat-file`, `config --get`), so clean
+/// and smudge filters, textconv, and external diff do not apply either.
+#[must_use]
+pub fn safe_git(dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "protocol.allow=never",
+        "--no-pager",
+        "--no-replace-objects",
+    ])
+    .arg("-C")
+    .arg(dir)
+    .env("GIT_OPTIONAL_LOCKS", "0")
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_NO_LAZY_FETCH", "1")
+    .env_remove("GIT_EXTERNAL_DIFF")
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Content hash (as [`current_hashes`] computes it) of each note committed at `HEAD` under
+/// `vault`, by id: empty when there is no commit yet. `None` when the vault is not in a git
+/// work tree or git fails. Reads objects only, never the work tree or the index.
+fn committed_hashes(vault: &Path) -> Option<Hashes> {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let run = |args: &[&str]| -> Option<Vec<u8>> {
+        let out = safe_git(vault).args(args).output().ok()?;
         out.status.success().then_some(out.stdout)
     };
-    let inside = git(&["rev-parse", "--is-inside-work-tree"])?;
-    if inside.trim_ascii() != b"true" {
+    if run(&["rev-parse", "--is-inside-work-tree"])?.trim_ascii() != b"true" {
         return None;
     }
-    let mut lists = Vec::new();
-    if git(&["rev-parse", "--verify", "-q", "HEAD"]).is_some() {
-        lists.push(git(&[
-            "diff",
-            "--name-only",
-            "-z",
-            "--no-ext-diff",
-            "--no-renames",
-            "--relative",
-            "HEAD",
-            "--",
-            ".",
-        ])?);
-        lists.push(git(&[
-            "ls-files",
-            "-z",
-            "--others",
-            "--exclude-standard",
-            "--",
-            ".",
-        ])?);
-    } else {
-        lists.push(git(&[
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--",
-            ".",
-        ])?);
+    if run(&["rev-parse", "--verify", "-q", "HEAD^{commit}"]).is_none() {
+        return Some(Hashes::new()); // no commit yet: every note is new
     }
-    Some(
-        lists
-            .iter()
-            .flat_map(|l| l.split(|b| *b == 0))
-            .filter_map(|p| {
-                let p = String::from_utf8_lossy(p);
-                let n = p.len();
-                (n > 3 && p.is_char_boundary(n - 3) && p[n - 3..].eq_ignore_ascii_case(".md"))
-                    .then(|| p[..n - 3].to_string())
-            })
-            .collect(),
-    )
+    // Paths are relative to the vault (the current folder for git).
+    let tree = run(&["ls-tree", "-r", "-z", "HEAD"])?;
+    let mut notes: Vec<(String, String)> = Vec::new(); // (id, blob oid)
+    for entry in tree.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let entry = String::from_utf8_lossy(entry);
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let mut meta = meta.split(' ');
+        let (Some(_mode), Some("blob"), Some(oid)) = (meta.next(), meta.next(), meta.next()) else {
+            continue;
+        };
+        let n = path.len();
+        if n > 3 && path.is_char_boundary(n - 3) && path[n - 3..].eq_ignore_ascii_case(".md") {
+            notes.push((path[..n - 3].to_string(), oid.to_string()));
+        }
+    }
+    if notes.is_empty() {
+        return Some(Hashes::new());
+    }
+    let mut child = safe_git(vault)
+        .args(["cat-file", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let oids: Vec<String> = notes.iter().map(|(_, oid)| oid.clone()).collect();
+    // Write from a thread: git's output would fill the pipe while the input is still going.
+    let writer = std::thread::spawn(move || {
+        for oid in oids {
+            if writeln!(stdin, "{oid}").is_err() {
+                break;
+            }
+        }
+    });
+    let mut reader = std::io::BufReader::new(child.stdout.take()?);
+    let mut hashes = Hashes::new();
+    for (id, _) in &notes {
+        let mut header = String::new();
+        reader.read_line(&mut header).ok()?;
+        // "<oid> blob <size>"
+        let size: usize = header.trim_end().rsplit(' ').next()?.parse().ok()?;
+        let mut body = vec![0u8; size];
+        reader.read_exact(&mut body).ok()?;
+        let mut newline = [0u8; 1];
+        reader.read_exact(&mut newline).ok()?;
+        let text = String::from_utf8_lossy(&body);
+        hashes.insert(
+            id.clone(),
+            blake3::hash(text.as_bytes()).to_hex().to_string(),
+        );
+    }
+    writer.join().ok()?;
+    child.wait().ok()?.success().then_some(hashes)
 }
 
 /// Digest of a set of notes and their current content.
