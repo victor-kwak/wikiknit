@@ -89,3 +89,30 @@ fn hybrid_search_finds_meaning_without_shared_words() {
         "search already re-embedded it"
     );
 }
+
+#[test]
+#[ignore = "downloads an embedding model on first use"]
+fn embed_saves_a_large_vault_in_slices() {
+    // More chunks than one slice (512): every note ends up indexed, once.
+    let v = TempDir::new().unwrap();
+    let p = v.path();
+    fs::write(p.join("wikiknit.toml"), "").unwrap();
+    for i in 0..300 {
+        let sections: String = (0..3)
+            .map(|s| {
+                format!(
+                    "## Part {s}\nNote {i} section {s} talks about topic {}.\n",
+                    i % 7
+                )
+            })
+            .collect();
+        fs::write(p.join(format!("n{i}.md")), format!("# n{i}\n{sections}")).unwrap();
+    }
+    let e = run(p, &["embed"]);
+    let item = &e["items"][0];
+    assert_eq!(item["embedded"], 300, "{e}");
+    assert_eq!(item["total_notes"], 300, "{e}");
+    assert!(item["chunks"].as_u64().unwrap() > 512, "{e}");
+    assert_eq!(item["chunks"], item["total_chunks"], "{e}");
+    assert_eq!(run(p, &["embed"])["items"][0]["embedded"], 0);
+}

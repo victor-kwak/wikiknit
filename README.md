@@ -191,7 +191,9 @@ unless `--include-hubs`. Each hit shows the fields it matched and its best line.
 
 `wikiknit embed` splits each note into chunks (by section, then paragraph, about 175 tokens each,
 each prefixed with the note title and heading path) and embeds them with a local model. The index
-lives in the state directory, keyed by note content hash: later runs embed only changed notes, and
+lives in the state directory, keyed by note content hash: later runs embed only changed notes. `embed`
+works in slices of about 512 chunks (whole notes) and saves after each, so memory stays bounded on a
+large vault and an interrupted run keeps what it finished. Also,
 `search` itself refreshes up to 64 changed chunks before answering (about a second). `search` then fuses
 the BM25 ranking and the meaning ranking (each note scored by its best chunk) with reciprocal rank
 fusion; an exact name or alias match still comes first, and quoted phrases still must match. A note
