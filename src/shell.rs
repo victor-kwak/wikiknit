@@ -114,6 +114,8 @@ struct Ctx {
     /// Aliases were changed in a way this parser does not follow (`BASH_ALIASES[x]=...`, an
     /// odd `alias` form): every later command is opaque.
     opaque_rest: bool,
+    /// `set -a`: every later assignment is exported.
+    allexport: bool,
 }
 
 /// A name `alias` can define that this parser follows.
@@ -201,7 +203,19 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
     // every simple command so far (heredoc bodies and pipes refer to commands by id)
     let mut commands: Vec<Cmd> = Vec::new();
     let mut bodies: Vec<(usize, String, Ctx)> = Vec::new();
-    for item in tokenize(command) {
+    let items = tokenize(command);
+    for (k, item) in items.iter().cloned().enumerate() {
+        // A function definition (`f() { ...; }`, `function f`): its body runs when called,
+        // not here, and a call can change anything about this shell. The rest is opaque.
+        if let Item::Cmd(c) = &item {
+            let fn_def = c.words.first().is_some_and(|w| w == "function")
+                || (c.words.len() == 1
+                    && matches!(items.get(k + 1), Some(Item::Open))
+                    && matches!(items.get(k + 2), Some(Item::Close)));
+            if fn_def {
+                ctx.opaque_rest = true;
+            }
+        }
         match item {
             Item::Open => scopes.push(ctx.clone()),
             Item::Close => {
@@ -671,7 +685,9 @@ fn simple(
         }
     }
     // After an alias change this parser cannot follow, nothing later can be read.
-    if words.iter().any(|w| w.starts_with("BASH_ALIASES")) {
+    if words.iter().any(|w| w.contains("BASH_ALIASES"))
+        || redirects.iter().any(|r| r.target.contains("BASH_ALIASES"))
+    {
         ctx.opaque_rest = true;
     }
     // Under xargs, an empty command gets its words from stdin.
@@ -680,10 +696,22 @@ fn simple(
         return;
     }
     let Some((program, args)) = p.words.split_first() else {
-        // Only assignments: shell variables, not exported.
+        // `exec` with only redirections: a new stdin for every later command.
+        if words.iter().any(|w| w == "exec")
+            && redirects.iter().any(|r| {
+                let op = r.op.trim_start_matches('0');
+                matches!(op, "<" | "<<" | "<<<" | "<>" | "<&")
+            })
+        {
+            ctx.opaque_rest = true;
+        }
+        // Only assignments: shell variables, exported only under `set -a`.
         for (k, v) in &p.assigns {
             if is_config_var(k) {
                 ctx.config = true;
+            }
+            if ctx.allexport {
+                ctx.export(k, v);
             }
             ctx.vars.insert(k.clone(), v.clone());
         }
@@ -736,6 +764,10 @@ fn simple(
             let exported =
                 name == "export" || args.iter().any(|a| a.starts_with('-') && a.contains('x'));
             for a in args.iter().filter(|a| !a.starts_with('-')) {
+                let var = a.split_once('=').map_or(a.as_str(), |(k, _)| k);
+                if is_dynamic_word(var.strip_suffix('+').unwrap_or(var)) {
+                    ctx.opaque_rest = true;
+                }
                 if let Some((k, v)) = split_assignment(a) {
                     if is_config_var(k) {
                         ctx.config = true;
@@ -747,6 +779,52 @@ fn simple(
                     }
                 } else if exported && let Some(v) = ctx.vars.get(a.as_str()).cloned() {
                     ctx.export(a, &v);
+                }
+            }
+        }
+        // Builtins that assign variables from input: names this parser cannot follow make
+        // the rest of the command opaque.
+        "read" => match parse_opts(&READ_OPTS, args) {
+            Some(parsed) => {
+                let mut names = parsed.operands.clone();
+                names.extend(parsed.values(&["a"]));
+                if names.iter().any(|n| risky_name(n)) {
+                    ctx.opaque_rest = true;
+                }
+            }
+            None => ctx.opaque_rest = true,
+        },
+        "mapfile" | "readarray" => match parse_opts(&MAPFILE_OPTS, args) {
+            Some(parsed) if !parsed.has(&["C"]) => {
+                if parsed.operands.iter().any(|n| risky_name(n)) {
+                    ctx.opaque_rest = true;
+                }
+            }
+            _ => ctx.opaque_rest = true,
+        },
+        "printf" => {
+            let args = match args.first() {
+                Some(a) if a == "--" => &args[1..],
+                _ => args,
+            };
+            if args.first().is_some_and(|a| a == "-v") && args.get(1).is_none_or(|n| risky_name(n))
+            {
+                ctx.opaque_rest = true;
+            }
+        }
+        "set" => {
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                let on = a.starts_with('-');
+                if !(on || a.starts_with('+')) || a.len() < 2 || a == "--" {
+                    break;
+                }
+                if a[1..].contains('o') {
+                    if it.next().is_some_and(|o| o == "allexport") {
+                        ctx.allexport = on;
+                    }
+                } else if a[1..].contains('a') {
+                    ctx.allexport = on;
                 }
             }
         }
@@ -774,20 +852,18 @@ fn simple(
                 ShellRun::Unknown => opaque(out, &inner, &what),
             }
         }
+        // `source` and `eval` run in this shell: what they change (`cd`, `export`, aliases)
+        // carries on to later commands.
         "source" | "." => {
-            let mut inner = ctx.clone();
-            inner.cds = dirs;
-            // A sourced script runs in this shell: its `cd` and `export` are unknown.
             match parse_opts(&SOURCE_OPTS, args).and_then(|p| p.operands.first().cloned()) {
-                Some(f) => run_file(&f, feed, &inner, out, depth, &what),
-                None => opaque(out, &inner, &what),
+                Some(f) => source_file(&f, feed, ctx, out, depth, &what),
+                None => {
+                    opaque(out, ctx, &what);
+                    ctx.opaque_rest = true;
+                }
             }
         }
-        "eval" => {
-            let mut inner = ctx.clone();
-            inner.cds = dirs;
-            collect(&args.join(" "), &mut inner, out, depth + 1);
-        }
+        "eval" => collect(&args.join(" "), ctx, out, depth + 1),
         "git" => {
             let mut config = ctx.config;
             let mut git_dir = ctx.git_dir.clone();
@@ -865,8 +941,13 @@ fn simple(
             inner.cds = dirs;
             match parse_opts(&WATCH_OPTS, args) {
                 Some(parsed) if parsed.has(&["h", "v", "help", "version"]) => {}
+                // `-x`: the words are an argv; else one string for `sh -c`.
                 Some(parsed) if !parsed.operands.is_empty() => {
-                    collect(&parsed.operands.join(" "), &mut inner, out, depth + 1);
+                    if parsed.has(&["x", "exec"]) {
+                        simple(&parsed.operands, &[], feed, &mut inner, out, depth + 1);
+                    } else {
+                        collect(&parsed.operands.join(" "), &mut inner, out, depth + 1);
+                    }
                 }
                 _ => opaque(out, &inner, &what),
             }
@@ -882,6 +963,16 @@ fn simple(
             match parse_opts(spec, args) {
                 None => opaque(out, &inner, &what),
                 Some(parsed) if parsed.has(&["h", "V", "help", "version"]) => {}
+                // Another shell (`-s`, or `$SHELL` kept by `-m`/`-p`) runs the command with
+                // rules this parser does not model; extra words after the user go to it.
+                Some(parsed)
+                    if !parsed.has(&["u", "user"])
+                        && (parsed.has(&["s", "shell", "m", "p", "preserve-environment"])
+                            || parsed.operands.iter().filter(|o| o.as_str() != "-").count()
+                                > 1) =>
+                {
+                    opaque(out, &inner, &what);
+                }
                 Some(parsed) => {
                     let scripts = parsed.values(&["c", "command", "session-command"]);
                     if let Some(script) = scripts.last() {
@@ -1035,16 +1126,20 @@ fn shell_run(args: &[String]) -> ShellRun {
     if p.has(&["help", "version"]) {
         return ShellRun::NotRun;
     }
+    // A lone `-` ends the options, as `--` does.
+    let mut operands = p.operands.clone();
+    if operands.first().is_some_and(|o| o == "-") {
+        operands.remove(0);
+    }
     if p.has(&["c"]) {
-        return p
-            .operands
+        return operands
             .first()
             .map_or(ShellRun::Unknown, |s| ShellRun::Script(s.clone()));
     }
-    if p.has(&["s"]) || p.operands.is_empty() {
+    if p.has(&["s"]) || operands.is_empty() {
         return ShellRun::Stdin;
     }
-    ShellRun::File(p.operands[0].clone())
+    ShellRun::File(operands[0].clone())
 }
 
 /// A shell that may read its script from stdin (for heredoc bodies and pipes): one that
@@ -1081,6 +1176,54 @@ fn run_file(file: &str, feed: &Feed, ctx: &Ctx, out: &mut Analysis, depth: usize
             target: WriteTarget::Unknown,
         });
     }
+}
+
+/// `source FILE` / `. FILE`: the script runs in this shell. A literal script (from a process
+/// substitution or `/dev/stdin`) is parsed in this shell's state; a file, a heredoc, or an
+/// unreadable script can change anything about this shell, so the rest of the command is
+/// opaque.
+fn source_file(
+    file: &str,
+    feed: &Feed,
+    ctx: &mut Ctx,
+    out: &mut Analysis,
+    depth: usize,
+    what: &str,
+) {
+    let script = if file == "/dev/stdin" || file == "-" {
+        feed.clone()
+    } else if is_dynamic_word(file) {
+        Feed::Opaque
+    } else if let Some(inner) = process_substitution(file) {
+        process_output(inner)
+    } else {
+        Feed::File
+    };
+    match script {
+        Feed::Literal(text) => collect(&text, ctx, out, depth + 1),
+        Feed::Terminal => {}
+        Feed::File => {
+            out.writes.push(Write {
+                what: what.to_string(),
+                target: WriteTarget::Unknown,
+            });
+            ctx.opaque_rest = true;
+        }
+        // The heredoc body is parsed where it appears, but not in this shell's state.
+        Feed::Heredoc(_) | Feed::Opaque => {
+            opaque(out, ctx, what);
+            ctx.opaque_rest = true;
+        }
+    }
+}
+
+/// A variable name an assignment may set that this parser cannot follow: not a literal,
+/// one that changes how git runs, or the alias table.
+fn risky_name(name: &str) -> bool {
+    is_dynamic_word(name)
+        || is_config_var(name)
+        || name == "GIT_WORK_TREE"
+        || name.contains("BASH_ALIASES")
 }
 
 fn program_name(p: &str) -> &str {
@@ -1468,13 +1611,14 @@ const SOURCE_OPTS: Opts = Opts {
     ..NO_OPTS
 };
 const SU_OPTS: Opts = Opts {
-    flags: "flmpPhV",
+    flags: "flmpPThV",
     args: "cgGsw",
     long_flags: &[
         "login",
         "preserve-environment",
         "fast",
         "pty",
+        "no-pty",
         "help",
         "version",
     ],
@@ -1490,13 +1634,14 @@ const SU_OPTS: Opts = Opts {
     ..NO_OPTS
 };
 const RUNUSER_OPTS: Opts = Opts {
-    flags: "flmpPhV",
+    flags: "flmpPThV",
     args: "cgGsuw",
     long_flags: &[
         "login",
         "preserve-environment",
         "fast",
         "pty",
+        "no-pty",
         "help",
         "version",
     ],
@@ -1565,6 +1710,16 @@ const WATCH_OPTS: Opts = Opts {
 };
 const TRAP_OPTS: Opts = Opts {
     flags: "lpP",
+    ..NO_OPTS
+};
+const READ_OPTS: Opts = Opts {
+    flags: "ers",
+    args: "adinNptu",
+    ..NO_OPTS
+};
+const MAPFILE_OPTS: Opts = Opts {
+    flags: "t",
+    args: "dnOsuCc",
     ..NO_OPTS
 };
 const ALIAS_OPTS: Opts = Opts {
@@ -3132,5 +3287,124 @@ mod tests {
         }
         assert!(seen_commit("alias g=git; g commit -m x"));
         assert!(!opaque_call("alias -p; git status"));
+    }
+
+    #[test]
+    fn watch_exec_takes_an_argv() {
+        for c in [
+            "watch -x bash -c 'git commit -m x'",
+            "watch --exec sh -c 'echo; git commit -m x'",
+            "watch -n 1 -x git commit -m x",
+            "watch 'git commit -m x'",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn eval_and_source_change_this_shell() {
+        assert_eq!(dirs("eval 'cd /x'; git commit"), vec![v(&["/x"])]);
+        assert_eq!(dirs("eval cd /x && git commit"), vec![v(&["/x"])]);
+        assert_eq!(
+            git_commits("eval 'export GIT_DIR=/x/.git'; git commit")[0]
+                .git_dir
+                .as_deref(),
+            Some("/x/.git")
+        );
+        assert_eq!(dirs("source <(echo cd /x); git commit"), vec![v(&["/x"])]);
+        assert!(seen_commit("eval 'alias g=git'; g commit -m x"));
+        for c in [
+            "eval 'BASH_ALIASES[g]=git'; g commit -m x",
+            // A sourced file can change anything about this shell.
+            "source ./env.sh; git commit -m x",
+            ". ./env.sh && git commit -m x",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        // A subshell still does not leak.
+        assert_eq!(dirs("(eval 'cd /x'); git commit"), vec![none()]);
+    }
+
+    #[test]
+    fn assignments_the_parser_cannot_follow() {
+        for c in [
+            "declare -n X=BASH_ALIASES; X[g]=git; g commit -m x",
+            "typeset -n X=BASH_ALIASES; git commit -m x",
+            "export \"$V\"=../repo/.git; git commit -m x",
+            "declare $N=x; git commit -m x",
+            "read GIT_DIR <<< x; export GIT_DIR; git commit -m x",
+            "read -r v GIT_DIR <<< 'a b'; git commit -m x",
+            "printf -v GIT_DIR x; export GIT_DIR; git commit -m x",
+            "mapfile -t GIT_DIR < f; git commit -m x",
+            "readarray PATH < f; git commit -m x",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        // Reading into an ordinary variable is fine.
+        assert!(!opaque_call("read -r line <<< x; git commit -m x"));
+    }
+
+    #[test]
+    fn function_definitions_are_not_run_where_defined() {
+        for c in [
+            "f() { export GIT_DIR=/x/.git; }; git commit -m x",
+            "function f { cd /x; }; git commit -m x",
+            "f () { cd /x; }; f; git commit -m x",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn a_lone_dash_ends_shell_options() {
+        assert!(seen_commit("echo 'git commit -m x' | bash -"));
+        assert!(seen_commit("bash -c - 'git commit -m x'"));
+        assert!(seen_commit("bash -e - <<'EOF'\ngit commit -m x\nEOF"));
+        // `bash - FILE` runs FILE, not stdin.
+        let c = "echo 'git commit -m x' | bash - x.sh";
+        assert!(!seen_commit(c), "{c}: {:?}", git_calls(c));
+        assert!(!analyze(c).writes.is_empty());
+    }
+
+    #[test]
+    fn su_with_another_shell_is_opaque() {
+        for c in [
+            "su -s /bin/zsh me -c 'git commit -m x'",
+            "su --shell=/bin/fish me -c 'git commit -m x'",
+            "su -m me -c 'git commit -m x'",
+            "su -p me -c 'git commit -m x'",
+            "su --preserve-environment me -c 'git commit -m x'",
+            "su me extra -c 'git commit -m x'",
+            "runuser -s /bin/zsh -l me -c 'git commit -m x'",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        let c = "su - me -c 'git commit -m x'";
+        assert!(seen_commit(c) && !opaque_call(c), "{c}: {:?}", git_calls(c));
+    }
+
+    #[test]
+    fn shell_state_from_exec_and_set() {
+        // `exec` with only redirections changes stdin for every later command.
+        for c in [
+            "exec < <(echo git commit -m x); bash",
+            "exec 0<script.sh; sh",
+            "exec <<< 'git commit -m x'; bash",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(!opaque_call("exec 2>/dev/null; git status"));
+        // `set -a` exports every later assignment.
+        for c in [
+            "set -a; GIT_DIR=r/.git; git commit",
+            "set -ea; GIT_DIR=r/.git; git commit",
+            "set -o allexport; GIT_DIR=r/.git; git commit",
+        ] {
+            assert_eq!(git_commits(c)[0].git_dir.as_deref(), Some("r/.git"), "{c}");
+        }
+        assert_eq!(
+            git_commits("set -a; set +a; GIT_DIR=r/.git; git commit")[0].git_dir,
+            None
+        );
     }
 }
