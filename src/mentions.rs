@@ -8,6 +8,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use regex::Regex;
 use serde::Serialize;
 
+use crate::parse::RangeSet;
 use crate::vault::{Note, Target, Vault};
 
 /// Bare URLs and autolinks: a name inside a URL (`github.com/<user>/<repo>`) is not prose.
@@ -25,12 +26,27 @@ pub struct Mention {
     pub target: String,
     pub count: usize,
     pub context: String,
+    /// Byte offset of the first match in the note text.
+    #[serde(skip)]
+    pub start: usize,
+    /// The inline code span holding the first match (a domain or path alias written as
+    /// `` `example.com` ``): a link must replace the whole span, backticks included.
+    #[serde(skip)]
+    pub code_span: Option<Range<usize>>,
+}
+
+/// A term that reads as a domain or path (`example.com`, `infra/dns`): such names are often
+/// written in inline code, and are matched there too.
+fn is_pathlike(term: &str) -> bool {
+    (term.contains('.') || term.contains('/')) && !term.chars().any(char::is_whitespace)
 }
 
 struct Terms {
     ac: AhoCorasick,
     /// pattern index -> notes that use it as their name or an alias
     owners: Vec<Vec<usize>>,
+    /// pattern index -> the term reads as a domain or path ([`is_pathlike`])
+    pathlike: Vec<bool>,
 }
 
 /// Lowercased text plus, for each byte of it, the byte offset of the original char.
@@ -101,7 +117,12 @@ fn build_terms(vault: &Vault) -> Option<Terms> {
         .match_kind(MatchKind::LeftmostLongest)
         .build(&patterns)
         .expect("valid patterns");
-    Some(Terms { ac, owners })
+    let pathlike = patterns.iter().map(|p| is_pathlike(p)).collect();
+    Some(Terms {
+        ac,
+        owners,
+        pathlike,
+    })
 }
 
 /// Letters, digits, `_`, and combining marks (so `café` written as `cafe` + U+0301 is one word).
@@ -128,20 +149,39 @@ pub(crate) fn is_unspaced(c: char) -> bool {
         | 0x20000..=0x2FA1F) // CJK extensions B-F, compatibility supplement
 }
 
-pub(crate) fn inside(ranges: &[Range<usize>], r: &Range<usize>) -> bool {
-    ranges.iter().any(|x| r.start < x.end && x.start < r.end)
-}
-
 /// Find unlinked mentions in the selected notes (`None` = every note).
 #[must_use]
 pub fn find(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Mention> {
-    let Some(terms) = build_terms(vault) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for (i, note) in vault.notes.iter().enumerate() {
-        if selected.is_some_and(|s| !s.contains(&note.id)) || vault.config.is_hub(&note.id) {
-            continue;
+    let matcher = Matcher::new(vault);
+    (0..vault.notes.len())
+        .filter(|&i| selected.is_none_or(|s| s.contains(&vault.notes[i].id)))
+        .flat_map(|i| matcher.in_note(vault, i))
+        .collect()
+}
+
+/// Every note's name and aliases, ready to match: build once, then look in many notes.
+pub struct Matcher {
+    terms: Option<Terms>,
+}
+
+impl Matcher {
+    #[must_use]
+    pub fn new(vault: &Vault) -> Self {
+        Self {
+            terms: build_terms(vault),
+        }
+    }
+
+    /// Unlinked mentions in note `i` (none in a hub).
+    #[must_use]
+    pub fn in_note(&self, vault: &Vault, i: usize) -> Vec<Mention> {
+        let mut out = Vec::new();
+        let Some(terms) = &self.terms else {
+            return out;
+        };
+        let note = &vault.notes[i];
+        if vault.config.is_hub(&note.id) {
+            return out;
         }
         let linked: BTreeSet<usize> = vault
             .resolve_links(note)
@@ -158,23 +198,62 @@ pub fn find(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Mention> 
         skip.extend(p.html_links.iter().map(|l| l.span.clone()));
         skip.extend(p.non_prose.iter().cloned());
         skip.extend(URL.find_iter(&note.text).map(|m| m.range()));
+        // The same without inline code spans: a domain or path alias may sit in one.
+        let inline: BTreeSet<(usize, usize)> =
+            p.inline_code.iter().map(|r| (r.start, r.end)).collect();
+        let skip_but_inline = RangeSet::new(
+            skip.iter()
+                .filter(|r| !inline.contains(&(r.start, r.end)))
+                .cloned(),
+        );
+        let skip = RangeSet::new(skip);
 
         let body_start = p.body_start;
         let folded = fold(&note.text[body_start..]);
-        // target -> (first match start, term, count)
-        let mut hits: BTreeMap<usize, (usize, String, usize)> = BTreeMap::new();
+        // target -> its mention (first match, count)
+        let mut hits: BTreeMap<usize, Mention> = BTreeMap::new();
         for m in terms.ac.find_iter(&folded.text) {
             let abs = body_start + folded.orig[m.start()]..body_start + folded.orig[m.end()];
-            if abs.is_empty() || inside(&skip, &abs) {
+            if abs.is_empty() {
                 continue;
             }
             let matched = &note.text[abs.clone()];
+            let mut code_span = None;
+            if skip.overlaps(&abs) {
+                // `example.com` alone in a code span names the note; other code does not.
+                let span = terms.pathlike[m.pattern().as_usize()]
+                    .then(|| {
+                        let k = p.inline_code.partition_point(|r| r.end <= abs.start);
+                        p.inline_code.get(k).filter(|r| {
+                            r.start <= abs.start
+                                && abs.end <= r.end
+                                && note.text[(*r).clone()].trim_matches('`').trim() == matched
+                        })
+                    })
+                    .flatten();
+                match span {
+                    Some(r) if !skip_but_inline.overlaps(&abs) => code_span = Some(r.clone()),
+                    _ => continue,
+                }
+            }
             let first = matched.chars().next().expect("non-empty");
             let last = matched.chars().next_back().expect("non-empty");
             let before = note.text[..abs.start].chars().next_back();
             let after = note.text[abs.end..].chars().next();
             if (!is_unspaced(first) && before.is_some_and(is_word_char))
                 || (!is_unspaced(last) && after.is_some_and(is_word_char))
+            {
+                continue;
+            }
+            // `vectorpoint.io` inside `canvas.vectorpoint.io` or `vectorpoint.io.example`
+            // is part of another name.
+            if terms.pathlike[m.pattern().as_usize()]
+                && (before.is_some_and(|c| matches!(c, '.' | '-' | '/'))
+                    || (after == Some('.')
+                        && note.text[abs.end + 1..]
+                            .chars()
+                            .next()
+                            .is_some_and(is_word_char)))
             {
                 continue;
             }
@@ -185,29 +264,29 @@ pub fn find(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Mention> 
                 if target == i || linked.contains(&target) {
                     continue;
                 }
-                hits.entry(target).and_modify(|h| h.2 += 1).or_insert((
-                    abs.start,
-                    matched.to_string(),
-                    1,
-                ));
+                hits.entry(target)
+                    .and_modify(|h| h.count += 1)
+                    .or_insert_with(|| {
+                        let mut context: String = note.line_text(abs.start).to_string();
+                        if context.chars().count() > 160 {
+                            context = context.chars().take(157).collect::<String>() + "...";
+                        }
+                        Mention {
+                            note: note.id.clone(),
+                            target: vault.notes[target].id.clone(),
+                            term: matched.to_string(),
+                            line: note.line_of(abs.start),
+                            count: 1,
+                            context,
+                            start: abs.start,
+                            code_span: code_span.clone(),
+                        }
+                    });
             }
         }
-        for (target, (start, term, count)) in hits {
-            let mut context: String = note.line_text(start).to_string();
-            if context.chars().count() > 160 {
-                context = context.chars().take(157).collect::<String>() + "...";
-            }
-            out.push(Mention {
-                note: note.id.clone(),
-                target: vault.notes[target].id.clone(),
-                term,
-                line: note.line_of(start),
-                count,
-                context,
-            });
-        }
+        out.extend(hits.into_values());
+        out
     }
-    out
 }
 
 #[cfg(test)]

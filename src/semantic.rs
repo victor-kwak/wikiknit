@@ -28,6 +28,17 @@ pub struct Update {
     pub total_chunks: usize,
 }
 
+/// Chunks embedded and saved together (whole notes; a note larger than this is one slice).
+const SLICE_CHUNKS: usize = 512;
+
+/// Notes to embed together: their ids, chunks, and each chunk's note (index into `ids`).
+#[derive(Default)]
+struct Slice {
+    ids: Vec<String>,
+    chunks: Vec<chunk::Chunk>,
+    owners: Vec<usize>,
+}
+
 pub struct Semantic {
     pub embedder: Embedder,
     pub index: Index,
@@ -111,6 +122,48 @@ impl Semantic {
         Ok(())
     }
 
+    /// Embed one slice of notes and save it merged; returns (notes, chunks) embedded.
+    fn embed_slice(
+        &mut self,
+        slice: Slice,
+        hashes: &BTreeMap<String, String>,
+    ) -> Result<(usize, usize), Error> {
+        let Slice {
+            ids,
+            chunks,
+            owners,
+        } = slice;
+        if chunks.is_empty() {
+            return Ok((ids.len(), 0));
+        }
+        // Embed in length order: a batch pads to its longest text, so similar lengths
+        // together waste far less work. Then put the vectors back in chunk order.
+        let mut order: Vec<usize> = (0..chunks.len()).collect();
+        order.sort_by_key(|&k| chunks[k].text.len());
+        let texts: Vec<String> = order.iter().map(|&k| chunks[k].text.clone()).collect();
+        let sorted = self.embedder.embed_passages(&texts)?;
+        let mut vecs: Vec<Vec<f32>> = vec![Vec::new(); chunks.len()];
+        for (v, &k) in sorted.into_iter().zip(&order) {
+            vecs[k] = v;
+        }
+        let mut per_note: BTreeMap<usize, NoteVectors> = BTreeMap::new();
+        for ((owner, c), v) in owners.iter().zip(&chunks).zip(vecs) {
+            let e = per_note.entry(*owner).or_insert_with(|| NoteVectors {
+                hash: hashes[&ids[*owner]].clone(),
+                lines: Vec::new(),
+                vectors: Vec::new(),
+            });
+            e.lines.push(c.line);
+            e.vectors.push(v);
+        }
+        let ours: BTreeMap<String, NoteVectors> = per_note
+            .into_iter()
+            .map(|(owner, nv)| (ids[owner].clone(), nv))
+            .collect();
+        self.save_merged(ours, hashes)?;
+        Ok((ids.len(), chunks.len()))
+    }
+
     /// Embed notes that changed since they were indexed, at most `budget` chunks (whole notes
     /// only; `None` = no limit), drop deleted notes, and save.
     pub fn update(&mut self, vault: &Vault, budget: Option<usize>) -> Result<Update, Error> {
@@ -123,60 +176,44 @@ impl Semantic {
             .map(str::to_string)
             .collect();
         let generic = &vault.config.generic_names;
-        let mut batch_ids = Vec::new();
-        let mut batch_chunks: Vec<chunk::Chunk> = Vec::new();
-        let mut owners: Vec<usize> = Vec::new();
+        // Embed and save in slices of whole notes: memory stays bounded on a large vault, and
+        // an interrupted `embed` keeps every slice saved so far.
+        let mut slice = Slice::default();
+        let (mut embedded, mut chunks_done) = (0usize, 0usize);
         for id in &stale {
             let Some(note) = vault.get(id) else { continue };
             let chunks = chunk::chunks(note, generic);
-            if budget.is_some_and(|b| batch_chunks.len() + chunks.len() > b) {
-                if batch_ids.is_empty() && budget.is_some_and(|b| chunks.len() > b) {
+            let used = chunks_done + slice.chunks.len();
+            if budget.is_some_and(|b| used + chunks.len() > b) {
+                if used == 0 && budget.is_some_and(|b| chunks.len() > b) {
                     continue; // one note larger than the whole budget: leave it for `embed`
                 }
                 break;
             }
-            owners.extend(std::iter::repeat_n(batch_ids.len(), chunks.len()));
-            batch_ids.push(id.clone());
-            batch_chunks.extend(chunks);
+            if !slice.chunks.is_empty() && slice.chunks.len() + chunks.len() > SLICE_CHUNKS {
+                let (n, c) = self.embed_slice(std::mem::take(&mut slice), &hashes)?;
+                embedded += n;
+                chunks_done += c;
+            }
+            slice
+                .owners
+                .extend(std::iter::repeat_n(slice.ids.len(), chunks.len()));
+            slice.ids.push(id.clone());
+            slice.chunks.extend(chunks);
         }
-        if !batch_chunks.is_empty() {
-            // Embed in length order: a batch pads to its longest text, so similar lengths
-            // together waste far less work. Then put the vectors back in chunk order.
-            let mut order: Vec<usize> = (0..batch_chunks.len()).collect();
-            order.sort_by_key(|&k| batch_chunks[k].text.len());
-            let texts: Vec<String> = order
-                .iter()
-                .map(|&k| batch_chunks[k].text.clone())
-                .collect();
-            let sorted = self.embedder.embed_passages(&texts)?;
-            let mut vecs: Vec<Vec<f32>> = vec![Vec::new(); batch_chunks.len()];
-            for (v, &k) in sorted.into_iter().zip(&order) {
-                vecs[k] = v;
-            }
-            let mut per_note: BTreeMap<usize, NoteVectors> = BTreeMap::new();
-            for ((owner, c), v) in owners.iter().zip(&batch_chunks).zip(vecs) {
-                let e = per_note.entry(*owner).or_insert_with(|| NoteVectors {
-                    hash: hashes[&batch_ids[*owner]].clone(),
-                    lines: Vec::new(),
-                    vectors: Vec::new(),
-                });
-                e.lines.push(c.line);
-                e.vectors.push(v);
-            }
-            let ours: BTreeMap<String, NoteVectors> = per_note
-                .into_iter()
-                .map(|(owner, nv)| (batch_ids[owner].clone(), nv))
-                .collect();
-            self.save_merged(ours, &hashes)?;
-        } else if removed > 0 {
+        if !slice.ids.is_empty() {
+            let (n, c) = self.embed_slice(slice, &hashes)?;
+            embedded += n;
+            chunks_done += c;
+        } else if embedded == 0 && removed > 0 {
             self.save_merged(BTreeMap::new(), &hashes)?;
         }
         Ok(Update {
             model: self.embedder.name.clone(),
-            embedded: batch_ids.len(),
-            chunks: batch_chunks.len(),
+            embedded,
+            chunks: chunks_done,
             removed,
-            stale: stale.len() - batch_ids.len(),
+            stale: stale.len() - embedded,
             total_notes: self.index.notes.len(),
             total_chunks: self.index.notes.values().map(|n| n.vectors.len()).sum(),
         })

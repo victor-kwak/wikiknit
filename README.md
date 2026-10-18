@@ -64,7 +64,8 @@ Filters (`search`, `links`, `catalog`): `--type`, `--path <prefix>`, `--where ke
 case-insensitive and matching anywhere in the value, so anchor with `^...$` for an exact value; lists match
 any element), `--tag` (frontmatter `tags` and inline `#tags`; a tag also matches its nested tags),
 `--linked-to <note>`. Repeat a flag to accept any of its values. A note can be named by its id, path,
-link target, name, alias, or folder (`Projects/x` for `Projects/x/overview`).
+link target, name, alias, or folder (`Projects/x` for `Projects/x/overview`), in every command that
+takes notes (`check`, `mentions`, and `mark` too).
 
 `links` rows give `dir` (`out`, `in`, `both`), `depth`, the note, `via` (the note one hop closer to the
 start), `source`/`line`/`context` (where the link is written, and the text around it), and for `both`
@@ -88,7 +89,8 @@ wrapped in `<note id=... role=... content=... lines=... score=... tokens=...>` t
 after a `# context budget=... used=...` header; notes left out are listed in `<omitted>`.
 
 wikiknit looks for `wikiknit.toml` in the current directory and its parents. `--vault <dir>` uses
-the `wikiknit.toml` in or above that folder that names it as its vault, else defaults.
+the `wikiknit.toml` in or above that folder that names it as its vault, else defaults; a broken
+`wikiknit.toml` in the vault folder itself is an error, not a silent fallback to defaults.
 
 ## Configure
 
@@ -99,6 +101,7 @@ vault = "notes"                 # vault folder: a relative path inside this file
 link_style = "full-path"        # or "shortest" (Obsidian's default; resolution is best-effort)
 ignore = ["Templates/"]         # folders not checked (links to notes there still resolve)
 hubs = ["INDEX"]                # index notes: not mention targets, left out of graph components
+                                # (note ids; `./INDEX.md` works too)
 alias_only = ["Systems/"]       # notes named with common words: found in prose by aliases only
 min_alias_len = 4               # shorter names and aliases are not matched as mentions
 generic_names = ["overview", "index", "readme"]  # stems that take their folder's name
@@ -150,7 +153,7 @@ link-in-code = "warn"
 | `ambiguous-link` | warn | A short link several notes match |
 | `frontmatter-invalid` | error | Frontmatter that is not valid YAML |
 | `frontmatter-unquoted-link` | error | `key: [[x]]` or `- [[x]]` in YAML (a nested list, not a link); quote it |
-| `link-in-code` | warn | `[[x]]` naming a note or file inside a code span or block (not a link); other `[[...]]` in code, such as a TOML `[[table]]`, is left alone |
+| `link-in-code` | warn | `[[x]]` naming a note or file inside a code span or block, or `$math$` (not a link); other `[[...]]` in code, such as a TOML `[[table]]`, is left alone |
 | `no-outbound-links` | error | A note (not a hub) that links to no other note |
 | `missing-required-link` | error | A note matching a `[[require_link]]` rule without that link |
 | `missing-required-inbound` | error | A note matching a `[[require_inbound]]` rule that its `from` note does not link; the fix is the edit in the `from` note, next to its links to similar notes. Checked when either note is selected; with only the `from` note selected, the finding is on it |
@@ -159,6 +162,7 @@ link-in-code = "warn"
 | `duplicate-alias` | error | An alias another note also uses as its name or alias |
 | `link-in-html` | warn | `[[x]]` inside raw HTML (not rendered as a link) |
 | `file-not-utf8` | warn | A note that is not valid UTF-8 (read with replacement characters) |
+| `duplicate-note-id` | warn | Two files with one note id (`a.md` and `a.MD`); the exact `.md` file is the note, the other resolves as a file |
 
 ### How links resolve
 
@@ -187,7 +191,9 @@ unless `--include-hubs`. Each hit shows the fields it matched and its best line.
 
 `wikiknit embed` splits each note into chunks (by section, then paragraph, about 175 tokens each,
 each prefixed with the note title and heading path) and embeds them with a local model. The index
-lives in the state directory, keyed by note content hash: later runs embed only changed notes, and
+lives in the state directory, keyed by note content hash: later runs embed only changed notes. `embed`
+works in slices of about 512 chunks (whole notes) and saves after each, so memory stays bounded on a
+large vault (about 1.6 GB, the ONNX Runtime arena) and an interrupted run keeps what it finished.
 `search` itself embeds up to 64 changed or new chunks before answering (a few seconds at most), so a
 few new notes do not need `embed`.
 
@@ -230,14 +236,23 @@ both vaults.
 - rare frontmatter values both notes have (`stack: cloudflare`, tags).
 
 Scores are absolute, so they compare across notes: one strong signal (a mention, a link here) scores
-2-3, a weak text match alone under 0.5; `--min-score` (default 0.75) leaves out the weak ones. Template
-headings shared by many notes and single shared neighbors do not count as similarity. Notes under
-`no_backlink_from` (logs, like session notes) linking here do not ask for a link back.
+2-3, a weak text match alone under 0.5; `--min-score` (default 0.75) leaves out the weak ones. A
+candidate needs a strong signal (a mention, a link either way, or note similarity of 0.85 or more) or
+two weak ones (similar text, similar meaning, shared neighbors, shared values): one weak signal alone
+is often chance. A shared frontmatter value counts by its rarity: a value only the two notes have
+counts fully, one that 6 of 70 notes have about half. Template headings shared by many notes and
+single shared neighbors do not count as similarity. Notes under `no_backlink_from` (logs, like session
+notes) linking here do not ask for a link back. Every row lists its reasons.
 
 Each row has the file to edit, the action (`mention`, `link`, `backlink`), the reasons, and the edit:
 where it goes (`link_section`, `## Related` by default, or `frontmatter:related` for a frontmatter list)
-and the link text in the vault's `link_style`. wikiknit never applies edits; an agent decides which
-suggestions are right and makes them.
+and the link text in the vault's `link_style`. Without the heading, a note that already lists links in
+a frontmatter key named like it (`related:` for `## Related`) gets the link there. The edits for one
+note apply in output order: the first creates a missing section or key (`append after line 12: ...`,
+the last line), the others add to it (`insert after line 15 (the `- [[a]]` line under ## Related): ...`),
+with line numbers that count the earlier edits. A mention edit names a column when the text also
+occurs earlier on the line, and replaces a name written as inline code backticks and all. wikiknit
+never applies edits; an agent decides which suggestions are right and makes them.
 
 ### Context
 
@@ -291,8 +306,9 @@ One row per note, with one frontmatter edit that adds all its terms (separate ed
 its evidence, including how many notes use it without a link: they become `mentions` once the alias
 is added. In text output, `terms` and `notes` are `;`-separated, and `reasons` is
 `term: reason, reason` per term with ` | ` between terms. The edit keeps the YAML valid (a trailing
-comment stays; a scalar alias is quoted whole; a block scalar gets an instruction, not an edit). A
-term goes to one note only.
+comment stays; a scalar alias is quoted whole; `aliases: ~` or `null` counts as no alias; a value
+written over several lines, such as a flow list `[a,` / `b]` or a block scalar, is replaced whole
+and the edit names its lines: `lines 2-3: replace with: ...`). A term goes to one note only.
 
 ### Mentions
 
@@ -300,7 +316,13 @@ term goes to one note only.
 `overview`) and its `aliases:` against the text of other notes. Matching ignores case in any
 script by lowercasing (`Émile` matches `émile`; it is not full case folding, so `STRASSE` does not
 match `straße`), needs word boundaries except in scripts written without spaces
-(Chinese, Japanese, Korean, Thai), and skips frontmatter, code, links, URLs, and raw HTML.
+(Chinese, Japanese, Korean, Thai), and skips frontmatter, code, math, links, URLs, and raw HTML. An
+alias that reads as a domain or path (`example.com`, no spaces) is also found as the whole text of an
+inline code span (`` `example.com` ``), where such names are often written; not inside longer code or a
+longer domain (`www.example.com.au`).
+
+Links: `$math$` and `$$math$$` are not links (as code). `%% comments %%` are: Obsidian counts links in
+comments for backlinks and the graph.
 
 ## AI agents: keep links complete as notes change
 
@@ -320,7 +342,9 @@ A note *needs a link pass* when its content differs from its content at its last
 is per vault, so a pass in one session counts for every session. Each session also records the vault
 as it was when it started, so it is asked only about notes that changed while it ran. Without
 `--session` and `$WIKIKNIT_SESSION`, wikiknit uses the one session active in the last 12 hours, and
-refuses to guess when there are several.
+refuses to guess when there are several. A session with no record yet (the hooks never saw it start,
+or a mistyped id) is started on the spot with every pending note counted as its own, and a warning
+on stderr says so: an empty list then does not mean the session changed nothing.
 
 State lives in `$XDG_STATE_HOME/wikiknit/` (or `~/.local/state/wikiknit/`), not in the vault, so it
 works with or without git.

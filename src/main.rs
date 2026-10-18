@@ -474,11 +474,15 @@ fn load_config(cli: &Cli) -> Result<Config> {
         // A wikiknit.toml in the vault, or above it naming this vault.
         for dir in root.ancestors() {
             let file = dir.join(CONFIG_FILE);
-            if file.is_file()
-                && let Ok(cfg) = Config::load(&file)
-                && cfg.vault == root
-            {
-                return Ok(cfg);
+            if !file.is_file() {
+                continue;
+            }
+            match Config::load(&file) {
+                Ok(cfg) if cfg.vault == root => return Ok(cfg),
+                Ok(_) => {}
+                // The vault's own config is broken: its rules must not silently fall away.
+                Err(e) if dir == root => return Err(e.into()),
+                Err(e) => eprintln!("wikiknit: ignoring {}: {e}", file.display()),
             }
         }
         return Ok(Config::for_vault(root));
@@ -505,8 +509,16 @@ fn session_changed(vault: &Vault, flag: Option<&str>) -> Result<(Store, String, 
     let now = state::current_hashes(vault);
     // A session the hooks never saw start (plugin added mid-session): start it the way the
     // hooks do, with pending notes counted as its own.
-    let s = store.start_session(&session, &now, true)?;
+    let (s, created) = store.open_session(&session, &now, true)?;
     let changed = store.changed(&s, &now)?;
+    if created {
+        // An empty list here must not read as "nothing changed": the session was unknown.
+        eprintln!(
+            "wikiknit: session {session} had no record (hooks not run, or a mistyped id?); \
+             started it now, counting the {} note(s) pending from any session as its changes",
+            changed.len()
+        );
+    }
     Ok((store, session, changed))
 }
 
@@ -525,13 +537,11 @@ fn ids_for(vault: &Vault, paths: &[String]) -> Result<BTreeSet<String>> {
     paths
         .iter()
         .map(|p| {
-            vault.id_for_arg(p, &cwd).with_context(|| {
-                if vault.is_ignored_arg(p, &cwd) {
-                    format!("`{p}` is in a folder the config ignores")
-                } else {
-                    format!("`{p}` is not a note in the vault")
-                }
-            })
+            if vault.id_for_arg(p, &cwd).is_none() && vault.is_ignored_arg(p, &cwd) {
+                bail!("`{p}` is in a folder the config ignores");
+            }
+            // The same note references as `links` and `suggest`: id, path, name, alias.
+            Ok(vault.notes[vault.find_note(p)?].id.clone())
         })
         .collect()
 }
@@ -941,16 +951,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 vec![vault.find_note(note.as_deref().expect("required by clap"))?]
             };
             let index = semantic_index(&vault)?;
-            let mut all = Vec::new();
-            for start in starts {
-                all.extend(wikiknit::suggest::suggest(
-                    &vault,
-                    start,
-                    index.as_ref(),
-                    *limit,
-                    *min_score,
-                ));
-            }
+            // Vault-wide structures once, then every note (in parallel, order kept).
+            let all = wikiknit::suggest::Suggester::new(&vault, index.as_ref())
+                .suggest_many(&starts, *limit, *min_score);
             emit(
                 fmt,
                 "suggest",

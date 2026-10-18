@@ -98,6 +98,37 @@ impl Frontmatter {
     }
 }
 
+/// Byte ranges, sorted and merged once, so an overlap test is a binary search (a note with
+/// many links and many tags or mentions stays linear-ish, not quadratic).
+#[derive(Debug, Clone, Default)]
+pub struct RangeSet {
+    /// Disjoint, sorted by start (and so by end).
+    ranges: Vec<Range<usize>>,
+}
+
+impl RangeSet {
+    #[must_use]
+    pub fn new(ranges: impl IntoIterator<Item = Range<usize>>) -> Self {
+        let mut all: Vec<Range<usize>> = ranges.into_iter().filter(|r| !r.is_empty()).collect();
+        all.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(all.len());
+        for r in all {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        Self { ranges: merged }
+    }
+
+    /// `r` overlaps one of the ranges (an empty `r` overlaps a range strictly around it).
+    #[must_use]
+    pub fn overlaps(&self, r: &Range<usize>) -> bool {
+        let i = self.ranges.partition_point(|x| x.end <= r.start);
+        self.ranges.get(i).is_some_and(|x| x.start < r.end)
+    }
+}
+
 /// Everything wikiknit needs from one note's text.
 #[derive(Debug, Clone, Default)]
 pub struct Parsed {
@@ -107,8 +138,11 @@ pub struct Parsed {
     pub links: Vec<RawLink>,
     /// Wikilinks found inside code spans or blocks (Obsidian ignores these).
     pub code_links: Vec<RawLink>,
-    /// Byte ranges of code spans and blocks.
+    /// Byte ranges of code spans and blocks, and of `$math$` / `$$math$$` (Obsidian does not
+    /// index links there either).
     pub code: Vec<Range<usize>>,
+    /// Byte ranges of inline code spans only (`` `x` ``), in order; also in `code`.
+    pub inline_code: Vec<Range<usize>>,
     /// Wikilinks inside raw HTML (not rendered as links).
     pub html_links: Vec<RawLink>,
     /// Byte ranges that are not prose for mention matching: raw HTML and external links.
@@ -177,6 +211,64 @@ fn split_frontmatter(text: &str) -> (Option<Range<usize>>, usize) {
     (None, 0)
 }
 
+/// Byte offset where a YAML line's `# comment` starts (the line length if none). A `#`
+/// starts a comment at the line start or after whitespace, outside quotes; a quote opens a
+/// quoted scalar only where a scalar can start (`it's` is plain text).
+#[must_use]
+pub fn yaml_comment_start(line: &str) -> usize {
+    let mut quote: Option<char> = None;
+    let mut prev = ' ';
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if (c == '"' || c == '\'')
+                && (prev.is_whitespace() || matches!(prev, '[' | '{' | ',' | ':' | '-')) =>
+            {
+                quote = Some(c);
+            }
+            None if c == '#' && prev.is_whitespace() => return i,
+            None => {}
+        }
+        prev = c;
+    }
+    line.len()
+}
+
+/// Byte offset in `src` of `needle` at or after `from`, outside `# comments`.
+fn find_outside_comments(src: &str, from: usize, needle: &str) -> Option<usize> {
+    let mut line_start = src[..from].rfind('\n').map_or(0, |i| i + 1);
+    while line_start < src.len() {
+        let end = src[line_start..]
+            .find('\n')
+            .map_or(src.len(), |i| line_start + i);
+        let line = &src[line_start..end];
+        let code_end = line_start + yaml_comment_start(line);
+        let begin = from.max(line_start);
+        if begin < code_end
+            && let Some(i) = src[begin..code_end].find(needle)
+        {
+            return Some(begin + i);
+        }
+        line_start = end + 1;
+    }
+    None
+}
+
+/// Byte offset of the line `key:` (top level) in the YAML source.
+fn yaml_key_offset(src: &str, key: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in src.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix(key)
+            && rest.trim_start_matches([' ', '\t']).starts_with(':')
+        {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
 fn collect_frontmatter_links(v: &Value, text: &str, yaml: &Range<usize>, out: &mut Parsed) {
     let Value::Object(map) = v else { return };
     let src = &text[yaml.clone()];
@@ -186,11 +278,17 @@ fn collect_frontmatter_links(v: &Value, text: &str, yaml: &Range<usize>, out: &m
         }
         let mut strings = Vec::new();
         string_leaves(val, &mut strings);
+        // Search from the key's line, past each link found, outside comments: the line is
+        // where the value is written, not the first textual occurrence anywhere.
+        let mut cursor = yaml_key_offset(src, key).unwrap_or(0);
         for s in strings {
             for m in WIKILINK.captures_iter(s) {
                 let whole = m.get(0).expect("match").as_str();
                 // Locate the text in the YAML for a line number; fall back to the block start.
-                let span = src.find(whole).map_or(yaml.start..yaml.start, |i| {
+                let found = find_outside_comments(src, cursor, whole)
+                    .or_else(|| find_outside_comments(src, 0, whole));
+                let span = found.map_or(yaml.start..yaml.start, |i| {
+                    cursor = i + whole.len();
                     yaml.start + i..yaml.start + i + whole.len()
                 });
                 let kind = if &m[1] == "!" {
@@ -240,18 +338,18 @@ pub fn normalize_tag(raw: &str) -> Option<String> {
 
 fn collect_inline_tags(text: &str, body_start: usize, out: &mut Parsed) {
     let body = &text[body_start..];
-    let inside = |r: &Range<usize>| {
+    let skip = RangeSet::new(
         out.code
             .iter()
             .chain(out.non_prose.iter())
             .chain(out.links.iter().map(|l| &l.span))
-            .any(|x| r.start < x.end && x.start < r.end)
-    };
+            .cloned(),
+    );
     let mut tags = Vec::new();
     for m in TAG.captures_iter(body) {
         let g = m.get(1).expect("group");
         let abs = body_start + g.start()..body_start + g.end();
-        if inside(&abs) {
+        if skip.overlaps(&abs) {
             continue;
         }
         if let Some(t) = normalize_tag(g.as_str()) {
@@ -316,6 +414,8 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    // `$...$` and `$$...$$` are math in Obsidian: LaTeX like `\text{[[x]]}` is not a link.
+    opts.insert(Options::ENABLE_MATH);
     let mut code_block: Option<usize> = None;
     let mut html: Vec<Range<usize>> = Vec::new();
     for (ev, range) in Parser::new_ext(body, opts).into_offset_iter() {
@@ -327,7 +427,11 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
                     out.code.push(start..abs.end);
                 }
             }
-            Event::Code(_) => out.code.push(abs),
+            Event::Code(_) => {
+                out.inline_code.push(abs.clone());
+                out.code.push(abs);
+            }
+            Event::InlineMath(_) | Event::DisplayMath(_) => out.code.push(abs),
             Event::Html(_) | Event::InlineHtml(_) => html.push(abs),
             Event::Start(Tag::Link {
                 link_type,
@@ -478,6 +582,22 @@ mod tests {
         assert_eq!(p.tags, vec!["todo", "area/ops"]);
         let s = parse("---\ntags: a, b c\n---\n");
         assert_eq!(s.frontmatter.tags(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn range_set_matches_the_linear_overlap_test() {
+        let ranges = vec![5..9, 0..2, 8..12, 20..21, 30..30];
+        let set = RangeSet::new(ranges.clone());
+        for start in 0..25 {
+            for end in start..26 {
+                let r = start..end;
+                let linear = ranges
+                    .iter()
+                    .filter(|x| !x.is_empty())
+                    .any(|x| r.start < x.end && x.start < r.end);
+                assert_eq!(set.overlaps(&r), linear, "{r:?}");
+            }
+        }
     }
 
     #[test]

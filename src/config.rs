@@ -267,7 +267,11 @@ impl Config {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
-        let base = path.parent().unwrap_or(Path::new("."));
+        // `wikiknit.toml` (a bare name) has the parent "": that is the current directory.
+        let base = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         // The vault must be named inside the config's folder (a relative path that does not
         // climb out): a cloned repo's config must not point the hooks at `/` or the home
         // directory. The check is on the path as written, so a vault folder that is itself a
@@ -378,23 +382,15 @@ impl Config {
             vault,
             source: Some(path.to_path_buf()),
             link_style: raw.link_style,
-            ignore: raw
-                .ignore
-                .into_iter()
-                .map(|p| p.trim_start_matches("./").to_string())
-                .collect(),
-            hubs: raw.hubs,
+            ignore: raw.ignore.into_iter().map(|p| prefix_ref(&p)).collect(),
+            hubs: raw.hubs.iter().map(|h| note_ref(h)).collect(),
             min_alias_len: raw.min_alias_len,
             generic_names: raw
                 .generic_names
                 .into_iter()
                 .map(|s| s.to_lowercase())
                 .collect(),
-            alias_only: raw
-                .alias_only
-                .into_iter()
-                .map(|p| p.trim_start_matches("./").to_string())
-                .collect(),
+            alias_only: raw.alias_only.into_iter().map(|p| prefix_ref(&p)).collect(),
             stemmer,
             embedding_model: raw.embedding_model,
             link_section: raw.link_section,
@@ -403,14 +399,14 @@ impl Config {
             no_backlink_from: raw
                 .no_backlink_from
                 .into_iter()
-                .map(|p| p.trim_start_matches("./").to_string())
+                .map(|p| prefix_ref(&p))
                 .collect(),
             require_link,
             require_inbound,
             orphan_exempt: raw
                 .orphan_exempt
                 .into_iter()
-                .map(|p| p.trim_start_matches("./").to_string())
+                .map(|p| prefix_ref(&p))
                 .collect(),
             stale,
             severity: raw.severity,
@@ -476,6 +472,14 @@ impl Config {
 fn note_ref(s: &str) -> String {
     let s = s.trim().trim_start_matches("./").trim_start_matches('/');
     s.strip_suffix(".md").unwrap_or(s).to_string()
+}
+
+/// A folder or path prefix as written (`./Sessions/`, `/Templates`) -> vault-relative form.
+fn prefix_ref(s: &str) -> String {
+    s.trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
 }
 
 /// `path` equals one of the prefixes or sits under it.

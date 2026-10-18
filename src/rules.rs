@@ -25,6 +25,7 @@ pub const RULES: &[(&str, Severity)] = &[
     ("stale", Severity::Warn),
     ("duplicate-alias", Severity::Error),
     ("file-not-utf8", Severity::Warn),
+    ("duplicate-note-id", Severity::Warn),
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,16 +286,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             );
         }
         for key in &p.unquoted_frontmatter_links {
-            let line = p
-                .frontmatter
-                .yaml
-                .as_ref()
-                .and_then(|r| {
-                    note.text[r.clone()]
-                        .find(&format!("{key}:"))
-                        .map(|i| note.line_of(r.start + i))
-                })
-                .unwrap_or(2);
+            let line = frontmatter_line(note, key);
             let targets = unquoted_targets(p.frontmatter.value.as_ref().and_then(|v| v.get(key)));
             let fix = if targets.is_empty() {
                 format!("{key}: [\"[[target]]\"]")
@@ -327,7 +319,10 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 "link-in-code",
                 &note.id,
                 note.line_of(l.span.start),
-                format!("[[{}]] is inside code, so it is not a link", l.target),
+                format!(
+                    "[[{}]] is inside code or math, so it is not a link",
+                    l.target
+                ),
                 "move it out of the code span if it should be a link".into(),
             );
         }
@@ -366,7 +361,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                     let fix = match closest.get(&r.raw.target, &note.id) {
                         None => format!(
                             "too many broken links for hints; `wikiknit check {}` gives them",
-                            note.id
+                            shell_word(&note.id)
                         ),
                         Some(near) if near.is_empty() => {
                             "create the note, or remove the link".to_string()
@@ -455,7 +450,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                     } else {
                         "it links them"
                     },
-                    note.id
+                    shell_word(&note.id)
                 )
             };
             sink.push_fix("orphan", &note.id, 1, "no note links here".into(), fix);
@@ -526,7 +521,10 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 &note.id,
                 1,
                 "note links to no other note".into(),
-                format!("`wikiknit suggest {}` lists link candidates", note.id),
+                format!(
+                    "`wikiknit suggest {}` lists link candidates",
+                    shell_word(&note.id)
+                ),
             );
         }
 
@@ -567,6 +565,20 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
         }
     }
 
+    for c in &vault.id_collisions {
+        if is_selected(&c.id) {
+            sink.push_fix(
+                "duplicate-note-id",
+                &c.id,
+                1,
+                format!(
+                    "`{}` and `{}` are both note `{}`; `{}` is read as a file, not a note",
+                    c.kept, c.shadowed, c.id, c.shadowed
+                ),
+                format!("rename or merge `{}`", c.shadowed),
+            );
+        }
+    }
     required_inbound(vault, &is_selected, &mut sink);
     duplicate_aliases(vault, &is_selected, &mut sink);
     sink.out
@@ -748,6 +760,21 @@ fn sibling_edit(
     ))
 }
 
+/// A note id as one shell word for a hint: as is when safe, else single-quoted.
+#[must_use]
+pub fn shell_word(s: &str) -> String {
+    let safe = !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars().all(|c| {
+            c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | '%' | ':' | ',')
+        });
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// Line of frontmatter `key:` (line 2, the first YAML line, if not found).
 fn frontmatter_line(note: &Note, key: &str) -> usize {
     note.parsed
@@ -907,6 +934,15 @@ mod tests {
         for d in [-1000, 0, 59, 60, 10_000, 20_743] {
             assert_eq!(parse_date(&format_date(d)), Some(d));
         }
+    }
+
+    #[test]
+    fn shell_words() {
+        assert_eq!(shell_word("Projects/x/overview"), "Projects/x/overview");
+        assert_eq!(shell_word("note with space"), "'note with space'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("-x"), "'-x'");
+        assert_eq!(shell_word("a$b"), "'a$b'");
     }
 
     #[test]
