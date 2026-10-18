@@ -108,6 +108,9 @@ struct Ctx {
     config: bool,
     /// Shell variables set without `export` (an `export NAME` later exports them).
     vars: BTreeMap<String, String>,
+    /// `alias NAME=VALUE` earlier in the command (expanded whether or not `expand_aliases`
+    /// is on: fail closed).
+    aliases: BTreeMap<String, String>,
 }
 
 impl Ctx {
@@ -212,17 +215,28 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
     // A heredoc body is a script when its command, or a command it is piped into
     // (`cat <<EOF | sh`), is a shell reading stdin.
     for (cmd, text, mut inner) in bodies {
-        let mut j = cmd;
+        // Every command the text can reach through pipes, groups, and substitutions.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec![cmd];
         let mut feeds_shell = false;
-        while let Some(c) = commands.iter().find(|c| c.id == j) {
-            if reads_stdin_shell(&c.words) {
+        while let Some(j) = todo.pop() {
+            if !seen.insert(j) {
+                continue;
+            }
+            if commands
+                .iter()
+                .find(|c| c.id == j)
+                .is_some_and(|c| reads_stdin_shell(&c.words))
+            {
                 feeds_shell = true;
                 break;
             }
-            match commands.iter().find(|n| n.stdin_from.contains(&j)) {
-                Some(next) => j = next.id,
-                None => break,
-            }
+            todo.extend(
+                commands
+                    .iter()
+                    .filter(|n| n.stdin_from.contains(&j))
+                    .map(|n| n.id),
+            );
         }
         if feeds_shell {
             collect(&text, &mut inner, out, depth + 1);
@@ -306,25 +320,20 @@ fn stdin_feed(commands: &[Cmd], cmd: &Cmd) -> Feed {
 fn output_of(commands: &[Cmd], cmd: &Cmd) -> Feed {
     let p = strip_prefixes(&cmd.words);
     let Some((program, args)) = p.words.split_first() else {
-        return Feed::Terminal;
+        // Only redirections or assignments: what reaches the pipe cannot be told.
+        return Feed::Opaque;
     };
+    // Text the shell expands, or escapes `echo`/`printf` may interpret (`\x74`, `%b`):
+    // the output cannot be read.
+    let unreadable = |text: &str| text.contains('\\') || args.iter().any(|a| is_dynamic_word(a));
     match program_name(program) {
-        "echo" => {
-            let args: Vec<&String> = args
-                .iter()
-                .skip_while(|a| {
-                    a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))
-                })
-                .collect();
-            Feed::Literal(unescape(
-                &args
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ))
+        "echo" | "printf" => {
+            let feed = output_text(program_name(program), args);
+            match feed {
+                Some(t) if !unreadable(&t) => Feed::Literal(t),
+                _ => Feed::Opaque,
+            }
         }
-        "printf" => Feed::Literal(unescape(&args.join(" "))),
         // Pass stdin through.
         "cat" if args.iter().all(|a| a.len() > 1 && a.starts_with('-')) => {
             stdin_feed(commands, cmd)
@@ -337,6 +346,26 @@ fn output_of(commands: &[Cmd], cmd: &Cmd) -> Feed {
 /// `\n` and `\t` as `echo -e` and `printf` print them.
 fn unescape(s: &str) -> String {
     s.replace("\\n", "\n").replace("\\t", "\t")
+}
+
+/// What `echo ARGS` / `printf ARGS` print, when it can be told (`None` for a `printf`
+/// format with directives). Remaining backslashes are left for the caller to refuse.
+fn output_text(program: &str, args: &[String]) -> Option<String> {
+    if program == "printf" {
+        let text = args.join(" ");
+        if text.contains('%') || args.first().is_some_and(|a| a == "-v") {
+            return None;
+        }
+        return Some(unescape(&text));
+    }
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .skip_while(|a| {
+            a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))
+        })
+        .collect();
+    Some(unescape(&args.join(" ")))
 }
 
 /// `<(cmd)` -> `cmd`.
@@ -588,9 +617,15 @@ fn simple(
     out: &mut Analysis,
     depth: usize,
 ) {
-    let p = strip_prefixes(words);
+    let mut p = strip_prefixes(words);
     if p.not_run {
         return;
+    }
+    // `xargs -I{} {} commit`: the replace string becomes text read from stdin.
+    if let Some(rs) = p.xargs_replace.clone() {
+        for w in &mut p.words {
+            *w = w.replace(&rs, "$XARGS");
+        }
     }
     let what = shorten(words);
     let write = |out: &mut Analysis, dirs: &[String], paths: Vec<String>, xargs: bool| {
@@ -617,6 +652,10 @@ fn simple(
             write(out, &ctx.cds, paths, false);
         }
     }
+    if p.unparsed {
+        opaque(out, ctx, &what);
+        return;
+    }
     let Some((program, args)) = p.words.split_first() else {
         // Only assignments: shell variables, not exported.
         for (k, v) in &p.assigns {
@@ -630,10 +669,31 @@ fn simple(
     let mut dirs = ctx.cds.clone();
     dirs.extend(p.dirs.iter().cloned());
     let name = program_name(program);
+    // An alias defined earlier: run what it stands for.
+    if !program.contains('/')
+        && let Some(value) = ctx.aliases.get(program.as_str()).cloned()
+    {
+        let mut text = value;
+        for a in args {
+            text.push(' ');
+            text.push_str(a);
+        }
+        let saved = ctx.aliases.remove(program.as_str()); // no self-recursion
+        collect(&text, ctx, out, depth + 1);
+        if let Some(v) = saved {
+            ctx.aliases.insert(program.clone(), v);
+        }
+        return;
+    }
+    // Under xargs, more arguments come from stdin: a shell runs unknown script files, and
+    // git with no subcommand gets one from stdin.
+    let xargs_unknown = p.xargs
+        && ((SHELLS.contains(&name) && shell_c_script(args).is_none())
+            || (name == "git" && parse_git(args, &dirs, None, None, false).is_none()));
     // A program word that is not a literal (`$G`, `$(which git)`), or a wrapper option this
     // parser does not know: it may be git, doing anything, in a repository that cannot be
     // known.
-    if is_dynamic_word(program) || p.unparsed {
+    if is_dynamic_word(program) || p.unparsed || xargs_unknown {
         let mut call = parse_git(args, &dirs, None, None, true).unwrap_or_else(|| GitCall {
             dirs: dirs.clone(),
             ..GitCall::default()
@@ -725,8 +785,82 @@ fn simple(
                     _ => {}
                 }
             }
-            if let Some(call) = parse_git(args, &dirs, git_dir, work_tree, config) {
+            if let Some(mut call) = parse_git(args, &dirs, git_dir, work_tree, config) {
+                // `git $CMD`, `git comm?t`, `git {commit,}`: the subcommand is not a literal.
+                if is_dynamic_word(&call.subcommand) {
+                    call.subcommand = "commit".into();
+                    call.config_overridden = true;
+                    call.opaque = true;
+                    out.writes.push(Write {
+                        what: what.clone(),
+                        target: WriteTarget::Unknown,
+                    });
+                }
                 out.calls.push(call);
+            }
+        }
+        "alias" => {
+            for a in args.iter().filter(|a| !a.starts_with('-')) {
+                if let Some((k, v)) = a.split_once('=') {
+                    ctx.aliases.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        "unalias" => {
+            for a in args {
+                ctx.aliases.remove(a.as_str());
+            }
+        }
+        // Commands that run a script argument.
+        "trap" => {
+            let script = args
+                .iter()
+                .find(|a| a.as_str() != "--" && !a.starts_with('-'));
+            if let Some(script) = script {
+                let mut inner = ctx.clone();
+                inner.cds = dirs;
+                collect(script, &mut inner, out, depth + 1);
+            }
+        }
+        "watch" => {
+            let mut rest = Vec::new();
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                if !rest.is_empty() || !a.starts_with('-') {
+                    rest.push(a.clone());
+                } else if matches!(a.as_str(), "-n" | "--interval" | "-q" | "--equexit") {
+                    it.next();
+                }
+            }
+            let mut inner = ctx.clone();
+            inner.cds = dirs;
+            collect(&rest.join(" "), &mut inner, out, depth + 1);
+        }
+        "su" | "script" | "runuser" => {
+            if let Some(script) = command_option(args) {
+                let mut inner = ctx.clone();
+                inner.cds = dirs;
+                collect(script, &mut inner, out, depth + 1);
+            }
+        }
+        "flock" => {
+            let mut inner = ctx.clone();
+            inner.cds = dirs;
+            if let Some(script) = command_option(args) {
+                collect(script, &mut inner, out, depth + 1);
+            } else {
+                // flock [options] FILE COMMAND [ARGS]
+                let mut i = 0;
+                while i < args.len() && args[i].starts_with('-') {
+                    let takes = matches!(
+                        args[i].as_str(),
+                        "-w" | "--wait" | "--timeout" | "-E" | "--conflict-exit-code"
+                    );
+                    i += if takes { 2 } else { 1 };
+                }
+                if i + 1 < args.len() {
+                    simple(&args[i + 1..], &[], feed, &mut inner, out, depth + 1);
+                }
             }
         }
         "find" => {
@@ -741,14 +875,12 @@ fn simple(
                         }
                         let mut inner = ctx.clone();
                         inner.cds = dirs.clone();
-                        simple(
-                            &args[start..j],
-                            &[],
-                            &Feed::Terminal,
-                            &mut inner,
-                            out,
-                            depth + 1,
-                        );
+                        // `{}` is a found path: text this parser cannot see.
+                        let found: Vec<String> = args[start..j]
+                            .iter()
+                            .map(|a| a.replace("{}", "$FOUND"))
+                            .collect();
+                        simple(&found, &[], &Feed::Terminal, &mut inner, out, depth + 1);
                         i = j + 1;
                     }
                     "-delete" | "-fprint" | "-fprint0" | "-fprintf" | "-fls" => {
@@ -878,6 +1010,21 @@ fn shell_reads_stdin(args: &[String]) -> bool {
     true
 }
 
+/// The value of `-c CMD` / `--command CMD` / `--command=CMD` (also at the end of a short
+/// option cluster, `-qc CMD`).
+fn command_option(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--command=") {
+            return Some(v);
+        }
+        if a == "--command" || (a.starts_with('-') && !a.starts_with("--") && a.ends_with('c')) {
+            return it.next().map(String::as_str);
+        }
+    }
+    None
+}
+
 /// The first word of a shell's arguments that is not an option (its script file).
 fn script_operand(args: &[String]) -> Option<&str> {
     let mut it = args.iter();
@@ -894,9 +1041,26 @@ fn script_operand(args: &[String]) -> Option<&str> {
     None
 }
 
-/// A word the shell expands at run time into something this parser cannot see.
+/// A word the shell expands at run time into something this parser cannot see: parameters
+/// and substitutions, globs (`gi?`), brace expansion (`{git,x}`, `{a..b}`). The test
+/// commands `[` and `[[` are words, not globs.
 fn is_dynamic_word(w: &str) -> bool {
-    w.contains(['$', '`'])
+    if w.contains(['$', '`']) {
+        return true;
+    }
+    if w == "[" || w == "[[" {
+        return false;
+    }
+    if w.contains(['*', '?', '[']) {
+        return true;
+    }
+    // `{a,b}` or `{a..b}`
+    w.find('{').is_some_and(|open| {
+        w[open..].find('}').is_some_and(|close| {
+            let inner = &w[open + 1..open + close];
+            inner.contains(',') || inner.contains("..")
+        })
+    })
 }
 
 fn parse_git(
@@ -966,7 +1130,6 @@ fn wrapper_arg_opts(wrapper: &str) -> &'static [&'static str] {
         "ionice" => &["-c", "-n", "-p", "-P", "-u"],
         "xargs" => &[
             "-I",
-            "-i",
             "-n",
             "-P",
             "-L",
@@ -1004,6 +1167,8 @@ struct Prefixed {
     dirs: Vec<String>,
     /// Run by `xargs`: more arguments come from stdin.
     xargs: bool,
+    /// `xargs -I STR` / `-i` / `--replace`: STR in the command is replaced by stdin text.
+    xargs_replace: Option<String>,
     /// Not run at all (`command -v git`).
     not_run: bool,
     /// A wrapper option this parser does not know: what runs cannot be told.
@@ -1094,6 +1259,14 @@ fn strip_prefixes(words: &[String]) -> Prefixed {
                 v
             };
             match (name.as_str(), opt.as_str()) {
+                ("xargs", "-I") => p.xargs_replace = value(&mut i),
+                ("xargs", "-i" | "--replace") => p.xargs_replace = Some("{}".into()),
+                ("xargs", o) if o.starts_with("--replace=") => {
+                    p.xargs_replace = Some(o["--replace=".len()..].to_string());
+                }
+                ("xargs", o) if o.starts_with("-I") || o.starts_with("-i") => {
+                    p.xargs_replace = Some(o[2..].to_string());
+                }
                 ("sudo", "-D" | "--chdir") => p.dirs.extend(value(&mut i)),
                 ("sudo", o) if o.starts_with("--chdir=") => {
                     p.dirs.push(o["--chdir=".len()..].to_string());
@@ -1184,21 +1357,62 @@ fn env_options(w: &mut Vec<String>, mut i: usize, p: &mut Prefixed) -> usize {
         match take {
             Some(('u', v)) => p.unsets.push(v),
             Some(('C', v)) => p.dirs.push(v),
-            Some((_, v)) => {
-                // `-S 'git commit -m x'`: split as the shell would split words.
-                let split: Vec<String> = tokenize(&v)
-                    .into_iter()
-                    .flat_map(|item| match item {
-                        Item::Cmd(c) => c.words,
-                        _ => Vec::new(),
-                    })
-                    .collect();
-                w.splice(i..i, split);
-            }
+            Some((_, v)) => match env_split(&v) {
+                Some(split) => {
+                    w.splice(i..i, split);
+                }
+                None => {
+                    p.unparsed = true;
+                    return i;
+                }
+            },
             None => {}
         }
     }
     i
+}
+
+/// Split an `env -S` string into words the way GNU env does, for the part of its rules
+/// that agrees with the shell: whitespace, `'...'`, `"..."`. Anything env treats
+/// differently (`${VAR}` expansion, backslash escapes such as `\_` and `\c`, `#` comments)
+/// or the shell would but env does not (`;`, `|`, `&`, `<`, `>`, `(`, `)`, `` ` ``, `$(`)
+/// returns `None`: the caller cannot tell what runs.
+fn env_split(s: &str) -> Option<Vec<String>> {
+    if s.contains(['$', '\\', '#', ';', '|', '&', '<', '>', '(', ')', '`']) {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some(q) if q == c => break,
+                        Some(ch) => word.push(ch),
+                        None => return None, // unterminated: env fails
+                    }
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1221,11 +1435,35 @@ struct Cmd {
     stdin_from: Vec<usize>,
 }
 
-/// An open `( ... )` or `{ ...; }`: what is piped into it, and the commands inside it.
+/// An open `( ... )`, `{ ...; }`, or substitution: what its commands read on stdin, and the
+/// commands inside it.
 struct Group {
     stdin: Vec<usize>,
     ids: Vec<usize>,
-    paren: bool,
+    kind: GroupKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupKind {
+    Paren,
+    Brace,
+    /// The inside of `$(...)`, backticks, `<(...)` (the command's stdin) or `>(...)` (the
+    /// command's output: unknown).
+    Sub,
+}
+
+/// Producer id that is never a command: stdin that cannot be told (`>(...)`).
+const UNKNOWN_STDIN: usize = usize::MAX;
+
+/// Stdin a command inherits when nothing is piped into it: that of the nearest enclosing
+/// group that has one (`echo x | { ( bash ); }`).
+fn inherited_stdin(groups: &[Group]) -> Vec<usize> {
+    groups
+        .iter()
+        .rev()
+        .find(|g| !g.stdin.is_empty())
+        .map(|g| g.stdin.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1390,23 +1628,23 @@ fn tokenize(command: &str) -> Vec<Item> {
             end_word!();
             pending = None;
             emitted = None;
-            let closes_brace =
-                words.len() == 1 && words[0] == "}" && groups.last().is_some_and(|g| !g.paren);
+            let closes_brace = words.len() == 1
+                && words[0] == "}"
+                && groups.last().is_some_and(|g| g.kind == GroupKind::Brace);
             let mut closed = None;
             if closes_brace {
                 closed = groups.pop().map(|g| g.ids);
                 words.clear();
             }
+            let only_redirects = words.is_empty();
             if !words.is_empty() || !redirects.is_empty() {
                 let id = cur_id.take().unwrap_or_else(|| {
                     next_id += 1;
                     next_id - 1
                 });
                 let mut stdin_from = std::mem::take(&mut pipe_from);
-                if stdin_from.is_empty()
-                    && let Some(g) = groups.last()
-                {
-                    stdin_from = g.stdin.clone();
+                if stdin_from.is_empty() {
+                    stdin_from = inherited_stdin(&groups);
                 }
                 for g in &mut groups {
                     g.ids.push(id);
@@ -1415,7 +1653,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                     groups.push(Group {
                         stdin: stdin_from.clone(),
                         ids: vec![id],
-                        paren: false,
+                        kind: GroupKind::Brace,
                     });
                 }
                 items.push(Item::Cmd(Cmd {
@@ -1425,7 +1663,10 @@ fn tokenize(command: &str) -> Vec<Item> {
                     stdin_from,
                 }));
                 emitted = Some(id);
-                last_group = None;
+                // `( ... ) 2>/dev/null | sh`: redirections of the group, not a new producer.
+                if !only_redirects {
+                    last_group = None;
+                }
             }
             cur_id = None;
             if closed.is_some() {
@@ -1435,10 +1676,17 @@ fn tokenize(command: &str) -> Vec<Item> {
     }
     // Start a substitution at `start`: the current command waits until it closes.
     macro_rules! open_sub {
-        ($start:expr) => {
+        ($start:expr, $output:expr) => {
             if !in_word {
                 word.clear();
             }
+            let sub_stdin: Vec<usize> = if $output {
+                vec![UNKNOWN_STDIN]
+            } else if !pipe_from.is_empty() {
+                pipe_from.clone()
+            } else {
+                inherited_stdin(&groups)
+            };
             opens.push(Some(Saved {
                 words: std::mem::take(&mut words),
                 word: std::mem::take(&mut word),
@@ -1449,6 +1697,13 @@ fn tokenize(command: &str) -> Vec<Item> {
                 groups: std::mem::take(&mut groups),
                 start: $start,
             }));
+            if !sub_stdin.is_empty() {
+                groups.push(Group {
+                    stdin: sub_stdin,
+                    ids: Vec::new(),
+                    kind: GroupKind::Sub,
+                });
+            }
             in_word = false;
             items.push(Item::Open);
         };
@@ -1474,8 +1729,9 @@ fn tokenize(command: &str) -> Vec<Item> {
                 }
                 Some(None) => {
                     // A subshell: a pipe after it reads every command in it.
-                    while let Some(g) = groups.pop() {
-                        if g.paren {
+                    while groups.last().is_some_and(|g| g.kind != GroupKind::Sub) {
+                        let g = groups.pop().expect("checked");
+                        if g.kind == GroupKind::Paren {
                             last_group = Some(g.ids);
                             break;
                         }
@@ -1553,7 +1809,7 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '$' if chars.get(i + 1) == Some(&'(') => {
                 // Command substitution: its contents are commands, in their own scope.
-                open_sub!(i);
+                open_sub!(i, false);
                 i += 2;
                 continue;
             }
@@ -1565,10 +1821,14 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '(' => {
                 end_cmd!();
+                let mut stdin = std::mem::take(&mut pipe_from);
+                if stdin.is_empty() {
+                    stdin = inherited_stdin(&groups);
+                }
                 groups.push(Group {
-                    stdin: std::mem::take(&mut pipe_from),
+                    stdin,
                     ids: Vec::new(),
-                    paren: true,
+                    kind: GroupKind::Paren,
                 });
                 items.push(Item::Open);
                 opens.push(None);
@@ -1584,7 +1844,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                 if in_backtick {
                     close!(i);
                 } else {
-                    open_sub!(i);
+                    open_sub!(i, false);
                 }
                 in_backtick = !in_backtick;
             }
@@ -1643,7 +1903,7 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '<' | '>' if chars.get(i + 1) == Some(&'(') => {
                 // Process substitution `<(cmd)` / `>(cmd)`: commands, and a word.
-                open_sub!(i);
+                open_sub!(i, c == '>');
                 i += 2;
                 continue;
             }
@@ -2210,5 +2470,135 @@ mod tests {
             assert!(opaque_call(c), "{c}");
         }
         assert!(git_calls("env --help").is_empty());
+    }
+
+    #[test]
+    fn env_split_string_follows_env_not_the_shell() {
+        // Plain words and quotes split the same way: parsed.
+        for c in [
+            "env -S 'git commit -m x'",
+            "env -S 'git commit -m \"a b\"'",
+            "env -S \"git commit -m 'a b'\"",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+        // env expands `${VAR}`, has its own escapes and comments, and runs no shell
+        // operators: anything where it differs from the shell is opaque.
+        for c in [
+            "env -S '${G} commit'",
+            "env -S 'git\\_commit'",
+            "env -S 'echo x # git commit'",
+            "env -S 'git commit; rm x'",
+            "env -S 'git commit | cat'",
+            "env -S 'git commit && x'",
+            "env -S 'git `x` commit'",
+            "env -S 'git $(x) commit'",
+            "env -S 'git commit > f'",
+            "env -S 'git commit < f'",
+            "env -S 'git (commit)'",
+            "env -S 'git \\c commit'",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn redirected_groups_keep_their_pipe() {
+        for c in [
+            "( echo 'git commit -m x' ) 2>/dev/null | bash",
+            "(echo 'git commit -m x') >&2 2>/dev/null | bash",
+            "{ echo 'git commit -m x'; } 2>/dev/null | bash",
+        ] {
+            assert!(seen_commit(c) || opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        // A redirect-only command piped in: its output cannot be told.
+        assert!(opaque_call("> f | bash"));
+    }
+
+    #[test]
+    fn nested_groups_inherit_stdin() {
+        for c in [
+            "echo 'git commit -m x' | { ( bash ) ; }",
+            "echo 'git commit -m x' | ( ( bash ) )",
+            "echo 'git commit -m x' | ( { bash; } )",
+            "echo 'git commit -m x' | { cd a; { bash; }; }",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn substitutions_read_the_commands_stdin() {
+        // `$(...)` and `<(...)` inherit the stdin of the command they are in; `>(...)` reads
+        // that command's output.
+        for c in [
+            "echo 'git commit -m x' | echo $(bash)",
+            "echo 'git commit -m x' | cat <(bash)",
+            "echo 'git commit -m x' | x=`bash` true",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(opaque_call("echo 'git commit' | tee >(bash)"));
+        assert!(opaque_call("tee >(bash) < f"));
+    }
+
+    #[test]
+    fn echo_and_printf_output_that_cannot_be_read_is_opaque() {
+        for c in [
+            "printf '%s\\n' \"$X\" | bash",
+            "printf '%b' 'git commit' | bash",
+            "echo -e 'gi\\x74 commit' | bash",
+            "echo \"$X\" | bash",
+            "printf 'gi\\164 commit' | bash",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn words_the_shell_expands_are_opaque() {
+        for c in [
+            "{git,x} commit",
+            "git {commit,}",
+            "/usr/bin/gi? commit",
+            "git $CMD",
+            "git comm?t",
+            "git \"$C\" -m x",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(!opaque_call("git log -- '*.md'"));
+    }
+
+    #[test]
+    fn xargs_and_find_replacements() {
+        for c in [
+            "echo commit | xargs git",
+            "echo x | xargs -I{} {} commit",
+            "echo x | xargs -i git {} -m x",
+            "echo x | xargs --replace=Z Z commit",
+            "find . -exec {} commit \\;",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(!opaque_call("ls | xargs grep x"));
+        assert!(!opaque_call("git ls-files | xargs git add"));
+    }
+
+    #[test]
+    fn commands_that_run_a_script_argument() {
+        for c in [
+            "shopt -s expand_aliases; alias g=git\ng commit -m x",
+            "alias g='git commit'; g -m x",
+            "trap 'git commit -m x' EXIT",
+            "watch 'git commit -m x'",
+            "watch -n 5 git commit -m x",
+            "su -c 'git commit -m x' me",
+            "flock /tmp/l git commit -m x",
+            "flock -w 5 /tmp/l -c 'git commit -m x'",
+            "script -qc 'git commit -m x' /dev/null",
+        ] {
+            assert!(seen_commit(c) || opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
     }
 }

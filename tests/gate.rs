@@ -549,6 +549,18 @@ fn substitutions_program_words_and_env_options() {
         "env --split-string='git commit -m x'",
         "env --bogus git status",
         "env -q git status",
+        // Second review round.
+        "env -S '${G} commit'",
+        "env -S 'git commit; true'",
+        "( echo 'git commit -m x' ) 2>/dev/null | bash",
+        "echo 'git commit -m x' | { ( bash ) ; }",
+        "echo 'git commit -m x' | echo $(bash)",
+        "printf '%s' \"$X\" | bash",
+        "{git,x} commit -m x",
+        "git $CMD",
+        "echo commit | xargs git",
+        "alias g=git\ng commit -m x",
+        "trap 'git commit -m x' EXIT",
     ] {
         let out = s.pre_commit(command);
         assert_eq!(code(&out), Some(2), "not held: {command}: {}", stderr(&out));
@@ -557,6 +569,10 @@ fn substitutions_program_words_and_env_options() {
         "env -i git status",
         "env -u X -C . git status",
         "x=$(true) git status",
+        "[ -f x ] && git status",
+        "ls | xargs grep x",
+        "git ls-files | xargs -I{} git log -1 -- {}",
+        "git log -- '*.md'",
     ] {
         let out = s.pre_commit(command);
         assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));

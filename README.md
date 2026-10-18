@@ -306,18 +306,32 @@ This repo is also a Claude Code plugin marketplace. The plugin adds:
   After `/clear` (a new session id), notes still pending from before carry over.
 - **PreToolUse hook on Bash**: a commit in the vault's repository while changed notes lack a link
   pass is held, with the list of notes and a pointer to the skill.
-  - *What counts as a commit*: `git commit`, `git commit-tree`, and `--continue` of a rebase,
-    cherry-pick, merge, revert, or am; found behind `if`/`for`/`&&`, wrappers (`sudo`, `timeout`,
-    `xargs`, `env`, `time -p`, `command`), redirections (`2>/dev/null git commit`), `bash -c`, `eval`,
-    `$(...)`, `find -exec`, scripts fed to a shell (`bash <<EOF`, `bash <<< '...'`,
-    `echo '...' | sh`, `source <(...)`), and git aliases that run one (from git config or
-    `-c alias.*`). When it cannot tell, it counts as a commit: a script it cannot read
-    (`curl ... | sh`), a program word that is not literal (`$G commit`), config from `GIT_CONFIG*`,
-    `GIT_DIR`, `HOME`, or `PATH`, an external `git-<name>` program (except `git lfs`, other than
-    `lfs migrate`). Text in quotes, quoted heredocs, and comments is not a commit.
+  - *What counts as a commit*: `git commit`, `git commit-tree`, `--continue` of a rebase,
+    cherry-pick, merge, revert, or am (also `am --resolved`, `rebase --exec`), and git's own
+    scripts that commit (`subtree`, `citool`, `gui`, `filter-branch`, ...). Plain `merge`, `pull`,
+    `cherry-pick`, `revert`, `am`, `rebase`, and `stash` do not count: git refuses them with a dirty
+    index and leaves unstaged files alone, so pending notes cannot enter their commits.
+  - *How commits are found*: behind `if`/`for`/`&&`, wrappers (`sudo`, `timeout`, `xargs`, `env`
+    with all its options, `time -p`, `command`, `flock`, `watch`, `su -c`, `script -c`),
+    redirections (`2>/dev/null git commit`), `bash -c`, `eval`, `trap`, aliases defined in the
+    command, `$(...)`, `find -exec`, scripts fed to a shell (`bash <<EOF`, `bash <<< '...'`,
+    `echo '...' | sh`, `( ... ) | sh`, `source <(...)`), stdin inherited by groups and
+    substitutions, and git aliases that run one (from git config or `-c alias.*`). Text in
+    quotes, quoted heredocs, and comments is not a commit.
+  - *When it cannot tell, it counts as a commit, in any repository*: a script it cannot read
+    (`curl ... | sh`, `printf '%s' "$X" | sh`), a program word or git subcommand the shell expands
+    (`$G`, `$(which git)`, `{git,x}`, `gi?`, `git $CMD`), `xargs` supplying the program or
+    subcommand, an `env` option it does not know or an `env -S` string that env splits differently
+    from the shell, config from `GIT_CONFIG*`, `GIT_DIR`, `HOME`, or `PATH`, an external `git-<name>`
+    program (except `git lfs`, other than `lfs migrate`).
   - *Which repository*: the one the commit runs in, after `cd`, `env -C`, `-C`, `--git-dir`, and an
     exported or inline `GIT_DIR`. The `wikiknit.toml` is looked up from there, from the session's
-    folder, and from `$CLAUDE_PROJECT_DIR`, and each vault found is checked.
+    folder, and from `$CLAUDE_PROJECT_DIR`, and each vault found is checked. Repositories are
+    compared by their common git dir: a commit in a linked worktree is checked against that
+    worktree's copy of the vault.
+  - *Repository config does not run*: the hook runs git in folders the command names, which may be a
+    cloned repository. Its git calls disable `core.fsmonitor`, hooks, and fetching, and read only
+    objects (never the work tree or index), so filters, textconv, and external diff cannot run.
   - *Write and commit in one command*: wikiknit reads the vault before the command runs, so a command
     that commits in the vault's repository and may also change vault files (a redirection or `tee`,
     `cp`, `mv`, `rm`, `sed -i` into the vault, `git checkout`/`restore`/`stash`, any program or script
