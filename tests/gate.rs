@@ -410,3 +410,171 @@ fn first_use_holds_uncommitted_notes_until_marked() {
     let out = s.pre_commit("git commit -am x");
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
 }
+
+/// Security: the hook runs git in folders named by the command (a cloned repo). Repo config
+/// that runs programs (fsmonitor, clean filters, external diff) must not run.
+#[cfg(unix)]
+#[test]
+fn repo_config_runs_no_programs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = Setup::standard();
+    let repo = s.repo();
+    let marker = s.root.path().join("ran");
+    let tool = s.root.path().join("tool.sh");
+    fs::write(
+        &tool,
+        format!("#!/bin/sh\necho x >> {}\ncat\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = fs::read_to_string(repo.join(".git/config")).unwrap();
+    config.push_str(&format!(
+        "[core]\n\tfsmonitor = {t}\n\thooksPath = {h}\n[filter \"evil\"]\n\tclean = {t}\n\tsmudge = cat\n\
+         [diff]\n\texternal = {t}\n[diff \"evil\"]\n\ttextconv = {t}\n",
+        t = tool.display(),
+        h = s.root.path().display()
+    ));
+    fs::write(repo.join(".git/config"), config).unwrap();
+    fs::write(repo.join(".gitattributes"), "*.md filter=evil diff=evil\n").unwrap();
+    s.edit();
+    // No session start and no state: the link record is rebuilt from git.
+    for command in [
+        "git commit -am x",
+        "git ci -m x",
+        "git status",
+        "git -C vault commit",
+    ] {
+        let out = s.pre_commit(command);
+        assert!(
+            !marker.exists(),
+            "{command} ran repo config programs: {}",
+            stderr(&out)
+        );
+    }
+    assert_eq!(code(&s.pre_commit("git commit -am x")), Some(2));
+}
+
+/// Item 3: a linked worktree of the vault's repo has its own copy of the vault; a commit
+/// there is checked against that copy, even when its `wikiknit.toml` is not tracked.
+#[test]
+fn linked_worktrees_check_their_own_copy_of_the_vault() {
+    let s = Setup::standard();
+    let repo = s.repo();
+    git(&repo, &["rm", "-q", "--cached", "wikiknit.toml"]);
+    git(&repo, &["commit", "-q", "-m", "untrack config"]);
+    let wt = s.root.path().join("wt");
+    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    s.session_start("s1");
+    fs::write(wt.join("vault/a.md"), "# a\nedited in wt [[b]]\n").unwrap();
+    let out = s.pre_commit_in(&wt, Some(&repo), "git commit -am x", &[]);
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    let out = s.pre_commit_in(
+        &repo,
+        Some(&repo),
+        &format!("git -C {} commit -am x", wt.display()),
+        &[],
+    );
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    // The main checkout is clean: its commits pass.
+    let out = s.pre_commit("git commit -m x");
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
+}
+
+/// Item 2: which git commands can commit pending notes. merge, cherry-pick, revert, am,
+/// rebase, and pull refuse a dirty index and leave unstaged files alone (checked against
+/// git), so only their `--continue` commits the index; `stash` writes `refs/stash`, not
+/// history. Commands from git's exec path (subtree, citool, ...) may commit.
+#[test]
+fn commands_that_can_commit_pending_notes() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.edit();
+    let exec_path = std::process::Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .unwrap();
+    let exec_path = PathBuf::from(String::from_utf8_lossy(&exec_path.stdout).trim());
+    let mut held = vec![
+        "git am --resolved",
+        "git am -r",
+        "git merge --continue",
+        "git -c alias.mc='merge --continue' mc",
+    ];
+    if exec_path.join("git-subtree").is_file() {
+        held.push("git subtree add --prefix=x HEAD");
+    }
+    if exec_path.join("git-citool").is_file() {
+        held.push("git citool");
+    }
+    for command in held {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(2), "not held: {command}: {}", stderr(&out));
+    }
+    for command in [
+        "git merge other",
+        "git cherry-pick HEAD",
+        "git revert HEAD",
+        "git am x.patch",
+        "git rebase main",
+        "git pull",
+        "git stash",
+        "git cherry-pick -n HEAD",
+    ] {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));
+    }
+}
+
+/// Items 4-6: parser differentials.
+#[test]
+fn substitutions_program_words_and_env_options() {
+    let s = Setup::standard();
+    s.session_start("s1");
+    s.edit();
+    for command in [
+        // A substitution must not shift pipe and heredoc bookkeeping.
+        "echo 'git commit -m x' | x=$(true) bash",
+        "cat <<'EOF' | x=$(true) sh\ngit commit -m x\nEOF",
+        "bash -s <<'EOF' $(true)\ngit commit -m x\nEOF",
+        "bash -s x <<'EOF'\ngit commit -m x\nEOF",
+        // Any program word that is not a literal may be git.
+        "G=git; $G st",
+        "\"$(which git)\" st",
+        "`which git` ci",
+        "bash $S",
+        // env options.
+        "env -S'git commit -m x'",
+        "env -iS 'git commit -m x'",
+        "env -vS'git commit -m x'",
+        "env --split-string='git commit -m x'",
+        "env --bogus git status",
+        "env -q git status",
+        // Second review round.
+        "env -S '${G} commit'",
+        "env -S 'git commit; true'",
+        "( echo 'git commit -m x' ) 2>/dev/null | bash",
+        "echo 'git commit -m x' | { ( bash ) ; }",
+        "echo 'git commit -m x' | echo $(bash)",
+        "printf '%s' \"$X\" | bash",
+        "{git,x} commit -m x",
+        "git $CMD",
+        "echo commit | xargs git",
+        "alias g=git\ng commit -m x",
+        "trap 'git commit -m x' EXIT",
+    ] {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(2), "not held: {command}: {}", stderr(&out));
+    }
+    for command in [
+        "env -i git status",
+        "env -u X -C . git status",
+        "x=$(true) git status",
+        "[ -f x ] && git status",
+        "ls | xargs grep x",
+        "git ls-files | xargs -I{} git log -1 -- {}",
+        "git log -- '*.md'",
+    ] {
+        let out = s.pre_commit(command);
+        assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));
+    }
+}

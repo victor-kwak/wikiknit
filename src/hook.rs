@@ -154,19 +154,19 @@ impl Target {
         }
     }
 
-    /// The repository it commits to: its git directory, canonicalized (`None`: unknown).
-    fn repo(&self) -> Option<PathBuf> {
+    /// The repository it commits to (`None`: unknown).
+    fn repo(&self) -> Option<Repo> {
         if self.opaque {
             return None;
         }
-        match &self.git_dir {
-            Some(g) => {
-                let mut args: Vec<&OsStr> = vec![OsStr::new("--git-dir"), g.as_os_str()];
-                args.extend(["rev-parse", "--absolute-git-dir"].map(OsStr::new));
-                canonical_output(&self.dir, &args)
-            }
-            None => repo_of_dir(&self.dir),
+        let mut global: Vec<&OsStr> = Vec::new();
+        if let Some(g) = &self.git_dir {
+            global.extend([OsStr::new("--git-dir"), g.as_os_str()]);
         }
+        if let Some(w) = &self.work_tree {
+            global.extend([OsStr::new("--work-tree"), w.as_os_str()]);
+        }
+        repo_with(&self.dir, &global)
     }
 
     /// Folders to look for a `wikiknit.toml` from.
@@ -177,10 +177,22 @@ impl Target {
     }
 }
 
+/// A repository as git sees it from some folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Repo {
+    /// `--git-common-dir`, canonicalized: the same for every worktree of one repository.
+    common: PathBuf,
+    /// `--absolute-git-dir`, canonicalized: one per worktree; its index is what a commit
+    /// takes.
+    git_dir: PathBuf,
+    /// The work tree's top folder (`None`: bare, or git cannot tell).
+    top: Option<PathBuf>,
+}
+
 /// A commit (or something that may commit) the command runs.
 struct Commit {
     target: Target,
-    repo: Option<PathBuf>,
+    repo: Option<Repo>,
 }
 
 /// The PreToolUse gate. Cheap until the command is known to commit; after that, any failure
@@ -248,6 +260,8 @@ fn gate(
         .map(|p| p.canonicalize().unwrap_or(p))
         .collect();
     let session = input.session_id.as_str();
+    // Vault folders already checked (a vault can be reached from several configs).
+    let mut checked = BTreeSet::new();
     for path in configs {
         let config = match Config::load(&path) {
             Ok(c) => c,
@@ -262,37 +276,83 @@ fn gate(
         let Some(vault_repo) = repo_of_dir(&config.vault) else {
             continue;
         };
-        let into_vault_repo =
-            |repo: &Option<PathBuf>| repo.as_ref().is_none_or(|r| *r == vault_repo);
-        if !commits.iter().any(|c| into_vault_repo(&c.repo)) {
+        let same_repo =
+            |repo: &Option<Repo>| repo.as_ref().is_none_or(|r| r.common == vault_repo.common);
+        // The copies of this vault the commits can take: the vault itself, or the same
+        // folder in another worktree of its repository (an unknown repository: the vault).
+        let rel = vault_repo
+            .top
+            .as_ref()
+            .and_then(|t| config.vault.strip_prefix(t).ok())
+            .map(Path::to_path_buf);
+        let mut copies = BTreeSet::new();
+        for c in commits.iter().filter(|c| same_repo(&c.repo)) {
+            let Some(r) = &c.repo else {
+                copies.insert(config.vault.clone());
+                continue;
+            };
+            // The vault's own index (`GIT_DIR` pointing at it from another folder still
+            // commits what is staged there), or another work tree's copy of the vault.
+            if r.git_dir == vault_repo.git_dir {
+                copies.insert(config.vault.clone());
+            }
+            match (&r.top, &vault_repo.top, &rel) {
+                (Some(top), Some(vault_top), Some(rel)) if top != vault_top => {
+                    copies.insert(top.join(rel));
+                }
+                (Some(_), Some(_), Some(_)) => {
+                    copies.insert(config.vault.clone());
+                }
+                // No work tree known: the vault itself.
+                _ => {
+                    copies.insert(config.vault.clone());
+                }
+            }
+        }
+        if copies.is_empty() {
             continue;
         }
         let git_write = writers
             .iter()
-            .find(|(_, repo)| into_vault_repo(repo))
+            .find(|(_, repo)| same_repo(repo))
             .map(|(sub, _)| format!("git {sub}"));
-        if let Some(what) = git_write.or_else(|| vault_write(analysis, base, &config.vault)) {
-            return Ok(Outcome::Block(format!(
-                "Commit held by wikiknit: this command commits in the repository of the vault \
-                 {} and may also change files in the vault (`{what}`). wikiknit reads the vault \
-                 before a command runs, so it cannot check notes this command writes. Run the \
-                 command that writes as one command and the commit as a separate command; the \
-                 commit is then checked against the notes as they are.",
-                config.vault.display()
-            )));
-        }
-        let vault = Vault::load(config)?;
-        let store = Store::open(&vault.config.vault)?;
-        let now = state::current_hashes(&vault);
-        // No record of this session's start (plugin added mid-session, state lost): start it
-        // with every pending note counted as its own, so the gate fails closed.
-        let s = store.start_session(session, &now, true)?;
-        let changed = store.changed(&s, &now)?;
-        if !changed.is_empty() {
-            return Ok(Outcome::Block(format!(
-                "Commit held by wikiknit. {}",
-                describe(&vault, &changed, session)
-            )));
+        for copy in copies {
+            // Not in that worktree (sparse checkout, another branch): nothing to commit.
+            let Ok(copy) = copy.canonicalize() else {
+                continue;
+            };
+            if !checked.insert(copy.clone()) {
+                continue;
+            }
+            let what = git_write
+                .clone()
+                .or_else(|| vault_write(analysis, base, &copy));
+            if let Some(what) = what {
+                return Ok(Outcome::Block(format!(
+                    "Commit held by wikiknit: this command commits in the repository of the \
+                     vault {} and may also change files in the vault (`{what}`). wikiknit reads \
+                     the vault before a command runs, so it cannot check notes this command \
+                     writes. Run the command that writes as one command and the commit as a \
+                     separate command; the commit is then checked against the notes as they \
+                     are.",
+                    copy.display()
+                )));
+            }
+            let mut config = config.clone();
+            config.vault = copy;
+            let vault = Vault::load(config)?;
+            let store = Store::open(&vault.config.vault)?;
+            let now = state::current_hashes(&vault);
+            // No record of this session's start (plugin added mid-session, state lost):
+            // start it with every pending note counted as its own, so the gate fails closed.
+            let s = store.start_session(session, &now, true)?;
+            let changed = store.changed(&s, &now)?;
+            if !changed.is_empty() {
+                return Ok(Outcome::Block(format!(
+                    "Commit held by wikiknit. {}",
+                    describe(&vault, &changed, session)
+                )));
+            }
         }
     }
     Ok(Outcome::Allow)
@@ -307,7 +367,7 @@ fn broken_config_matters(path: &Path, commits: &[Commit]) -> bool {
         let Some(repo) = &c.repo else {
             return true;
         };
-        dir_repo.as_ref() == Some(repo)
+        dir_repo.as_ref().map(|d| &d.common) == Some(&repo.common)
             || c.target
                 .dir
                 .canonicalize()
@@ -489,7 +549,8 @@ fn commit_like(sub: &str, args: &[String]) -> bool {
                     .iter()
                     .any(|a| a == "--exec" || a.starts_with("--exec="))
         }
-        "cherry-pick" | "merge" | "revert" | "am" => has("--continue"),
+        "cherry-pick" | "merge" | "revert" => has("--continue"),
+        "am" => has("--continue") || has("--resolved") || has("-r"),
         _ => false,
     }
 }
@@ -576,8 +637,44 @@ fn classify(call: &shell::GitCall, sub: &str, args: &[String], dir: &Path, depth
     classify(call, &first, &rest, dir, depth + 1)
 }
 
-/// An external `git-<name>` program: it may do anything, except well-known ones.
+/// Commands in git's exec path that cannot commit.
+const EXEC_PATH_NO_COMMIT: &[&str] = &[
+    "credential-cache",
+    "credential-libsecret",
+    "credential-store",
+    "daemon",
+    "difftool--helper",
+    "gui--askpass",
+    "gui--askyesno",
+    "http-backend",
+    "http-fetch",
+    "http-push",
+    "imap-send",
+    "instaweb",
+    "remote-ftp",
+    "remote-ftps",
+    "remote-http",
+    "remote-https",
+    "request-pull",
+    "send-email",
+    "sh-i18n--envsubst",
+    "shell",
+    "web--browse",
+];
+
+/// An external `git-<name>` program (on `PATH`, or a script in git's exec path such as
+/// `subtree`, `citool`, `filter-branch`): it may do anything, except well-known ones.
 fn external(sub: &str, args: &[String]) -> Kind {
+    if exec_path_command(sub) {
+        return match sub {
+            s if EXEC_PATH_NO_COMMIT.contains(&s) => Kind::default(),
+            "mergetool" | "merge-octopus" | "merge-one-file" | "merge-resolve" => Kind {
+                commit: false,
+                writes: true,
+            },
+            _ => Kind::ANYTHING,
+        };
+    }
     if !external_git_command(sub) {
         return Kind::default(); // git fails: no such command
     }
@@ -607,6 +704,16 @@ fn is_builtin(subcommand: &str) -> bool {
     subcommand != "commit" && BUILTINS.iter().any(|b| b == subcommand)
 }
 
+/// A `git-<name>` program in git's exec path (`git --exec-path`).
+fn exec_path_command(name: &str) -> bool {
+    static EXEC_PATH: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+        git_output(Path::new("."), &["--exec-path"]).map(|s| PathBuf::from(s.trim_end()))
+    });
+    EXEC_PATH
+        .as_ref()
+        .is_some_and(|d| d.join(format!("git-{name}")).is_file())
+}
+
 /// An executable `git-<name>` on `PATH` (git runs it for `git <name>`).
 fn external_git_command(name: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
@@ -616,15 +723,10 @@ fn external_git_command(name: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(&file).is_file())
 }
 
+/// Run git in `dir` (hardened: repository config cannot run programs, see
+/// [`state::safe_git`]); its stdout on success.
 fn git_output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = state::safe_git(dir).args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8(out.stdout).ok())
@@ -639,9 +741,37 @@ fn canonical_output<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Option<PathBuf> 
         .ok()
 }
 
-/// The git directory of the repository (or worktree) holding `dir`, canonicalized.
-fn repo_of_dir(dir: &Path) -> Option<PathBuf> {
-    canonical_output(dir, &["rev-parse", "--absolute-git-dir"])
+/// The repository holding `dir` (with git's global options `global`, such as `--git-dir`).
+fn repo_with(dir: &Path, global: &[&OsStr]) -> Option<Repo> {
+    let args = |rest: &[&'static str]| -> Vec<&OsStr> {
+        let mut v: Vec<&OsStr> = global.to_vec();
+        v.extend(rest.iter().map(|s| OsStr::new(*s)));
+        v
+    };
+    let dirs = git_output(
+        dir,
+        &args(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--absolute-git-dir",
+        ]),
+    )?;
+    let mut lines = dirs.lines().map(|l| PathBuf::from(l).canonicalize());
+    let (Some(Ok(common)), Some(Ok(git_dir))) = (lines.next(), lines.next()) else {
+        return None;
+    };
+    let top = canonical_output(dir, &args(&["rev-parse", "--show-toplevel"]));
+    Some(Repo {
+        common,
+        git_dir,
+        top,
+    })
+}
+
+/// The repository holding `dir`.
+fn repo_of_dir(dir: &Path) -> Option<Repo> {
+    repo_with(dir, &[])
 }
 
 /// Apply a `cd`/`-C` argument to `base` (handles `~` and absolute paths).
