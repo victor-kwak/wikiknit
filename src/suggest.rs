@@ -395,6 +395,8 @@ pub struct Suggester<'a> {
     df: HashMap<(String, String), usize>,
     /// Mean vector per note (index order), when there is an index.
     vectors: Vec<Option<Vec<f32>>>,
+    /// The vault analyzed once for the "similar text" searches.
+    corpus: search::Corpus,
 }
 
 impl<'a> Suggester<'a> {
@@ -434,6 +436,7 @@ impl<'a> Suggester<'a> {
         Self {
             vault,
             index,
+            corpus: search::Corpus::new(vault),
             matcher: mentions::Matcher::new(vault),
             common: common_headings(vault),
             adj,
@@ -573,8 +576,9 @@ impl<'a> Suggester<'a> {
         }
         // Quotes in a title or heading must not turn into phrase rules.
         let query = query.replace('"', " ");
-        let hits = search::search(
+        let hits = search::search_in(
             vault,
+            &self.corpus,
             &query,
             &Filter::default(),
             &search::Options {

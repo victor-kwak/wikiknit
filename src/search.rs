@@ -448,6 +448,62 @@ fn build_stats(note: &Note, an: &mut Analyzer, q: &Query, generic: &[String]) ->
     stats
 }
 
+/// Every note analyzed once: field lengths and each term's count per field. For running many
+/// queries over one vault (`suggest`), where analyzing the vault per query would dominate.
+pub struct Corpus {
+    docs: Vec<DocTerms>,
+}
+
+struct DocTerms {
+    lens: [usize; 5],
+    counts: HashMap<String, [u32; 5]>,
+}
+
+impl Corpus {
+    #[must_use]
+    pub fn new(vault: &Vault) -> Self {
+        let cfg = &vault.config;
+        let docs = vault
+            .notes
+            .par_iter()
+            .map_init(
+                || Analyzer::new(&cfg.stemmer),
+                |an, note| {
+                    let mut d = DocTerms {
+                        lens: [0; 5],
+                        counts: HashMap::new(),
+                    };
+                    for (f, field_text) in field_texts(note, &cfg.generic_names).iter().enumerate()
+                    {
+                        for line in field_text.lines() {
+                            for tok in an.tokens(line, true) {
+                                d.lens[f] += 1;
+                                d.counts.entry(tok.term).or_default()[f] += 1;
+                            }
+                        }
+                    }
+                    d
+                },
+            )
+            .collect();
+        Self { docs }
+    }
+
+    /// The same [`Stats`] as [`build_stats`] gives, for a query without phrases.
+    fn stats(&self, i: usize, q: &Query) -> Stats {
+        let d = &self.docs[i];
+        Stats {
+            lens: d.lens,
+            counts: q
+                .terms
+                .iter()
+                .map(|t| d.counts.get(t).copied().unwrap_or_default())
+                .collect(),
+            phrases_ok: true,
+        }
+    }
+}
+
 fn normalize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
@@ -459,6 +515,29 @@ fn normalize(s: &str) -> String {
 #[must_use]
 #[allow(clippy::cast_precision_loss)] // counts far below 2^52
 pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -> Vec<Hit> {
+    search_impl(vault, None, query, filter, opts)
+}
+
+/// [`search`] over a [`Corpus`] built once for the vault (same results, no re-analysis).
+#[must_use]
+pub fn search_in(
+    vault: &Vault,
+    corpus: &Corpus,
+    query: &str,
+    filter: &Filter,
+    opts: &Options<'_>,
+) -> Vec<Hit> {
+    search_impl(vault, Some(corpus), query, filter, opts)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)] // counts far below 2^52
+fn search_impl(
+    vault: &Vault,
+    prepared: Option<&Corpus>,
+    query: &str,
+    filter: &Filter,
+    opts: &Options<'_>,
+) -> Vec<Hit> {
     let Options {
         include_hubs,
         limit,
@@ -479,13 +558,17 @@ pub fn search(vault: &Vault, query: &str, filter: &Filter, opts: &Options<'_>) -
         .filter(|(_, n)| include_hubs || !cfg.is_hub(&n.id))
         .map(|(i, _)| i)
         .collect();
-    let docs: Vec<Stats> = corpus
-        .par_iter()
-        .map_init(
-            || Analyzer::new(&cfg.stemmer),
-            |an, &i| build_stats(&vault.notes[i], an, &q, &cfg.generic_names),
-        )
-        .collect();
+    let docs: Vec<Stats> = match prepared {
+        // Phrases need word positions, which the corpus does not keep.
+        Some(c) if q.phrases.is_empty() => corpus.iter().map(|&i| c.stats(i, &q)).collect(),
+        _ => corpus
+            .par_iter()
+            .map_init(
+                || Analyzer::new(&cfg.stemmer),
+                |an, &i| build_stats(&vault.notes[i], an, &q, &cfg.generic_names),
+            )
+            .collect(),
+    };
     let n_docs = docs.len() as f64;
     let mut avg = [0.0f64; 5];
     for d in &docs {
@@ -830,6 +913,49 @@ mod tests {
         let grounded = ids("alpha");
         assert!(grounded.contains(&"y".to_string()), "{grounded:?}");
         assert!(grounded.contains(&"z".to_string()), "{grounded:?}");
+    }
+
+    #[test]
+    fn a_prepared_corpus_gives_the_same_results() {
+        let v = vault_of(&[
+            (
+                "a.md",
+                "---\ntags: [net]\n---\n# Alpha net\ncloudflare tunnel snapshot.sh\n## Deploy\nrun it\n",
+            ),
+            ("b.md", "# b\ncloudflare dns, tunnel later\n"),
+            ("c.md", "# Gamma\nid_ed25519 key for deploys\n"),
+        ]);
+        let corpus = Corpus::new(&v);
+        let opts = Options {
+            include_hubs: false,
+            limit: 10,
+            semantic: None,
+            lexical: true,
+        };
+        for q in [
+            "cloudflare tunnel",
+            "deploy",
+            "snapshot.sh net",
+            "id_ed25519",
+            "\"cloudflare tunnel\"",
+            "Gamma",
+        ] {
+            let a = search(&v, q, &Filter::default(), &opts);
+            let b = search_in(&v, &corpus, q, &Filter::default(), &opts);
+            let key = |h: &Hit| {
+                (
+                    h.id.clone(),
+                    h.score.to_bits(),
+                    h.coverage.to_bits(),
+                    h.line,
+                )
+            };
+            assert_eq!(
+                a.iter().map(key).collect::<Vec<_>>(),
+                b.iter().map(key).collect::<Vec<_>>(),
+                "{q}"
+            );
+        }
     }
 
     #[test]
