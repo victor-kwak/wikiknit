@@ -184,17 +184,11 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
     }
     // shell state at each open subshell / substitution
     let mut scopes: Vec<Ctx> = Vec::new();
-    // every simple command so far, by index (heredoc bodies refer back to their command)
+    // every simple command so far (heredoc bodies and pipes refer to commands by id)
     let mut commands: Vec<Cmd> = Vec::new();
-    // piped[i]: command i's output is piped into command i + 1
-    let mut piped: Vec<bool> = Vec::new();
+    let mut bodies: Vec<(usize, String, Ctx)> = Vec::new();
     for item in tokenize(command) {
         match item {
-            Item::Pipe => {
-                if let Some(last) = piped.last_mut() {
-                    *last = true;
-                }
-            }
             Item::Open => scopes.push(ctx.clone()),
             Item::Close => {
                 if let Some(saved) = scopes.pop() {
@@ -205,32 +199,33 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
                 let mut inner = ctx.clone();
                 collect(&script, &mut inner, out, depth + 1);
             }
-            Item::Body { cmd, text } => {
-                // The body is a script when its command, or a command it is piped into
-                // (`cat <<EOF | sh`), is a shell reading stdin.
-                let mut j = cmd;
-                let mut feeds_shell = false;
-                while let Some(c) = commands.get(j) {
-                    if reads_stdin_shell(&c.words) {
-                        feeds_shell = true;
-                        break;
-                    }
-                    if !piped.get(j).copied().unwrap_or(false) {
-                        break;
-                    }
-                    j += 1;
-                }
-                if feeds_shell {
-                    let mut inner = ctx.clone();
-                    collect(&text, &mut inner, out, depth + 1);
-                }
-            }
+            // Judged once every command is known: the shell it is piped into may come later
+            // (`(cat <<EOF ... EOF\n) | sh`).
+            Item::Body { cmd, text } => bodies.push((cmd, text, ctx.clone())),
             Item::Cmd(cmd) => {
-                commands.push(cmd.clone());
-                piped.push(false);
-                let feed = stdin_feed(&commands, &piped, commands.len() - 1);
+                let feed = stdin_feed(&commands, &cmd);
                 simple(&cmd.words, &cmd.redirects, &feed, ctx, out, depth);
+                commands.push(cmd);
             }
+        }
+    }
+    // A heredoc body is a script when its command, or a command it is piped into
+    // (`cat <<EOF | sh`), is a shell reading stdin.
+    for (cmd, text, mut inner) in bodies {
+        let mut j = cmd;
+        let mut feeds_shell = false;
+        while let Some(c) = commands.iter().find(|c| c.id == j) {
+            if reads_stdin_shell(&c.words) {
+                feeds_shell = true;
+                break;
+            }
+            match commands.iter().find(|n| n.stdin_from.contains(&j)) {
+                Some(next) => j = next.id,
+                None => break,
+            }
+        }
+        if feeds_shell {
+            collect(&text, &mut inner, out, depth + 1);
         }
     }
 }
@@ -247,7 +242,7 @@ fn reads_stdin_shell(words: &[String]) -> bool {
 enum Feed {
     /// Nothing visible (the agent's stdin).
     Terminal,
-    /// The heredoc of command `n` (its body is handled where it is parsed).
+    /// The heredoc of the command with this id (its body is handled where it is parsed).
     Heredoc(usize),
     /// This text.
     Literal(String),
@@ -257,9 +252,8 @@ enum Feed {
     Opaque,
 }
 
-/// The stdin of command `idx`.
-fn stdin_feed(commands: &[Cmd], piped: &[bool], idx: usize) -> Feed {
-    let cmd = &commands[idx];
+/// The stdin of `cmd`; `commands` are the commands before it.
+fn stdin_feed(commands: &[Cmd], cmd: &Cmd) -> Feed {
     // The last redirection of fd 0 wins.
     for r in cmd.redirects.iter().rev() {
         let digits = r.op.len() - r.op.trim_start_matches(|c: char| c.is_ascii_digit()).len();
@@ -268,7 +262,7 @@ fn stdin_feed(commands: &[Cmd], piped: &[bool], idx: usize) -> Feed {
             continue;
         }
         match op {
-            "<<" => return Feed::Heredoc(idx),
+            "<<" => return Feed::Heredoc(cmd.id),
             "<<<" => return Feed::Literal(r.target.clone()),
             "<" | "<>" => {
                 return match process_substitution(&r.target) {
@@ -279,15 +273,38 @@ fn stdin_feed(commands: &[Cmd], piped: &[bool], idx: usize) -> Feed {
             _ => {}
         }
     }
-    if idx > 0 && piped.get(idx - 1).copied().unwrap_or(false) {
-        return output_of(commands, piped, idx - 1);
+    let feeds: Vec<Feed> = cmd
+        .stdin_from
+        .iter()
+        .map(|from| {
+            commands
+                .iter()
+                .find(|c| c.id == *from)
+                .map_or(Feed::Opaque, |producer| output_of(commands, producer))
+        })
+        .collect();
+    match feeds.len() {
+        0 => Feed::Terminal,
+        1 => feeds.into_iter().next().unwrap_or(Feed::Opaque),
+        // A group piped in: its literal output in order; anything unreadable makes it opaque
+        // (heredoc bodies are parsed where they appear).
+        _ => {
+            let mut text = Vec::new();
+            for f in feeds {
+                match f {
+                    Feed::Literal(t) => text.push(t),
+                    Feed::Heredoc(_) | Feed::Terminal => {}
+                    Feed::File | Feed::Opaque => return Feed::Opaque,
+                }
+            }
+            Feed::Literal(text.join("\n"))
+        }
     }
-    Feed::Terminal
 }
 
-/// What command `idx` writes to stdout.
-fn output_of(commands: &[Cmd], piped: &[bool], idx: usize) -> Feed {
-    let p = strip_prefixes(&commands[idx].words);
+/// What `cmd` writes to stdout.
+fn output_of(commands: &[Cmd], cmd: &Cmd) -> Feed {
+    let p = strip_prefixes(&cmd.words);
     let Some((program, args)) = p.words.split_first() else {
         return Feed::Terminal;
     };
@@ -310,9 +327,9 @@ fn output_of(commands: &[Cmd], piped: &[bool], idx: usize) -> Feed {
         "printf" => Feed::Literal(unescape(&args.join(" "))),
         // Pass stdin through.
         "cat" if args.iter().all(|a| a.len() > 1 && a.starts_with('-')) => {
-            stdin_feed(commands, piped, idx)
+            stdin_feed(commands, cmd)
         }
-        "tee" => stdin_feed(commands, piped, idx),
+        "tee" => stdin_feed(commands, cmd),
         _ => Feed::Opaque,
     }
 }
@@ -330,27 +347,18 @@ fn process_substitution(word: &str) -> Option<&str> {
 /// What the commands of a process substitution print.
 fn process_output(inner: &str) -> Feed {
     let mut cmds = Vec::new();
-    let mut piped = Vec::new();
     let mut bodies = Vec::new();
     for item in tokenize(inner) {
         match item {
-            Item::Cmd(c) => {
-                cmds.push(c);
-                piped.push(false);
-            }
-            Item::Pipe => {
-                if let Some(l) = piped.last_mut() {
-                    *l = true;
-                }
-            }
+            Item::Cmd(c) => cmds.push(c),
             Item::Body { cmd, text } => bodies.push((cmd, text)),
             _ => return Feed::Opaque,
         }
     }
-    let Some(last) = cmds.len().checked_sub(1) else {
+    let Some(last) = cmds.last() else {
         return Feed::Terminal;
     };
-    match output_of(&cmds, &piped, last) {
+    match output_of(&cmds, last) {
         Feed::Heredoc(j) => bodies
             .into_iter()
             .find(|(c, _)| *c == j)
@@ -622,19 +630,18 @@ fn simple(
     let mut dirs = ctx.cds.clone();
     dirs.extend(p.dirs.iter().cloned());
     let name = program_name(program);
-    // A program word that is not a literal (`$G`, `$(which git)`).
-    if program.contains(['$', '`']) {
-        let commits = args
-            .iter()
-            .any(|a| a == "commit" || a == "commit-tree" || a == "--continue");
-        if commits {
-            let mut call = parse_git(args, &dirs, None, None, true).unwrap_or_default();
-            if !matches!(call.subcommand.as_str(), "commit" | "commit-tree") {
-                call.subcommand = "commit".into();
-            }
-            call.config_overridden = true;
-            out.calls.push(call);
-        }
+    // A program word that is not a literal (`$G`, `$(which git)`), or a wrapper option this
+    // parser does not know: it may be git, doing anything, in a repository that cannot be
+    // known.
+    if is_dynamic_word(program) || p.unparsed {
+        let mut call = parse_git(args, &dirs, None, None, true).unwrap_or_else(|| GitCall {
+            dirs: dirs.clone(),
+            ..GitCall::default()
+        });
+        call.subcommand = "commit".into();
+        call.config_overridden = true;
+        call.opaque = true;
+        out.calls.push(call);
         out.writes.push(Write {
             what,
             target: WriteTarget::Unknown,
@@ -679,6 +686,10 @@ fn simple(
             if let Some(script) = shell_c_script(args) {
                 collect(script, &mut inner, out, depth + 1);
             } else if shell_reads_stdin(args) {
+                // `bash $S`: the word may be a script file, or expand to nothing.
+                if script_operand(args).is_some_and(is_dynamic_word) {
+                    opaque(out, &inner, &what);
+                }
                 run_fed(feed, &inner, out, depth, &what);
             } else {
                 run_script_arg(args, feed, &inner, out, depth, &what);
@@ -787,6 +798,7 @@ fn run_script_arg(
     }
     match file {
         Some("/dev/stdin" | "-") => run_fed(feed, ctx, out, depth, what),
+        Some(f) if is_dynamic_word(f) => opaque(out, ctx, what),
         Some(f) => match process_substitution(f) {
             Some(inner) => run_fed(&process_output(inner), ctx, out, depth, what),
             None => out.writes.push(Write {
@@ -838,6 +850,8 @@ fn shell_c_script(args: &[String]) -> Option<&str> {
 }
 
 /// `bash` with only options reads its script from stdin (a heredoc, a pipe).
+/// `bash` with only options, or with `-s` (later words are arguments), reads its script from
+/// stdin (a heredoc, a pipe). So may `bash $X`: the word can expand to nothing.
 fn shell_reads_stdin(args: &[String]) -> bool {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -847,17 +861,42 @@ fn shell_reads_stdin(args: &[String]) -> bool {
             continue;
         }
         if a.starts_with('-') || a.starts_with('+') {
-            if a.len() > 1 && !a.starts_with("--") && a[1..].contains('c') {
+            let short = a.len() > 1 && !a.starts_with("--");
+            if short && a[1..].contains('c') {
                 return false;
             }
-            if a.len() > 1 && !a.starts_with("--") && a[1..].contains(['o', 'O']) {
+            if short && a.starts_with('-') && a[1..].contains('s') {
+                return true;
+            }
+            if short && a[1..].contains(['o', 'O']) {
                 it.next();
             }
             continue;
         }
-        return false;
+        return is_dynamic_word(a);
     }
     true
+}
+
+/// The first word of a shell's arguments that is not an option (its script file).
+fn script_operand(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if shell_opt_takes_arg(a) {
+            it.next();
+            continue;
+        }
+        if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) {
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
+/// A word the shell expands at run time into something this parser cannot see.
+fn is_dynamic_word(w: &str) -> bool {
+    w.contains(['$', '`'])
 }
 
 fn parse_git(
@@ -967,6 +1006,8 @@ struct Prefixed {
     xargs: bool,
     /// Not run at all (`command -v git`).
     not_run: bool,
+    /// A wrapper option this parser does not know: what runs cannot be told.
+    unparsed: bool,
 }
 
 /// Drop shell keywords, env assignments, and wrapper commands (with their options)
@@ -1037,6 +1078,10 @@ fn strip_prefixes(words: &[String]) -> Prefixed {
         p.xargs |= name == "xargs";
         let arg_opts = wrapper_arg_opts(&name);
         i += 1;
+        if name == "env" {
+            i = env_options(&mut w, i, &mut p);
+            continue;
+        }
         while i < w.len() && w[i].starts_with('-') {
             let opt = w[i].clone();
             i += 1;
@@ -1049,30 +1094,9 @@ fn strip_prefixes(words: &[String]) -> Prefixed {
                 v
             };
             match (name.as_str(), opt.as_str()) {
-                ("env", "-C" | "--chdir") | ("sudo", "-D" | "--chdir") => {
-                    p.dirs.extend(value(&mut i));
-                }
-                ("env" | "sudo", o) if o.starts_with("--chdir=") => {
+                ("sudo", "-D" | "--chdir") => p.dirs.extend(value(&mut i)),
+                ("sudo", o) if o.starts_with("--chdir=") => {
                     p.dirs.push(o["--chdir=".len()..].to_string());
-                }
-                ("env", o) if o.starts_with("-C") => p.dirs.push(o[2..].to_string()),
-                ("env", "-u" | "--unset") => p.unsets.extend(value(&mut i)),
-                ("env", o) if o.starts_with("--unset=") => {
-                    p.unsets.push(o["--unset=".len()..].to_string());
-                }
-                ("env", "-S" | "--split-string") => {
-                    // `env -S 'git commit -m x'`: the string is split into words.
-                    if let Some(s) = value(&mut i) {
-                        let split: Vec<String> = s.split_whitespace().map(str::to_string).collect();
-                        w.splice(i..i, split);
-                    }
-                }
-                ("env", o) if o.starts_with("--split-string=") => {
-                    let split: Vec<String> = o["--split-string=".len()..]
-                        .split_whitespace()
-                        .map(str::to_string)
-                        .collect();
-                    w.splice(i..i, split);
                 }
                 _ if arg_opts.contains(&opt.as_str()) => i += 1,
                 _ => {}
@@ -1087,6 +1111,96 @@ fn strip_prefixes(words: &[String]) -> Prefixed {
     p
 }
 
+/// Parse `env`'s options from `w[i]` on (GNU coreutils `env`); returns the index after them.
+/// `-S STRING` splits STRING into words in place. An unknown option sets `unparsed`.
+fn env_options(w: &mut Vec<String>, mut i: usize, p: &mut Prefixed) -> usize {
+    while i < w.len() && w[i].starts_with('-') {
+        let opt = w[i].clone();
+        i += 1;
+        if opt == "--" {
+            break;
+        }
+        if opt == "-" {
+            continue; // same as -i
+        }
+        // (option, value) for the options that take one
+        let mut take: Option<(char, String)> = None;
+        if let Some(long) = opt.strip_prefix("--") {
+            let (k, v) = match long.split_once('=') {
+                Some((k, v)) => (k, Some(v.to_string())),
+                None => (long, None),
+            };
+            let short = match k {
+                "ignore-environment"
+                | "null"
+                | "debug"
+                | "block-signal"
+                | "default-signal"
+                | "ignore-signal"
+                | "list-signal-handling" => continue,
+                "help" | "version" => {
+                    p.not_run = true;
+                    continue;
+                }
+                "unset" => 'u',
+                "chdir" => 'C',
+                "split-string" => 'S',
+                _ => {
+                    p.unparsed = true;
+                    return i;
+                }
+            };
+            let v = match v {
+                Some(v) => v,
+                None => {
+                    i += 1;
+                    w.get(i - 1).cloned().unwrap_or_default()
+                }
+            };
+            take = Some((short, v));
+        } else {
+            let chars: Vec<char> = opt[1..].chars().collect();
+            for (k, c) in chars.iter().enumerate() {
+                match c {
+                    'i' | '0' | 'v' => {}
+                    'u' | 'C' | 'S' => {
+                        let rest: String = chars[k + 1..].iter().collect();
+                        let v = if rest.is_empty() {
+                            i += 1;
+                            w.get(i - 1).cloned().unwrap_or_default()
+                        } else {
+                            rest
+                        };
+                        take = Some((*c, v));
+                        break;
+                    }
+                    _ => {
+                        p.unparsed = true;
+                        return i;
+                    }
+                }
+            }
+        }
+        match take {
+            Some(('u', v)) => p.unsets.push(v),
+            Some(('C', v)) => p.dirs.push(v),
+            Some((_, v)) => {
+                // `-S 'git commit -m x'`: split as the shell would split words.
+                let split: Vec<String> = tokenize(&v)
+                    .into_iter()
+                    .flat_map(|item| match item {
+                        Item::Cmd(c) => c.words,
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                w.splice(i..i, split);
+            }
+            None => {}
+        }
+    }
+    i
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Redir {
     /// `>`, `>>`, `2>`, `&>`, `>&`, `<`, `<<`, `<<<`, ...
@@ -1097,9 +1211,21 @@ struct Redir {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Cmd {
+    /// Unique in one `tokenize`, given when the command starts (before any substitution
+    /// inside it runs), so heredocs and pipes point at the right command.
+    id: usize,
     /// Words with quotes removed; redirections taken out.
     words: Vec<String>,
     redirects: Vec<Redir>,
+    /// Commands whose output is piped into this one (several for `( ... ) |`, `{ ...; } |`).
+    stdin_from: Vec<usize>,
+}
+
+/// An open `( ... )` or `{ ...; }`: what is piped into it, and the commands inside it.
+struct Group {
+    stdin: Vec<usize>,
+    ids: Vec<usize>,
+    paren: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1112,10 +1238,8 @@ enum Item {
     Close,
     /// A command substitution found inside double quotes.
     Sub(String),
-    /// A heredoc body, fed to the command with this index (in order of `Cmd` items).
+    /// A heredoc body, fed to the command with this id.
     Body { cmd: usize, text: String },
-    /// The previous command's output is piped into the next one (`|`, `|&`).
-    Pipe,
 }
 
 struct Heredoc {
@@ -1134,6 +1258,9 @@ struct Saved {
     word: String,
     redirects: Vec<Redir>,
     pending: Option<String>,
+    cur_id: Option<usize>,
+    pipe_from: Vec<usize>,
+    groups: Vec<Group>,
     start: usize,
 }
 
@@ -1218,7 +1345,15 @@ fn tokenize(command: &str) -> Vec<Item> {
     let mut pending: Option<String> = None;
     let mut word = String::new();
     let mut in_word = false;
-    let mut cmd_count = 0usize;
+    // Ids: the command being built has one once a heredoc names it (else at its end).
+    let mut next_id = 0usize;
+    let mut cur_id: Option<usize> = None;
+    // Producers piped into the next command; groups open at this level; the commands of the
+    // group that just closed (a pipe after `)` or `}` reads all of them).
+    let mut pipe_from: Vec<usize> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut last_group: Option<Vec<usize>> = None;
+    let mut emitted: Option<usize> = None;
     let mut heredocs: Vec<Heredoc> = Vec::new();
     let mut in_backtick = false;
     let mut i = 0;
@@ -1254,12 +1389,47 @@ fn tokenize(command: &str) -> Vec<Item> {
         () => {
             end_word!();
             pending = None;
+            emitted = None;
+            let closes_brace =
+                words.len() == 1 && words[0] == "}" && groups.last().is_some_and(|g| !g.paren);
+            let mut closed = None;
+            if closes_brace {
+                closed = groups.pop().map(|g| g.ids);
+                words.clear();
+            }
             if !words.is_empty() || !redirects.is_empty() {
+                let id = cur_id.take().unwrap_or_else(|| {
+                    next_id += 1;
+                    next_id - 1
+                });
+                let mut stdin_from = std::mem::take(&mut pipe_from);
+                if stdin_from.is_empty()
+                    && let Some(g) = groups.last()
+                {
+                    stdin_from = g.stdin.clone();
+                }
+                for g in &mut groups {
+                    g.ids.push(id);
+                }
+                if words.first().is_some_and(|w| w == "{") {
+                    groups.push(Group {
+                        stdin: stdin_from.clone(),
+                        ids: vec![id],
+                        paren: false,
+                    });
+                }
                 items.push(Item::Cmd(Cmd {
+                    id,
                     words: std::mem::take(&mut words),
                     redirects: std::mem::take(&mut redirects),
+                    stdin_from,
                 }));
-                cmd_count += 1;
+                emitted = Some(id);
+                last_group = None;
+            }
+            cur_id = None;
+            if closed.is_some() {
+                last_group = closed;
             }
         };
     }
@@ -1274,6 +1444,9 @@ fn tokenize(command: &str) -> Vec<Item> {
                 word: std::mem::take(&mut word),
                 redirects: std::mem::take(&mut redirects),
                 pending: pending.take(),
+                cur_id: cur_id.take(),
+                pipe_from: std::mem::take(&mut pipe_from),
+                groups: std::mem::take(&mut groups),
                 start: $start,
             }));
             in_word = false;
@@ -1285,14 +1458,30 @@ fn tokenize(command: &str) -> Vec<Item> {
         ($end:expr) => {
             end_cmd!();
             items.push(Item::Close);
-            if let Some(Some(s)) = opens.pop() {
-                words = s.words;
-                word = s.word;
-                redirects = s.redirects;
-                pending = s.pending;
-                in_word = true;
-                let end = ($end).min(chars.len().saturating_sub(1));
-                word.extend(chars[s.start..=end].iter());
+            match opens.pop() {
+                Some(Some(s)) => {
+                    words = s.words;
+                    word = s.word;
+                    redirects = s.redirects;
+                    pending = s.pending;
+                    cur_id = s.cur_id;
+                    pipe_from = s.pipe_from;
+                    groups = s.groups;
+                    last_group = None;
+                    in_word = true;
+                    let end = ($end).min(chars.len().saturating_sub(1));
+                    word.extend(chars[s.start..=end].iter());
+                }
+                Some(None) => {
+                    // A subshell: a pipe after it reads every command in it.
+                    while let Some(g) = groups.pop() {
+                        if g.paren {
+                            last_group = Some(g.ids);
+                            break;
+                        }
+                    }
+                }
+                None => {}
             }
         };
     }
@@ -1376,6 +1565,11 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '(' => {
                 end_cmd!();
+                groups.push(Group {
+                    stdin: std::mem::take(&mut pipe_from),
+                    ids: Vec::new(),
+                    paren: true,
+                });
                 items.push(Item::Open);
                 opens.push(None);
             }
@@ -1430,6 +1624,10 @@ fn tokenize(command: &str) -> Vec<Item> {
                     i += 1;
                 }
                 if !delim.is_empty() {
+                    let id = *cur_id.get_or_insert_with(|| {
+                        next_id += 1;
+                        next_id - 1
+                    });
                     redirects.push(Redir {
                         op: "<<".into(),
                         target: delim.clone(),
@@ -1438,7 +1636,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                         delim,
                         strip_tabs,
                         quoted,
-                        cmd: cmd_count,
+                        cmd: id,
                     });
                 }
                 continue;
@@ -1530,13 +1728,18 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '|' if chars.get(i + 1) == Some(&'|') => {
                 end_cmd!();
+                last_group = None;
                 i += 2;
                 continue;
             }
             '|' => {
                 // `|` or `|&`: a pipe into the next command.
                 end_cmd!();
-                items.push(Item::Pipe);
+                pipe_from = match (last_group.take(), emitted) {
+                    (Some(g), _) => g,
+                    (None, Some(id)) => vec![id],
+                    (None, None) => Vec::new(),
+                };
                 if chars.get(i + 1) == Some(&'&') {
                     i += 1;
                 }
@@ -1918,5 +2121,94 @@ mod tests {
         }
         let calls = git_calls(&c);
         assert!(calls.iter().any(|g| g.opaque), "{calls:?}");
+    }
+
+    /// Whether `c` is found to run `git commit` that the parser can see (not opaque).
+    fn seen_commit(c: &str) -> bool {
+        git_calls(c)
+            .iter()
+            .any(|g| g.subcommand == "commit" && !g.opaque)
+    }
+
+    fn opaque_call(c: &str) -> bool {
+        git_calls(c).iter().any(|g| g.opaque)
+    }
+
+    #[test]
+    fn substitutions_do_not_shift_pipes_or_heredocs() {
+        for c in [
+            "echo 'git commit -m x' | x=$(true) bash",
+            "echo 'git commit -m x' | x=`true` bash",
+            "cat <<'EOF' | x=$(true) sh\ngit commit -m x\nEOF",
+            "bash -s <<'EOF' $(true)\ngit commit -m x\nEOF",
+            "x=$(true) bash <<'EOF'\ngit commit -m x\nEOF",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+    }
+
+    #[test]
+    fn groups_piped_into_a_shell() {
+        for c in [
+            "(echo 'git commit -m x') | bash",
+            "{ echo 'git commit -m x'; } | bash",
+            "(echo hi; echo 'git commit') | bash",
+            "echo 'git commit -m x' | (bash)",
+            "echo 'git commit -m x' | { cd a; bash; }",
+            "(cat <<'EOF'\ngit commit\nEOF\n) | bash",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+        // Any unreadable part of a group makes the script opaque.
+        for c in [
+            "(curl -s x; echo hi) | bash",
+            "{ curl -s x; echo hi; } | bash",
+            "for f in a; do cat $f; done | bash",
+        ] {
+            assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
+        }
+        assert!(git_calls("(echo 'git commit') | cat").is_empty());
+    }
+
+    #[test]
+    fn non_literal_program_words_are_opaque() {
+        for c in [
+            "$G status",
+            "\"$(which git)\" st",
+            "`which git` log",
+            "$EDITOR f",
+        ] {
+            assert!(opaque_call(c), "{c}");
+        }
+        assert!(!opaque_call("x=$(true) git status"));
+        assert!(opaque_call("bash $S"));
+        assert!(opaque_call("source $F"));
+    }
+
+    #[test]
+    fn env_options() {
+        for c in [
+            "env -S'git commit -m x'",
+            "env -iS 'git commit -m x'",
+            "env -vS'git commit'",
+            "env --split-string='git commit -m \"a b\"'",
+            "env -u X -C a -i git commit",
+        ] {
+            assert!(seen_commit(c), "{c}: {:?}", git_calls(c));
+        }
+        assert_eq!(dirs("env -Ca git commit"), vec![v(&["a"])]);
+        assert_eq!(dirs("env -iCa git commit"), vec![v(&["a"])]);
+        assert_eq!(
+            git_commits("export GIT_DIR=r; env -uGIT_DIR git commit")[0].git_dir,
+            None
+        );
+        for c in [
+            "env --bogus git status",
+            "env -q git status",
+            "env -iq git status",
+        ] {
+            assert!(opaque_call(c), "{c}");
+        }
+        assert!(git_calls("env --help").is_empty());
     }
 }
