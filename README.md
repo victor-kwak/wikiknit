@@ -323,7 +323,13 @@ This repo is also a Claude Code plugin marketplace. The plugin adds:
     (`$G`, `$(which git)`, `{git,x}`, `gi?`, `git $CMD`), `xargs` supplying the program or
     subcommand, an `env` option it does not know or an `env -S` string that env splits differently
     from the shell, config from `GIT_CONFIG*`, `GIT_DIR`, `HOME`, or `PATH`, an external `git-<name>`
-    program (except `git lfs`, other than `lfs migrate`).
+    program (except `git lfs`, other than `lfs migrate`), an alias change it cannot follow
+    (`BASH_ALIASES[...]=`).
+  - *Wrappers and runners*: each one wikiknit models (`sudo`, `env`, `xargs`, `timeout`, `nice`,
+    `su`, `runuser`, `script`, `flock`, `watch`, `trap`, the shells, `printf`, ...) has a complete
+    table of its options, read the way `getopt` reads them (clusters, attached and separate
+    values, long options, `--`). An option not in the table, or a missing command (`xargs sudo`,
+    `flock FILE`), counts as a commit in any repository.
   - *Which repository*: the one the commit runs in, after `cd`, `env -C`, `-C`, `--git-dir`, and an
     exported or inline `GIT_DIR`. The `wikiknit.toml` is looked up from there, from the session's
     folder, and from `$CLAUDE_PROJECT_DIR`, and each vault found is checked. Repositories are
@@ -350,6 +356,12 @@ This repo is also a Claude Code plugin marketplace. The plugin adds:
 - **`link` skill**: the link pass itself. The agent reads the catalog, decides which notes each changed
   note is about (by meaning, using what it knows about the task), adds links both ways, adds missing
   aliases, re-checks, and runs `wikiknit mark`.
+
+**Threat model.** The commit gate is for an agent that forgets the link pass. It catches the
+commit however the command is written, including unusual shell forms, and holds it when it cannot
+tell. It is not a sandbox against an agent that sets out to get past it: a script file that
+commits, or code that the commit's own git hooks run, cannot be seen by a check made before the
+command runs.
 
 The hooks run only in projects with a `wikiknit.toml`, use no LLM calls, and do nothing if the
 `wikiknit` binary is not on `PATH`.
