@@ -504,6 +504,26 @@ impl Corpus {
     }
 }
 
+/// English function words, as query terms (stemmed like the query). Other languages: none.
+fn stopwords(stemmer: &str, an: &mut Analyzer) -> BTreeSet<String> {
+    const EN: &[&str] = &[
+        "a", "about", "after", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because",
+        "been", "before", "being", "between", "both", "but", "by", "can", "could", "did", "do",
+        "does", "doing", "done", "during", "each", "for", "from", "get", "got", "had", "has",
+        "have", "having", "he", "her", "here", "him", "his", "how", "i", "if", "in", "into", "is",
+        "it", "its", "just", "me", "more", "most", "my", "no", "not", "now", "of", "on", "once",
+        "only", "or", "other", "our", "out", "over", "own", "same", "she", "should", "so", "some",
+        "such", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this",
+        "those", "through", "to", "too", "under", "until", "up", "us", "very", "was", "we", "were",
+        "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with", "would",
+        "you", "your",
+    ];
+    if stemmer != "english" {
+        return BTreeSet::new();
+    }
+    EN.iter().flat_map(|w| an.query_terms(w)).collect()
+}
+
 fn normalize(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
@@ -587,11 +607,28 @@ fn search_impl(
             }
         }
     }
-    // Term weights: rare terms weigh more; a term no note has weighs most (it is unmatched).
-    let idf_q: Vec<f64> = df
+    // Term weights for coverage and snippets: rare terms weigh more; a term no note has
+    // weighs most (it is unmatched). Function words ("how", "does") weigh nothing, so a note
+    // matching them is not taken to cover a question (BM25 still scores them, lightly).
+    let stop = stopwords(&cfg.stemmer, &mut an);
+    let mut idf_q: Vec<f64> = df
         .iter()
-        .map(|&d| (1.0 + (n_docs - d as f64 + 0.5) / (d as f64 + 0.5)).ln())
+        .zip(&q.terms)
+        .map(|(&d, term)| {
+            if stop.contains(term) {
+                0.0
+            } else {
+                (1.0 + (n_docs - d as f64 + 0.5) / (d as f64 + 0.5)).ln()
+            }
+        })
         .collect();
+    if idf_q.iter().all(|&w| w == 0.0) {
+        // A query of function words only: weigh them after all.
+        idf_q = df
+            .iter()
+            .map(|&d| (1.0 + (n_docs - d as f64 + 0.5) / (d as f64 + 0.5)).ln())
+            .collect();
+    }
     let idf_total: f64 = idf_q.iter().sum::<f64>().max(1e-9);
     let mut coverage: BTreeMap<usize, f64> = BTreeMap::new();
     let inbound = vault.inbound_counts();
@@ -806,6 +843,11 @@ fn scored_lines<'a>(
         if in_code {
             score *= 0.5;
         }
+        // A line that is only links (`- [[a]] · [[b]]`, a Related list) says little.
+        let rest = text::strip_links(line);
+        if rest.chars().all(|c| !c.is_alphanumeric()) {
+            score *= 0.5;
+        }
         out.push((score, start_line + k, line, focus));
     }
     out
@@ -828,8 +870,19 @@ fn best_line(note: &Note, q: &Query, an: &mut Analyzer, weight: &[f64]) -> Optio
 pub fn matching_lines(vault: &Vault, note: &Note, query: &str) -> Vec<(usize, f64)> {
     let mut an = Analyzer::new(&vault.config.stemmer);
     let q = parse_query(query, &mut an);
-    scored_lines(note, &q, &mut an, &[])
+    // Function words do not make a line match (unless the query is nothing else).
+    let stop = stopwords(&vault.config.stemmer, &mut an);
+    let mut weight: Vec<f64> = q
+        .terms
+        .iter()
+        .map(|t| if stop.contains(t) { 0.0 } else { 1.0 })
+        .collect();
+    if weight.iter().all(|&w| w == 0.0) {
+        weight.fill(1.0);
+    }
+    scored_lines(note, &q, &mut an, &weight)
         .into_iter()
+        .filter(|&(s, ..)| s > 0.0)
         .map(|(s, l, _, _)| (l, s))
         .collect()
 }
@@ -956,6 +1009,45 @@ mod tests {
                 "{q}"
             );
         }
+    }
+
+    #[test]
+    fn snippets_prefer_prose_to_link_lists() {
+        let v = vault_of(&[
+            (
+                "a.md",
+                "# a\n## Related\n- [[gatehouse]]\n\nThe gatehouse login uses OAuth.\n",
+            ),
+            ("gatehouse.md", "# gatehouse\nx\n"),
+        ]);
+        let opts = Options {
+            include_hubs: false,
+            limit: 10,
+            semantic: None,
+            lexical: true,
+        };
+        let hits = search(&v, "gatehouse", &Filter::default(), &opts);
+        let a = hits.iter().find(|h| h.id == "a").unwrap();
+        assert!(a.snippet.contains("OAuth"), "{}", a.snippet);
+    }
+
+    #[test]
+    fn function_words_do_not_count_as_coverage() {
+        let v = vault_of(&[
+            ("g.md", "# g\ngatehouse is deployed with a script\n"),
+            ("o.md", "# o\nhow does it deploy? it does\n"),
+            ("p.md", "# p\nplain\n"),
+        ]);
+        let opts = Options {
+            include_hubs: false,
+            limit: 10,
+            semantic: None,
+            lexical: true,
+        };
+        let hits = search(&v, "how does gatehouse deploy", &Filter::default(), &opts);
+        let cov = |id: &str| hits.iter().find(|h| h.id == id).unwrap().coverage;
+        assert!(cov("g") > 0.99, "{}", cov("g"));
+        assert!(cov("o") < 0.6, "{}", cov("o"));
     }
 
     #[test]

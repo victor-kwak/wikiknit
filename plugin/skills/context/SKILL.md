@@ -20,8 +20,8 @@ wikiknit context <note> --budget 4000                              # a note you 
 The pack lists the best notes first. Each `<note>` entry has:
 
 - `role`: `seed` (a search hit, or the note you named) or `linked` (linked to or from a seed),
-- `content`: `full`, `excerpt` (the section around the matching line), or `summary` (one line),
-- `lines`: the file lines included, `why`: the search match or the link line that put it there.
+- `content`: `full`, `excerpt` (small frontmatter, the lead section, and the sections that match the query; `...` marks what is left out), or `summary` (one line),
+- `lines`: the file lines included, `why`: the search match (and how much of the query it covers) or the link line that put it there.
 
 `<omitted>` lists ranked notes that did not fit.
 

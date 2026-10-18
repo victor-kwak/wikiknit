@@ -28,6 +28,13 @@ pub fn link_display(target: &str, alias: Option<&str>, generic: &[String]) -> St
     stem.to_string()
 }
 
+/// `s` without its wikilinks and Markdown links.
+#[must_use]
+pub fn strip_links(s: &str) -> String {
+    let s = WIKILINK.replace_all(s, "");
+    MD_LINK.replace_all(&s, "").into_owned()
+}
+
 /// Replace wikilinks and Markdown links with their display text.
 #[must_use]
 pub fn links_to_text(s: &str, generic: &[String]) -> String {

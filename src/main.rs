@@ -133,6 +133,8 @@ fn refresh(
     vault: &Vault,
 ) -> Result<wikiknit::semantic::Update> {
     let (indexed, total) = sem.coverage(vault);
+    // Each missing note is at least one chunk: more missing notes than the refresh budget
+    // cannot all fit, so a refresh would not make the index usable.
     if !sem.covers(vault) && total - indexed > REFRESH_CHUNKS {
         return Ok(sem.update(vault, Some(0))?);
     }
@@ -825,7 +827,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 // Seeds are the hits that match by meaning or cover most of the question,
                 // close to the best of them. When none does, the best hit alone, and the
                 // pack says it is weak: the vault may not cover the question.
-                weak = !hits.iter().any(strong);
+                weak = !hits.is_empty() && !hits.iter().any(strong);
                 let top = hits
                     .iter()
                     .find(|h| strong(h))
