@@ -700,7 +700,7 @@ fn simple(
         if words.iter().any(|w| w == "exec")
             && redirects.iter().any(|r| {
                 let op = r.op.trim_start_matches('0');
-                matches!(op, "<" | "<<" | "<<<" | "<>" | "<&")
+                op.starts_with('<')
             })
         {
             ctx.opaque_rest = true;
@@ -763,6 +763,10 @@ fn simple(
         "export" | "declare" | "typeset" | "readonly" | "local" => {
             let exported =
                 name == "export" || args.iter().any(|a| a.starts_with('-') && a.contains('x'));
+            // A nameref (`declare -n`) makes later assignments land on another name.
+            if name != "export" && args.iter().any(|a| a.starts_with('-') && a.contains('n')) {
+                ctx.opaque_rest = true;
+            }
             for a in args.iter().filter(|a| !a.starts_with('-')) {
                 let var = a.split_once('=').map_or(a.as_str(), |(k, _)| k);
                 if is_dynamic_word(var.strip_suffix('+').unwrap_or(var)) {
@@ -807,9 +811,20 @@ fn simple(
                 Some(a) if a == "--" => &args[1..],
                 _ => args,
             };
-            if args.first().is_some_and(|a| a == "-v") && args.get(1).is_none_or(|n| risky_name(n))
-            {
-                ctx.opaque_rest = true;
+            // `-v NAME` and `-vNAME` assign; any other option is not modelled.
+            match args.first().map(String::as_str) {
+                Some("-v") => {
+                    if args.get(1).is_none_or(|n| risky_name(n)) {
+                        ctx.opaque_rest = true;
+                    }
+                }
+                Some(a) if a.starts_with("-v") => {
+                    if risky_name(&a[2..]) {
+                        ctx.opaque_rest = true;
+                    }
+                }
+                Some(a) if a.starts_with('-') && a.len() > 1 => ctx.opaque_rest = true,
+                _ => {}
             }
         }
         "set" => {
@@ -819,11 +834,11 @@ fn simple(
                 if !(on || a.starts_with('+')) || a.len() < 2 || a == "--" {
                     break;
                 }
-                if a[1..].contains('o') {
-                    if it.next().is_some_and(|o| o == "allexport") {
-                        ctx.allexport = on;
-                    }
-                } else if a[1..].contains('a') {
+                // Every letter of a cluster counts (`-ea`, `-ao allexport`).
+                if a[1..].contains('a') {
+                    ctx.allexport = on;
+                }
+                if a[1..].contains('o') && it.next().is_some_and(|o| o == "allexport") {
                     ctx.allexport = on;
                 }
             }
@@ -3394,11 +3409,22 @@ mod tests {
             assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
         }
         assert!(!opaque_call("exec 2>/dev/null; git status"));
+        // Review: every stdin redirect of exec, namerefs, printf -vNAME, clustered set flags.
+        for c in [
+            "exec <<-EOF\n\tgit commit -m x\n\tEOF\ngit status",
+            "declare -n r=GIT_DIR; r=x/.git; git status",
+            "printf -vGIT_DIR %s x/.git; git status",
+            "printf -x y; git status",
+        ] {
+            assert!(opaque_call(c), "{c}");
+        }
         // `set -a` exports every later assignment.
         for c in [
             "set -a; GIT_DIR=r/.git; git commit",
             "set -ea; GIT_DIR=r/.git; git commit",
             "set -o allexport; GIT_DIR=r/.git; git commit",
+            "set -ao allexport; GIT_DIR=r/.git; git commit",
+            "set -oa allexport; GIT_DIR=r/.git; git commit",
         ] {
             assert_eq!(git_commits(c)[0].git_dir.as_deref(), Some("r/.git"), "{c}");
         }
