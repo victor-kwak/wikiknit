@@ -1,35 +1,88 @@
-//! Just enough shell parsing to find the git commands a Bash command would run,
-//! and the directory each one runs in.
+//! Just enough shell parsing to find the git commands a Bash command would run, the
+//! directory and repository each one runs in, and the files the command may write.
 //!
 //! Data is not a command: heredoc bodies, quoted text, comments, and arithmetic
 //! (`cat <<EOF ... git commit ... EOF`, `echo "git commit"`, `$((1<<2))`, `(( x = 1 << 2 ))`).
 //! Commands are found behind shell keywords (`if ...; then git commit; fi`), wrappers (`sudo`,
-//! `timeout`, `xargs`, `env`, ...), `bash -c '...'`, `eval`, command substitution (also inside
-//! double quotes), and heredocs fed to a shell (`bash <<EOF`). `cd` inside a subshell or
-//! substitution does not leak out of it.
+//! `timeout`, `xargs`, `env`, `time -p`, ...), redirections (`2>/dev/null git commit`),
+//! `bash -c '...'`, `eval`, `find -exec`, command substitution (also inside double quotes),
+//! and scripts fed to a shell (`bash <<EOF`, `bash <<< '...'`, `echo '...' | sh`,
+//! `source <(echo ...)`). A script whose text cannot be seen (`curl ... | sh`), a program
+//! word that is not a literal (`$G commit`), or nesting too deep to follow is reported as
+//! an *opaque* call: it may commit anywhere. `cd` and `export` inside a subshell or
+//! substitution do not leak out of it.
+
+use std::collections::BTreeMap;
 
 /// A git invocation found in a command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GitCall {
-    /// Directory changes before it, in order (`cd a && cd b` -> `["a", "b"]`), then `-C` values.
+    /// Directory changes before it, in order (`cd a && cd b` -> `["a", "b"]`), then
+    /// `env -C`/`sudo -D` values, then `-C` values.
     pub dirs: Vec<String>,
+    /// `--git-dir` or an exported `GIT_DIR` (relative to `dirs`).
+    pub git_dir: Option<String>,
+    /// `--work-tree` or an exported `GIT_WORK_TREE` (relative to `dirs`).
+    pub work_tree: Option<String>,
     /// The subcommand (`commit`, `add`, or an alias such as `ci`).
     pub subcommand: String,
+    /// Arguments after the subcommand.
+    pub args: Vec<String>,
     /// Aliases defined on the command line: `git -c alias.ci=commit ci`.
     pub inline_aliases: Vec<(String, String)>,
     /// Config or command lookup is overridden for this call (`-c` other than `alias.*`,
-    /// `--config-env`, `--exec-path`, or `GIT_*`, `HOME`, `XDG_CONFIG_HOME`, `PATH` set in
-    /// the command), so an alias or external command cannot be resolved reliably.
+    /// `--config-env`, `--exec-path`, or `GIT_CONFIG*`, `GIT_DIR`, `GIT_COMMON_DIR`,
+    /// `GIT_EXEC_PATH`, `HOME`, `XDG_CONFIG_HOME`, `PATH` set in the command), so an alias
+    /// or external command cannot be resolved reliably.
     pub config_overridden: bool,
+    /// What runs cannot be seen (`$G commit`, `curl ... | sh`): it may commit, in a
+    /// repository that cannot be known.
+    pub opaque: bool,
+}
+
+/// Where a command other than git may write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// These paths, as written (relative to `dirs`, the directory changes before the command).
+    Paths {
+        dirs: Vec<String>,
+        paths: Vec<String>,
+    },
+    /// Cannot tell: a program wikiknit does not know, a script.
+    Unknown,
+}
+
+/// A command that may write files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Write {
+    /// The command, shortened, for messages.
+    pub what: String,
+    pub target: WriteTarget,
+}
+
+/// What a command would run and write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Analysis {
+    /// Every git invocation (and opaque call).
+    pub calls: Vec<GitCall>,
+    /// Possible file writes by commands other than git (redirections, `tee`, `cp`, unknown
+    /// programs). Git's own work-tree changes are judged from `calls`.
+    pub writes: Vec<Write>,
+}
+
+/// The git calls and possible writes of a Bash command.
+#[must_use]
+pub fn analyze(command: &str) -> Analysis {
+    let mut out = Analysis::default();
+    let mut ctx = Ctx::default();
+    collect(command, &mut ctx, &mut out, 0);
+    out
 }
 
 /// Every git invocation the command would run.
 #[must_use]
 pub fn git_calls(command: &str) -> Vec<GitCall> {
-    let mut out = Vec::new();
-    let mut cds = Vec::new();
-    collect(command, &mut cds, &mut out, 0);
-    out
+    analyze(command).calls
 }
 
 /// Every `git commit` the command would run (aliases not resolved).
@@ -44,24 +97,97 @@ pub fn git_commits(command: &str) -> Vec<GitCall> {
 const MAX_DEPTH: usize = 6;
 const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 
-fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: usize) {
+/// Shell state that later commands see.
+#[derive(Debug, Clone, Default)]
+struct Ctx {
+    cds: Vec<String>,
+    /// Exported `GIT_DIR` / `GIT_WORK_TREE`.
+    git_dir: Option<String>,
+    work_tree: Option<String>,
+    /// An earlier command set a variable that changes git's config or command lookup.
+    config: bool,
+    /// Shell variables set without `export` (an `export NAME` later exports them).
+    vars: BTreeMap<String, String>,
+}
+
+impl Ctx {
+    fn export(&mut self, k: &str, v: &str) {
+        match k {
+            "GIT_DIR" => self.git_dir = Some(v.to_string()),
+            "GIT_WORK_TREE" => self.work_tree = Some(v.to_string()),
+            _ => {}
+        }
+        if is_config_var(k) {
+            self.config = true;
+        }
+    }
+
+    fn unset(&mut self, k: &str) {
+        match k {
+            "GIT_DIR" => self.git_dir = None,
+            "GIT_WORK_TREE" => self.work_tree = None,
+            _ => {}
+        }
+        self.vars.remove(k);
+    }
+}
+
+/// Variables that change where git finds config or commands.
+fn is_config_var(k: &str) -> bool {
+    k.starts_with("GIT_CONFIG")
+        || matches!(
+            k,
+            "GIT_DIR" | "GIT_COMMON_DIR" | "GIT_EXEC_PATH" | "HOME" | "XDG_CONFIG_HOME" | "PATH"
+        )
+}
+
+/// `NAME=value` or `NAME+=value` -> (`NAME`, `value`).
+fn split_assignment(w: &str) -> Option<(&str, &str)> {
+    let (k, v) = w.split_once('=')?;
+    let k = k.strip_suffix('+').unwrap_or(k);
+    let ok = !k.is_empty()
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !k.starts_with(|c: char| c.is_ascii_digit());
+    ok.then_some((k, v))
+}
+
+/// A call that cannot be seen into: it may commit anywhere and write anything.
+fn opaque(out: &mut Analysis, ctx: &Ctx, what: &str) {
+    out.calls.push(GitCall {
+        dirs: ctx.cds.clone(),
+        subcommand: "commit".into(),
+        config_overridden: true,
+        opaque: true,
+        ..GitCall::default()
+    });
+    out.writes.push(Write {
+        what: what.to_string(),
+        target: WriteTarget::Unknown,
+    });
+}
+
+fn shorten(words: &[String]) -> String {
+    let s = words.join(" ");
+    if s.chars().count() > 60 {
+        let mut t: String = s.chars().take(57).collect();
+        t.push_str("...");
+        t
+    } else {
+        s
+    }
+}
+
+fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
     if depth > MAX_DEPTH {
+        opaque(out, ctx, "commands nested too deep to follow");
         return;
     }
-    // cds length at each open subshell / substitution
-    let mut scopes: Vec<usize> = Vec::new();
+    // shell state at each open subshell / substitution
+    let mut scopes: Vec<Ctx> = Vec::new();
     // every simple command so far, by index (heredoc bodies refer back to their command)
-    let mut commands: Vec<Vec<String>> = Vec::new();
+    let mut commands: Vec<Cmd> = Vec::new();
     // piped[i]: command i's output is piped into command i + 1
     let mut piped: Vec<bool> = Vec::new();
-    let reads_stdin_shell = |words: &[String]| {
-        let words = strip_prefixes(words);
-        words
-            .split_first()
-            .is_some_and(|(p, args)| SHELLS.contains(&program_name(p)) && shell_reads_stdin(args))
-    };
-    // `export GIT_CONFIG_COUNT=...` (or a bare assignment) earlier in the command.
-    let mut env_config = false;
     for item in tokenize(command) {
         match item {
             Item::Pipe => {
@@ -69,14 +195,14 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
                     *last = true;
                 }
             }
-            Item::Open => scopes.push(cds.len()),
+            Item::Open => scopes.push(ctx.clone()),
             Item::Close => {
-                if let Some(n) = scopes.pop() {
-                    cds.truncate(n);
+                if let Some(saved) = scopes.pop() {
+                    *ctx = saved;
                 }
             }
             Item::Sub(script) => {
-                let mut inner = cds.clone();
+                let mut inner = ctx.clone();
                 collect(&script, &mut inner, out, depth + 1);
             }
             Item::Body { cmd, text } => {
@@ -84,8 +210,8 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
                 // (`cat <<EOF | sh`), is a shell reading stdin.
                 let mut j = cmd;
                 let mut feeds_shell = false;
-                while let Some(words) = commands.get(j) {
-                    if reads_stdin_shell(words) {
+                while let Some(c) = commands.get(j) {
+                    if reads_stdin_shell(&c.words) {
                         feeds_shell = true;
                         break;
                     }
@@ -95,76 +221,580 @@ fn collect(command: &str, cds: &mut Vec<String>, out: &mut Vec<GitCall>, depth: 
                     j += 1;
                 }
                 if feeds_shell {
-                    let mut inner = cds.clone();
+                    let mut inner = ctx.clone();
                     collect(&text, &mut inner, out, depth + 1);
                 }
             }
-            Item::Cmd(words) => {
-                commands.push(words.clone());
+            Item::Cmd(cmd) => {
+                commands.push(cmd.clone());
                 piped.push(false);
-                // Variables that change where git finds config or commands.
-                // (`PATH+=...` appends; strip the `+`.)
-                let sets_git_config = words.iter().any(|w| {
-                    w.split_once('=').is_some_and(|(k, _)| {
-                        let k = k.strip_suffix('+').unwrap_or(k);
-                        k.starts_with("GIT_") || matches!(k, "HOME" | "XDG_CONFIG_HOME" | "PATH")
-                    })
-                });
-                // First word after shell keywords (`{ local X=1; ...`, `then export X=1`).
-                let first = words.iter().map(String::as_str).find(|w| {
-                    !matches!(
-                        *w,
-                        "{" | "}"
-                            | "!"
-                            | "if"
-                            | "then"
-                            | "else"
-                            | "elif"
-                            | "do"
-                            | "while"
-                            | "until"
-                    )
-                });
-                if sets_git_config
-                    && (matches!(
-                        first,
-                        Some("export" | "declare" | "typeset" | "readonly" | "local")
-                    ) || words.iter().all(|w| w.contains('=')))
-                {
-                    env_config = true;
-                }
-                let words = strip_prefixes(&words);
-                let Some((program, args)) = words.split_first() else {
-                    continue;
+                let feed = stdin_feed(&commands, &piped, commands.len() - 1);
+                simple(&cmd.words, &cmd.redirects, &feed, ctx, out, depth);
+            }
+        }
+    }
+}
+
+fn reads_stdin_shell(words: &[String]) -> bool {
+    let p = strip_prefixes(words);
+    p.words
+        .split_first()
+        .is_some_and(|(prog, args)| SHELLS.contains(&program_name(prog)) && shell_reads_stdin(args))
+}
+
+/// What a command reads on stdin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Feed {
+    /// Nothing visible (the agent's stdin).
+    Terminal,
+    /// The heredoc of command `n` (its body is handled where it is parsed).
+    Heredoc(usize),
+    /// This text.
+    Literal(String),
+    /// A file.
+    File,
+    /// The output of a program that cannot be seen into.
+    Opaque,
+}
+
+/// The stdin of command `idx`.
+fn stdin_feed(commands: &[Cmd], piped: &[bool], idx: usize) -> Feed {
+    let cmd = &commands[idx];
+    // The last redirection of fd 0 wins.
+    for r in cmd.redirects.iter().rev() {
+        let digits = r.op.len() - r.op.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let (fd, op) = r.op.split_at(digits);
+        if !(fd.is_empty() || fd == "0") {
+            continue;
+        }
+        match op {
+            "<<" => return Feed::Heredoc(idx),
+            "<<<" => return Feed::Literal(r.target.clone()),
+            "<" | "<>" => {
+                return match process_substitution(&r.target) {
+                    Some(inner) => process_output(inner),
+                    None => Feed::File,
                 };
-                match program_name(program) {
-                    "cd" | "pushd" => {
-                        if let Some(dir) = args.iter().find(|a| !a.starts_with('-')) {
-                            cds.push(dir.clone());
-                        }
+            }
+            _ => {}
+        }
+    }
+    if idx > 0 && piped.get(idx - 1).copied().unwrap_or(false) {
+        return output_of(commands, piped, idx - 1);
+    }
+    Feed::Terminal
+}
+
+/// What command `idx` writes to stdout.
+fn output_of(commands: &[Cmd], piped: &[bool], idx: usize) -> Feed {
+    let p = strip_prefixes(&commands[idx].words);
+    let Some((program, args)) = p.words.split_first() else {
+        return Feed::Terminal;
+    };
+    match program_name(program) {
+        "echo" => {
+            let args: Vec<&String> = args
+                .iter()
+                .skip_while(|a| {
+                    a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))
+                })
+                .collect();
+            Feed::Literal(unescape(
+                &args
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ))
+        }
+        "printf" => Feed::Literal(unescape(&args.join(" "))),
+        // Pass stdin through.
+        "cat" if args.iter().all(|a| a.len() > 1 && a.starts_with('-')) => {
+            stdin_feed(commands, piped, idx)
+        }
+        "tee" => stdin_feed(commands, piped, idx),
+        _ => Feed::Opaque,
+    }
+}
+
+/// `\n` and `\t` as `echo -e` and `printf` print them.
+fn unescape(s: &str) -> String {
+    s.replace("\\n", "\n").replace("\\t", "\t")
+}
+
+/// `<(cmd)` -> `cmd`.
+fn process_substitution(word: &str) -> Option<&str> {
+    word.strip_prefix("<(")?.strip_suffix(')')
+}
+
+/// What the commands of a process substitution print.
+fn process_output(inner: &str) -> Feed {
+    let mut cmds = Vec::new();
+    let mut piped = Vec::new();
+    let mut bodies = Vec::new();
+    for item in tokenize(inner) {
+        match item {
+            Item::Cmd(c) => {
+                cmds.push(c);
+                piped.push(false);
+            }
+            Item::Pipe => {
+                if let Some(l) = piped.last_mut() {
+                    *l = true;
+                }
+            }
+            Item::Body { cmd, text } => bodies.push((cmd, text)),
+            _ => return Feed::Opaque,
+        }
+    }
+    let Some(last) = cmds.len().checked_sub(1) else {
+        return Feed::Terminal;
+    };
+    match output_of(&cmds, &piped, last) {
+        Feed::Heredoc(j) => bodies
+            .into_iter()
+            .find(|(c, _)| *c == j)
+            .map_or(Feed::Opaque, |(_, t)| Feed::Literal(t)),
+        f => f,
+    }
+}
+
+/// Run a script whose text arrives as `feed` (a shell reading stdin, `source <(...)`).
+fn run_fed(feed: &Feed, ctx: &Ctx, out: &mut Analysis, depth: usize, what: &str) {
+    match feed {
+        Feed::Literal(script) => {
+            let mut inner = ctx.clone();
+            collect(script, &mut inner, out, depth + 1);
+        }
+        // Heredoc bodies are parsed where they appear; nothing comes from the terminal.
+        Feed::Heredoc(_) | Feed::Terminal => {}
+        // A script file: like `bash script.sh`, it may write anything.
+        Feed::File => out.writes.push(Write {
+            what: what.to_string(),
+            target: WriteTarget::Unknown,
+        }),
+        Feed::Opaque => opaque(out, ctx, what),
+    }
+}
+
+/// The file a redirection writes, if any.
+fn redirect_target(r: &Redir) -> Option<&str> {
+    let op = r.op.trim_start_matches(|c: char| c.is_ascii_digit());
+    match op {
+        ">" | ">>" | ">|" | "&>" | "&>>" | "<>" => {}
+        // `>&2`, `>&-` duplicate a descriptor; `>&file` writes the file.
+        ">&" if r.target == "-" || r.target.chars().all(|c| c.is_ascii_digit()) => return None,
+        ">&" => {}
+        _ => return None,
+    }
+    // `>(cmd)`: its commands are parsed where they appear.
+    if r.target.starts_with(">(") {
+        return None;
+    }
+    Some(&r.target)
+}
+
+/// Programs that do not write files (beyond their redirections).
+const READ_ONLY: &[&str] = &[
+    "[",
+    "[[",
+    ":",
+    "ag",
+    "b2sum",
+    "basename",
+    "case",
+    "cat",
+    "cd",
+    "cksum",
+    "cmp",
+    "column",
+    "comm",
+    "cut",
+    "date",
+    "declare",
+    "df",
+    "diff",
+    "dirname",
+    "done",
+    "du",
+    "echo",
+    "egrep",
+    "esac",
+    "exit",
+    "export",
+    "false",
+    "fgrep",
+    "fi",
+    "file",
+    "fold",
+    "for",
+    "free",
+    "function",
+    "git",
+    "grep",
+    "hash",
+    "head",
+    "hexdump",
+    "hostname",
+    "id",
+    "in",
+    "jq",
+    "less",
+    "let",
+    "local",
+    "ls",
+    "md5sum",
+    "nl",
+    "nproc",
+    "od",
+    "paste",
+    "pgrep",
+    "popd",
+    "printenv",
+    "printf",
+    "ps",
+    "pushd",
+    "pwd",
+    "read",
+    "readlink",
+    "readonly",
+    "realpath",
+    "return",
+    "rg",
+    "select",
+    "seq",
+    "set",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "shift",
+    "shopt",
+    "sleep",
+    "stat",
+    "tail",
+    "test",
+    "tr",
+    "tree",
+    "true",
+    "type",
+    "typeset",
+    "uname",
+    "uniq",
+    "unset",
+    "wait",
+    "wc",
+    "which",
+    "whoami",
+    "wikiknit",
+    "yes",
+    "}",
+];
+
+/// Arguments that are not options.
+fn operands(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|a| !a.starts_with('-') || a.as_str() == "-")
+        .cloned()
+        .collect()
+}
+
+/// Where a program other than git may write: `None` for no files, `Some(paths)` for these
+/// paths, `Some([])` with `unknown` set when it cannot be told.
+enum Effect {
+    None,
+    Paths(Vec<String>),
+    Unknown,
+}
+
+fn program_effect(name: &str, args: &[String]) -> Effect {
+    if READ_ONLY.contains(&name) {
+        return Effect::None;
+    }
+    match name {
+        "sed" => {
+            let in_place = args.iter().any(|a| {
+                a.starts_with("--in-place")
+                    || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+            });
+            if in_place {
+                Effect::Paths(operands(args))
+            } else {
+                Effect::None
+            }
+        }
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            let writes = args.iter().any(|a| {
+                a.contains('>') || a.contains("system") || a.contains("inplace") || a == "-i"
+            });
+            if writes {
+                Effect::Unknown
+            } else {
+                Effect::None
+            }
+        }
+        "sort" => {
+            let mut paths = Vec::new();
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                if a == "-o" || a == "--output" {
+                    paths.extend(it.next().cloned());
+                } else if let Some(p) = a.strip_prefix("--output=") {
+                    paths.push(p.to_string());
+                } else if let Some(p) = a.strip_prefix("-o") {
+                    paths.push(p.to_string());
+                }
+            }
+            if paths.is_empty() {
+                Effect::None
+            } else {
+                Effect::Paths(paths)
+            }
+        }
+        "dd" => Effect::Paths(
+            args.iter()
+                .filter_map(|a| a.strip_prefix("of="))
+                .map(str::to_string)
+                .collect(),
+        ),
+        "tee" | "cp" | "mv" | "install" | "ln" | "link" | "rm" | "unlink" | "rmdir" | "mkdir"
+        | "touch" | "truncate" | "shred" | "mktemp" => {
+            let mut paths = operands(args);
+            paths.extend(
+                args.iter()
+                    .filter_map(|a| a.strip_prefix("--target-directory="))
+                    .map(str::to_string),
+            );
+            Effect::Paths(paths)
+        }
+        _ => Effect::Unknown,
+    }
+}
+
+/// Handle one simple command.
+#[allow(clippy::too_many_lines)] // one dispatch over the programs that matter
+fn simple(
+    words: &[String],
+    redirects: &[Redir],
+    feed: &Feed,
+    ctx: &mut Ctx,
+    out: &mut Analysis,
+    depth: usize,
+) {
+    let p = strip_prefixes(words);
+    if p.not_run {
+        return;
+    }
+    let what = shorten(words);
+    let write = |out: &mut Analysis, dirs: &[String], paths: Vec<String>, xargs: bool| {
+        out.writes.push(Write {
+            what: what.clone(),
+            target: if xargs {
+                WriteTarget::Unknown
+            } else {
+                WriteTarget::Paths {
+                    dirs: dirs.to_vec(),
+                    paths,
+                }
+            },
+        });
+    };
+    // Redirections (in `[[ ... ]]`, `<` and `>` compare strings).
+    if p.words.first().map(String::as_str) != Some("[[") {
+        let paths: Vec<String> = redirects
+            .iter()
+            .filter_map(redirect_target)
+            .map(str::to_string)
+            .collect();
+        if !paths.is_empty() {
+            write(out, &ctx.cds, paths, false);
+        }
+    }
+    let Some((program, args)) = p.words.split_first() else {
+        // Only assignments: shell variables, not exported.
+        for (k, v) in &p.assigns {
+            if is_config_var(k) {
+                ctx.config = true;
+            }
+            ctx.vars.insert(k.clone(), v.clone());
+        }
+        return;
+    };
+    let mut dirs = ctx.cds.clone();
+    dirs.extend(p.dirs.iter().cloned());
+    let name = program_name(program);
+    // A program word that is not a literal (`$G`, `$(which git)`).
+    if program.contains(['$', '`']) {
+        let commits = args
+            .iter()
+            .any(|a| a == "commit" || a == "commit-tree" || a == "--continue");
+        if commits {
+            let mut call = parse_git(args, &dirs, None, None, true).unwrap_or_default();
+            if !matches!(call.subcommand.as_str(), "commit" | "commit-tree") {
+                call.subcommand = "commit".into();
+            }
+            call.config_overridden = true;
+            out.calls.push(call);
+        }
+        out.writes.push(Write {
+            what,
+            target: WriteTarget::Unknown,
+        });
+        return;
+    }
+    match name {
+        "export" | "declare" | "typeset" | "readonly" | "local" => {
+            let exported =
+                name == "export" || args.iter().any(|a| a.starts_with('-') && a.contains('x'));
+            for a in args.iter().filter(|a| !a.starts_with('-')) {
+                if let Some((k, v)) = split_assignment(a) {
+                    if is_config_var(k) {
+                        ctx.config = true;
                     }
-                    "popd" => {
-                        cds.pop();
+                    if exported {
+                        ctx.export(k, v);
+                    } else {
+                        ctx.vars.insert(k.to_string(), v.to_string());
                     }
-                    name if SHELLS.contains(&name) => {
-                        if let Some(script) = shell_c_script(args) {
-                            let mut inner = cds.clone();
-                            collect(script, &mut inner, out, depth + 1);
-                        }
-                    }
-                    "eval" => {
-                        let mut inner = cds.clone();
-                        collect(&args.join(" "), &mut inner, out, depth + 1);
-                    }
-                    "git" => {
-                        if let Some(call) = parse_git(args, cds, env_config || sets_git_config) {
-                            out.push(call);
-                        }
-                    }
-                    _ => {}
+                } else if exported && let Some(v) = ctx.vars.get(a.as_str()).cloned() {
+                    ctx.export(a, &v);
                 }
             }
         }
+        "unset" => {
+            for a in args.iter().filter(|a| !a.starts_with('-')) {
+                ctx.unset(a);
+            }
+        }
+        "cd" | "pushd" => {
+            if let Some(dir) = args.iter().find(|a| !a.starts_with('-')) {
+                ctx.cds.push(dir.clone());
+            }
+        }
+        "popd" => {
+            ctx.cds.pop();
+        }
+        name if SHELLS.contains(&name) => {
+            let mut inner = ctx.clone();
+            inner.cds = dirs;
+            if let Some(script) = shell_c_script(args) {
+                collect(script, &mut inner, out, depth + 1);
+            } else if shell_reads_stdin(args) {
+                run_fed(feed, &inner, out, depth, &what);
+            } else {
+                run_script_arg(args, feed, &inner, out, depth, &what);
+            }
+        }
+        "source" | "." => {
+            let mut inner = ctx.clone();
+            inner.cds = dirs;
+            run_script_arg(args, feed, &inner, out, depth, &what);
+            // A sourced script runs in this shell: its `cd` and `export` are unknown.
+        }
+        "eval" => {
+            let mut inner = ctx.clone();
+            inner.cds = dirs;
+            collect(&args.join(" "), &mut inner, out, depth + 1);
+        }
+        "git" => {
+            let mut config = ctx.config;
+            let mut git_dir = ctx.git_dir.clone();
+            let mut work_tree = ctx.work_tree.clone();
+            for u in &p.unsets {
+                match u.as_str() {
+                    "GIT_DIR" => git_dir = None,
+                    "GIT_WORK_TREE" => work_tree = None,
+                    _ => {}
+                }
+            }
+            for (k, v) in &p.assigns {
+                config |= is_config_var(k);
+                match k.as_str() {
+                    "GIT_DIR" => git_dir = Some(v.clone()),
+                    "GIT_WORK_TREE" => work_tree = Some(v.clone()),
+                    _ => {}
+                }
+            }
+            if let Some(call) = parse_git(args, &dirs, git_dir, work_tree, config) {
+                out.calls.push(call);
+            }
+        }
+        "find" => {
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                        let start = i + 1;
+                        let mut j = start;
+                        while j < args.len() && args[j] != ";" && args[j] != "+" {
+                            j += 1;
+                        }
+                        let mut inner = ctx.clone();
+                        inner.cds = dirs.clone();
+                        simple(
+                            &args[start..j],
+                            &[],
+                            &Feed::Terminal,
+                            &mut inner,
+                            out,
+                            depth + 1,
+                        );
+                        i = j + 1;
+                    }
+                    "-delete" | "-fprint" | "-fprint0" | "-fprintf" | "-fls" => {
+                        out.writes.push(Write {
+                            what: what.clone(),
+                            target: WriteTarget::Unknown,
+                        });
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+        _ => match program_effect(name, args) {
+            Effect::None => {}
+            Effect::Paths(paths) => write(out, &dirs, paths, p.xargs),
+            Effect::Unknown => out.writes.push(Write {
+                what,
+                target: WriteTarget::Unknown,
+            }),
+        },
+    }
+}
+
+/// `bash FILE` / `source FILE`: a process substitution or `/dev/stdin` is parsed; a script
+/// file may write anything (its commits are not seen, as for any program).
+fn run_script_arg(
+    args: &[String],
+    feed: &Feed,
+    ctx: &Ctx,
+    out: &mut Analysis,
+    depth: usize,
+    what: &str,
+) {
+    let mut it = args.iter();
+    let mut file = None;
+    while let Some(a) = it.next() {
+        if shell_opt_takes_arg(a) {
+            it.next();
+            continue;
+        }
+        if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) {
+            continue;
+        }
+        file = Some(a.as_str());
+        break;
+    }
+    match file {
+        Some("/dev/stdin" | "-") => run_fed(feed, ctx, out, depth, what),
+        Some(f) => match process_substitution(f) {
+            Some(inner) => run_fed(&process_output(inner), ctx, out, depth, what),
+            None => out.writes.push(Write {
+                what: what.to_string(),
+                target: WriteTarget::Unknown,
+            }),
+        },
+        None => {}
     }
 }
 
@@ -207,7 +837,7 @@ fn shell_c_script(args: &[String]) -> Option<&str> {
     None
 }
 
-/// `bash` with only options reads its script from stdin (a heredoc).
+/// `bash` with only options reads its script from stdin (a heredoc, a pipe).
 fn shell_reads_stdin(args: &[String]) -> bool {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -230,47 +860,58 @@ fn shell_reads_stdin(args: &[String]) -> bool {
     true
 }
 
-fn parse_git(args: &[String], cds: &[String], config_overridden: bool) -> Option<GitCall> {
-    let mut dirs = cds.to_vec();
-    let mut inline_aliases = Vec::new();
-    let mut config_overridden = config_overridden;
+fn parse_git(
+    args: &[String],
+    dirs: &[String],
+    git_dir: Option<String>,
+    work_tree: Option<String>,
+    config_overridden: bool,
+) -> Option<GitCall> {
+    let mut call = GitCall {
+        dirs: dirs.to_vec(),
+        git_dir,
+        work_tree,
+        config_overridden,
+        ..GitCall::default()
+    };
     let mut it = args.iter();
     while let Some(t) = it.next() {
         match t.as_str() {
-            "-C" | "--work-tree" | "--git-dir" => dirs.push(it.next()?.clone()),
+            "-C" => call.dirs.push(it.next()?.clone()),
+            "--git-dir" => call.git_dir = Some(it.next()?.clone()),
+            "--work-tree" => call.work_tree = Some(it.next()?.clone()),
             "-c" => {
                 let kv = it.next()?;
                 // Config keys are case-insensitive: `-c ALIAS.X=commit` defines alias `x`.
                 let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), "true"));
                 let k = k.to_ascii_lowercase();
                 if let Some(name) = k.strip_prefix("alias.") {
-                    inline_aliases.push((name.to_string(), v.to_string()));
+                    call.inline_aliases.push((name.to_string(), v.to_string()));
                 } else {
-                    config_overridden = true; // include.path, includeIf, ...
+                    call.config_overridden = true; // include.path, includeIf, ...
                 }
             }
             "--config-env" | "--exec-path" => {
                 it.next();
-                config_overridden = true;
+                call.config_overridden = true;
             }
             s if s.starts_with("--config-env=") || s.starts_with("--exec-path") => {
-                config_overridden = true;
+                call.config_overridden = true;
             }
-            "--namespace" => {
+            "--namespace" | "--super-prefix" | "--list-cmds" => {
                 it.next();
             }
             s if s.starts_with("--work-tree=") => {
-                dirs.push(s["--work-tree=".len()..].to_string());
+                call.work_tree = Some(s["--work-tree=".len()..].to_string());
             }
-            s if s.starts_with("--git-dir=") => dirs.push(s["--git-dir=".len()..].to_string()),
+            s if s.starts_with("--git-dir=") => {
+                call.git_dir = Some(s["--git-dir=".len()..].to_string());
+            }
             s if s.starts_with('-') => {}
             sub => {
-                return Some(GitCall {
-                    dirs,
-                    subcommand: sub.to_string(),
-                    inline_aliases,
-                    config_overridden,
-                });
+                call.subcommand = sub.to_string();
+                call.args = it.cloned().collect();
+                return Some(call);
             }
         }
     }
@@ -280,7 +921,7 @@ fn parse_git(args: &[String], cds: &[String], config_overridden: bool) -> Option
 /// Options (of a wrapper) that take a separate argument.
 fn wrapper_arg_opts(wrapper: &str) -> &'static [&'static str] {
     match wrapper {
-        "sudo" => &["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"],
+        "sudo" => &["-u", "-g", "-h", "-p", "-C", "-r", "-t", "-U", "-T", "-R"],
         "timeout" => &["-s", "-k", "--signal", "--kill-after"],
         "nice" => &["-n", "--adjustment"],
         "ionice" => &["-c", "-n", "-p", "-P", "-u"],
@@ -306,50 +947,79 @@ fn wrapper_arg_opts(wrapper: &str) -> &'static [&'static str] {
             "--process-slot-var",
         ],
         "stdbuf" => &["-i", "-o", "-e"],
-        "env" => &["-u", "-C", "-S", "--unset", "--chdir"],
         "doas" => &["-u", "-C"],
         _ => &[],
     }
 }
 
+/// A command with the prefixes in front of its program taken off.
+#[derive(Debug, Default)]
+struct Prefixed {
+    /// The program and its arguments.
+    words: Vec<String>,
+    /// `NAME=value` in front of it (also after `env`).
+    assigns: Vec<(String, String)>,
+    /// `env -u NAME`.
+    unsets: Vec<String>,
+    /// `env -C DIR`, `sudo -D DIR`.
+    dirs: Vec<String>,
+    /// Run by `xargs`: more arguments come from stdin.
+    xargs: bool,
+    /// Not run at all (`command -v git`).
+    not_run: bool,
+}
+
 /// Drop shell keywords, env assignments, and wrapper commands (with their options)
 /// in front of the real program.
-fn strip_prefixes(words: &[String]) -> Vec<String> {
+fn strip_prefixes(words: &[String]) -> Prefixed {
+    let mut w: Vec<String> = words.to_vec();
+    let mut p = Prefixed::default();
     let mut i = 0;
-    while i < words.len() {
-        let t = words[i].as_str();
-        let assignment = t.split_once('=').is_some_and(|(k, _)| {
-            let k = k.strip_suffix('+').unwrap_or(k); // `VAR+=value` appends
-            !k.is_empty()
-                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !k.starts_with(|c: char| c.is_ascii_digit())
-        });
-        if assignment
-            || matches!(
-                t,
-                "if" | "then"
-                    | "else"
-                    | "elif"
-                    | "do"
-                    | "while"
-                    | "until"
-                    | "{"
-                    | "}"
-                    | "!"
-                    | "time"
-                    | "coproc"
-                    | "command"
-                    | "exec"
-                    | "nohup"
-                    | "builtin"
-            )
-        {
+    while i < w.len() {
+        let t = w[i].clone();
+        if let Some((k, v)) = split_assignment(&t) {
+            p.assigns.push((k.to_string(), v.to_string()));
             i += 1;
             continue;
         }
-        let name = program_name(t);
-        if matches!(
-            name,
+        match t.as_str() {
+            "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "!"
+            | "coproc" | "nohup" | "builtin" => {
+                i += 1;
+                continue;
+            }
+            "time" => {
+                i += 1;
+                while i < w.len() && w[i].starts_with('-') {
+                    i += 1;
+                    if w[i - 1] == "--" {
+                        break;
+                    }
+                }
+                continue;
+            }
+            "command" => {
+                i += 1;
+                while i < w.len() && w[i].starts_with('-') {
+                    if w[i].contains(['v', 'V']) {
+                        p.not_run = true;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            "exec" => {
+                i += 1;
+                while i < w.len() && w[i].starts_with('-') {
+                    i += if w[i] == "-a" { 2 } else { 1 };
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let name = program_name(&t).to_string();
+        if !matches!(
+            name.as_str(),
             "sudo"
                 | "doas"
                 | "timeout"
@@ -359,34 +1029,83 @@ fn strip_prefixes(words: &[String]) -> Vec<String> {
                 | "stdbuf"
                 | "env"
                 | "chronic"
+                | "setsid"
+                | "unbuffer"
         ) {
-            let arg_opts = wrapper_arg_opts(name);
-            i += 1;
-            while i < words.len() && words[i].starts_with('-') {
-                let opt = words[i].as_str();
-                i += 1;
-                if opt == "--" {
-                    break;
-                }
-                if arg_opts.contains(&opt) {
-                    i += 1;
-                }
-            }
-            // timeout DURATION
-            if name == "timeout" && i < words.len() {
-                i += 1;
-            }
-            continue;
+            break;
         }
-        break;
+        p.xargs |= name == "xargs";
+        let arg_opts = wrapper_arg_opts(&name);
+        i += 1;
+        while i < w.len() && w[i].starts_with('-') {
+            let opt = w[i].clone();
+            i += 1;
+            if opt == "--" {
+                break;
+            }
+            let value = |i: &mut usize| {
+                let v = w.get(*i).cloned();
+                *i += 1;
+                v
+            };
+            match (name.as_str(), opt.as_str()) {
+                ("env", "-C" | "--chdir") | ("sudo", "-D" | "--chdir") => {
+                    p.dirs.extend(value(&mut i));
+                }
+                ("env" | "sudo", o) if o.starts_with("--chdir=") => {
+                    p.dirs.push(o["--chdir=".len()..].to_string());
+                }
+                ("env", o) if o.starts_with("-C") => p.dirs.push(o[2..].to_string()),
+                ("env", "-u" | "--unset") => p.unsets.extend(value(&mut i)),
+                ("env", o) if o.starts_with("--unset=") => {
+                    p.unsets.push(o["--unset=".len()..].to_string());
+                }
+                ("env", "-S" | "--split-string") => {
+                    // `env -S 'git commit -m x'`: the string is split into words.
+                    if let Some(s) = value(&mut i) {
+                        let split: Vec<String> = s.split_whitespace().map(str::to_string).collect();
+                        w.splice(i..i, split);
+                    }
+                }
+                ("env", o) if o.starts_with("--split-string=") => {
+                    let split: Vec<String> = o["--split-string=".len()..]
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect();
+                    w.splice(i..i, split);
+                }
+                _ if arg_opts.contains(&opt.as_str()) => i += 1,
+                _ => {}
+            }
+        }
+        // timeout DURATION
+        if name == "timeout" && i < w.len() {
+            i += 1;
+        }
     }
-    words[i..].to_vec()
+    p.words = w.split_off(i.min(w.len()));
+    p
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Redir {
+    /// `>`, `>>`, `2>`, `&>`, `>&`, `<`, `<<`, `<<<`, ...
+    op: String,
+    /// The word after it (the delimiter for `<<`).
+    target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Cmd {
+    /// Words with quotes removed; redirections taken out.
+    words: Vec<String>,
+    redirects: Vec<Redir>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Item {
-    /// A simple command, words with quotes removed.
-    Cmd(Vec<String>),
+    /// A simple command.
+    Cmd(Cmd),
     /// Start of a subshell or command substitution.
     Open,
     /// End of one.
@@ -406,6 +1125,16 @@ struct Heredoc {
     /// `$(...)` and backticks, which run commands.
     quoted: bool,
     cmd: usize,
+}
+
+/// The command being built when a `$(`, `<(`, `>(`, or backtick opened; it resumes at the
+/// matching close, with the substitution's text as part of the current word.
+struct Saved {
+    words: Vec<String>,
+    word: String,
+    redirects: Vec<Redir>,
+    pending: Option<String>,
+    start: usize,
 }
 
 /// Command substitutions (`$(...)`, backticks) in an unquoted heredoc body.
@@ -479,11 +1208,14 @@ fn balanced_close(chars: &[char], open: usize) -> usize {
     chars.len()
 }
 
-#[allow(clippy::too_many_lines)] // one state machine; splitting it hides the state
+#[allow(clippy::too_many_lines, unused_assignments)] // one state machine; splitting it hides the state
 fn tokenize(command: &str) -> Vec<Item> {
     let chars: Vec<char> = command.chars().collect();
     let mut items = Vec::new();
     let mut words: Vec<String> = Vec::new();
+    let mut redirects: Vec<Redir> = Vec::new();
+    // A redirection operator waiting for its target word.
+    let mut pending: Option<String> = None;
     let mut word = String::new();
     let mut in_word = false;
     let mut cmd_count = 0usize;
@@ -491,33 +1223,76 @@ fn tokenize(command: &str) -> Vec<Item> {
     let mut in_backtick = false;
     let mut i = 0;
 
-    // Nesting depth of `(`/`$(`/backticks, and that depth at each open `case`: inside a
-    // `case`, a `)` at the same depth ends a pattern (`a) ...;;`), not a subshell.
-    let mut open_depth = 0usize;
+    // Each open `(` (None) or `$(`/`<(`/`>(`/backtick (the command it interrupts), and the
+    // nesting depth at each open `case`: inside a `case`, a `)` at the same depth ends a
+    // pattern (`a) ...;;`), not a subshell.
+    let mut opens: Vec<Option<Saved>> = Vec::new();
     let mut cases: Vec<usize> = Vec::new();
     macro_rules! end_word {
         () => {
             if in_word {
-                if words.is_empty() && !word.is_empty() {
-                    match word.as_str() {
-                        "case" => cases.push(open_depth),
-                        "esac" => {
-                            cases.pop();
-                        }
-                        _ => {}
-                    }
-                }
-                words.push(std::mem::take(&mut word));
+                let w = std::mem::take(&mut word);
                 in_word = false;
+                if let Some(op) = pending.take() {
+                    redirects.push(Redir { op, target: w });
+                } else {
+                    if words.is_empty() && !w.is_empty() {
+                        match w.as_str() {
+                            "case" => cases.push(opens.len()),
+                            "esac" => {
+                                cases.pop();
+                            }
+                            _ => {}
+                        }
+                    }
+                    words.push(w);
+                }
             }
         };
     }
     macro_rules! end_cmd {
         () => {
             end_word!();
-            if !words.is_empty() {
-                items.push(Item::Cmd(std::mem::take(&mut words)));
+            pending = None;
+            if !words.is_empty() || !redirects.is_empty() {
+                items.push(Item::Cmd(Cmd {
+                    words: std::mem::take(&mut words),
+                    redirects: std::mem::take(&mut redirects),
+                }));
                 cmd_count += 1;
+            }
+        };
+    }
+    // Start a substitution at `start`: the current command waits until it closes.
+    macro_rules! open_sub {
+        ($start:expr) => {
+            if !in_word {
+                word.clear();
+            }
+            opens.push(Some(Saved {
+                words: std::mem::take(&mut words),
+                word: std::mem::take(&mut word),
+                redirects: std::mem::take(&mut redirects),
+                pending: pending.take(),
+                start: $start,
+            }));
+            in_word = false;
+            items.push(Item::Open);
+        };
+    }
+    // Close the innermost `(` or substitution at `end` (the closing char).
+    macro_rules! close {
+        ($end:expr) => {
+            end_cmd!();
+            items.push(Item::Close);
+            if let Some(Some(s)) = opens.pop() {
+                words = s.words;
+                word = s.word;
+                redirects = s.redirects;
+                pending = s.pending;
+                in_word = true;
+                let end = ($end).min(chars.len().saturating_sub(1));
+                word.extend(chars[s.start..=end].iter());
             }
         };
     }
@@ -549,6 +1324,7 @@ fn tokenize(command: &str) -> Vec<Item> {
                                 .iter()
                                 .collect();
                             items.push(Item::Sub(inner));
+                            word.extend(chars[i..end].iter());
                             i = end;
                             continue;
                         }
@@ -561,8 +1337,9 @@ fn tokenize(command: &str) -> Vec<Item> {
                                 }
                                 j += 1;
                             }
-                            items
-                                .push(Item::Sub(chars[start..j.min(chars.len())].iter().collect()));
+                            let j = j.min(chars.len());
+                            items.push(Item::Sub(chars[start..j].iter().collect()));
+                            word.extend(chars[i..(j + 1).min(chars.len())].iter());
                             i = j + 1;
                             continue;
                         }
@@ -587,9 +1364,7 @@ fn tokenize(command: &str) -> Vec<Item> {
             }
             '$' if chars.get(i + 1) == Some(&'(') => {
                 // Command substitution: its contents are commands, in their own scope.
-                end_cmd!();
-                items.push(Item::Open);
-                open_depth += 1;
+                open_sub!(i);
                 i += 2;
                 continue;
             }
@@ -602,25 +1377,20 @@ fn tokenize(command: &str) -> Vec<Item> {
             '(' => {
                 end_cmd!();
                 items.push(Item::Open);
-                open_depth += 1;
+                opens.push(None);
             }
             ')' => {
-                end_cmd!();
-                if cases.last() == Some(&open_depth) {
-                    // end of a `case` pattern
+                if cases.last() == Some(&opens.len()) {
+                    end_cmd!(); // end of a `case` pattern
                 } else {
-                    items.push(Item::Close);
-                    open_depth = open_depth.saturating_sub(1);
+                    close!(i);
                 }
             }
             '`' => {
-                end_cmd!();
                 if in_backtick {
-                    items.push(Item::Close);
-                    open_depth = open_depth.saturating_sub(1);
+                    close!(i);
                 } else {
-                    items.push(Item::Open);
-                    open_depth += 1;
+                    open_sub!(i);
                 }
                 in_backtick = !in_backtick;
             }
@@ -631,13 +1401,13 @@ fn tokenize(command: &str) -> Vec<Item> {
                 continue; // the newline ends the command below
             }
             '<' if chars.get(i + 1) == Some(&'<') => {
+                end_word!();
                 if chars.get(i + 2) == Some(&'<') {
-                    // `<<<` here-string: the next word is data, read as a normal word.
-                    end_word!();
+                    // `<<<` here-string: the next word is its text.
+                    pending = Some("<<<".into());
                     i += 3;
                     continue;
                 }
-                end_word!();
                 i += 2;
                 let strip_tabs = chars.get(i) == Some(&'-');
                 if strip_tabs {
@@ -660,6 +1430,10 @@ fn tokenize(command: &str) -> Vec<Item> {
                     i += 1;
                 }
                 if !delim.is_empty() {
+                    redirects.push(Redir {
+                        op: "<<".into(),
+                        target: delim.clone(),
+                    });
                     heredocs.push(Heredoc {
                         delim,
                         strip_tabs,
@@ -667,6 +1441,55 @@ fn tokenize(command: &str) -> Vec<Item> {
                         cmd: cmd_count,
                     });
                 }
+                continue;
+            }
+            '<' | '>' if chars.get(i + 1) == Some(&'(') => {
+                // Process substitution `<(cmd)` / `>(cmd)`: commands, and a word.
+                open_sub!(i);
+                i += 2;
+                continue;
+            }
+            '<' | '>' => {
+                // A redirection; a number right before it is its file descriptor (`2>`).
+                let mut op = String::new();
+                if in_word
+                    && pending.is_none()
+                    && !word.is_empty()
+                    && word.chars().all(|d| d.is_ascii_digit())
+                {
+                    op = std::mem::take(&mut word);
+                    in_word = false;
+                } else {
+                    end_word!();
+                }
+                op.push(c);
+                i += 1;
+                if c == '>' {
+                    if matches!(chars.get(i), Some('>' | '|')) {
+                        op.push(chars[i]);
+                        i += 1;
+                    }
+                    if chars.get(i) == Some(&'&') {
+                        op.push('&');
+                        i += 1;
+                    }
+                } else if matches!(chars.get(i), Some('&' | '>')) {
+                    op.push(chars[i]);
+                    i += 1;
+                }
+                pending = Some(op);
+                continue;
+            }
+            '&' if chars.get(i + 1) == Some(&'>') => {
+                // `&>file`, `&>>file`: stdout and stderr.
+                end_word!();
+                let mut op = String::from("&>");
+                i += 2;
+                if chars.get(i) == Some(&'>') {
+                    op.push('>');
+                    i += 1;
+                }
+                pending = Some(op);
                 continue;
             }
             '\n' => {
@@ -731,12 +1554,11 @@ fn tokenize(command: &str) -> Vec<Item> {
         }
         i += 1;
     }
-    if in_word {
-        words.push(word);
+    // Unclosed substitutions: close them so the commands they interrupt are kept.
+    while !opens.is_empty() {
+        close!(chars.len());
     }
-    if !words.is_empty() {
-        items.push(Item::Cmd(words));
-    }
+    end_cmd!();
     items
 }
 
@@ -761,7 +1583,11 @@ mod tests {
         assert_eq!(dirs("git commit -m x"), vec![none()]);
         assert_eq!(dirs("cd a && git commit -q -F f"), vec![v(&["a"])]);
         assert_eq!(dirs("git -C x commit"), vec![v(&["x"])]);
-        assert_eq!(dirs("git --work-tree /v commit"), vec![v(&["/v"])]);
+        assert_eq!(dirs("git --work-tree /v commit"), vec![none()]);
+        assert_eq!(
+            git_commits("git --work-tree /v --git-dir=/v/.git commit")[0].git_dir,
+            Some("/v/.git".into())
+        );
         assert_eq!(dirs("git add . && git -c user.name=v commit"), vec![none()]);
         assert_eq!(dirs("FOO=1 git commit"), vec![none()]);
         assert_eq!(
@@ -903,5 +1729,194 @@ mod tests {
         ] {
             assert!(git_calls(c)[0].config_overridden, "{c}");
         }
+    }
+
+    fn writes(c: &str) -> Vec<WriteTarget> {
+        analyze(c).writes.into_iter().map(|w| w.target).collect()
+    }
+
+    fn paths(c: &str) -> Vec<String> {
+        writes(c)
+            .into_iter()
+            .flat_map(|t| match t {
+                WriteTarget::Paths { paths, .. } => paths,
+                WriteTarget::Unknown => vec!["?".into()],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn redirections_are_writes_except_descriptors() {
+        assert_eq!(paths("echo x > f"), vec!["f"]);
+        assert_eq!(paths("echo x >> f; echo y 2>e"), vec!["f", "e"]);
+        assert_eq!(paths("echo x &> f"), vec!["f"]);
+        assert_eq!(paths("echo x >f 2>&1"), vec!["f"]);
+        assert_eq!(paths("echo a>b"), vec!["b"]);
+        assert_eq!(paths("> f"), vec!["f"]);
+        assert_eq!(paths("cat > f <<'EOF'\nx\nEOF"), vec!["f"]);
+        assert_eq!(paths("cat <<EOF >f\nx\nEOF"), vec!["f"]);
+        assert_eq!(paths("git commit -m x 2>/dev/null"), vec!["/dev/null"]);
+        assert!(paths("git commit -m x >&2").is_empty());
+        assert!(paths("echo x 1>&2 2>&-").is_empty());
+        assert!(paths("[[ a > b ]]").is_empty());
+        assert!(paths("cat < f").is_empty());
+        assert!(paths("echo \"a > b\" 'c > d'").is_empty());
+        assert_eq!(paths("cd v && echo x > c.md"), vec!["c.md"]);
+        match &writes("cd v && echo x > c.md")[0] {
+            WriteTarget::Paths { dirs, .. } => assert_eq!(dirs, &v(&["v"])),
+            WriteTarget::Unknown => panic!(),
+        }
+    }
+
+    #[test]
+    fn programs_that_may_write() {
+        assert_eq!(paths("echo x | tee -a f g"), vec!["f", "g"]);
+        assert_eq!(paths("cp a b"), vec!["a", "b"]);
+        assert_eq!(paths("sed -i s/a/b/ f"), vec!["s/a/b/", "f"]);
+        assert!(paths("sed s/a/b/ f").is_empty());
+        assert_eq!(paths("dd if=/dev/zero of=f"), vec!["f"]);
+        assert_eq!(paths("python3 -c 'x'"), vec!["?"]);
+        assert_eq!(paths("./gen.sh"), vec!["?"]);
+        assert_eq!(paths("bash gen.sh"), vec!["?"]);
+        assert_eq!(paths("find . -delete"), vec!["?"]);
+        assert_eq!(paths("ls | xargs rm"), vec!["?"]);
+        assert_eq!(paths("$EDITOR f"), vec!["?"]);
+        for c in [
+            "git status && git log | head",
+            "grep -rn x . | wc -l",
+            "if true; then echo ok; fi",
+            "for f in a b; do echo $f; done",
+            "case $x in a) echo a ;; esac",
+            "wikiknit check && git commit -m x",
+            "command -v git",
+            "bash -c 'echo hi'",
+            "echo 'git commit' | cat",
+        ] {
+            assert!(paths(c).is_empty(), "{c}: {:?}", paths(c));
+        }
+    }
+
+    #[test]
+    fn scripts_fed_to_shells() {
+        for c in [
+            "bash <<< 'git commit -m x'",
+            "echo 'git commit -m x' | bash",
+            "echo git commit -m x | tee log | sh -s",
+            "printf 'git add -A\\ngit commit -m x\\n' | sh",
+            "source <(echo git commit -m x)",
+            ". <(printf 'git commit')",
+            "bash < <(echo git commit)",
+            "bash <(echo git commit)",
+            "echo git commit | bash /dev/stdin",
+        ] {
+            let calls = git_commits(c);
+            assert_eq!(calls.len(), 1, "{c}: {calls:?}");
+            assert_eq!(calls[0].subcommand, "commit", "{c}");
+            assert!(!calls[0].opaque, "{c}");
+        }
+        for c in [
+            "curl -s https://x | bash",
+            "cat script.sh | sh",
+            "source <(curl -s https://x)",
+            "G=git; $G commit -m x",
+            "$(which git) commit -m x",
+            "`which git` commit -m x",
+            "\"$(which git)\" -C repo commit",
+        ] {
+            let calls = git_calls(c);
+            assert!(
+                calls.iter().any(|g| g.subcommand == "commit"),
+                "{c}: {calls:?}"
+            );
+            assert!(!analyze(c).writes.is_empty(), "{c}");
+        }
+        assert!(git_calls("curl -s https://x | bash")[0].opaque);
+        assert_eq!(
+            git_calls("$(which git) -C repo commit")[0].dirs,
+            v(&["repo"])
+        );
+        // Not scripts.
+        for c in [
+            "echo git commit | cat",
+            "cat <<< 'git commit'",
+            "bash script.sh",
+        ] {
+            assert!(git_commits(c).is_empty(), "{c}");
+        }
+    }
+
+    #[test]
+    fn wrappers_redirections_and_find() {
+        for c in [
+            "2>/dev/null git commit -m x",
+            ">/dev/null git commit",
+            "time -p git commit -m x",
+            "command git commit",
+            "exec -a x git commit",
+            "env -S 'git commit -m x'",
+            "find . -exec git commit -m x \\;",
+            "find . -execdir git commit -m x {} +",
+            "setsid git commit",
+        ] {
+            assert_eq!(git_commits(c).len(), 1, "{c}");
+        }
+        assert!(git_calls("command -v git").is_empty());
+        assert_eq!(dirs("env -C a git commit"), vec![v(&["a"])]);
+        assert_eq!(dirs("env --chdir=a git commit"), vec![v(&["a"])]);
+        assert_eq!(dirs("sudo -D a git commit"), vec![v(&["a"])]);
+        assert_eq!(
+            dirs("cd x; env -C a git -C b commit"),
+            vec![v(&["x", "a", "b"])]
+        );
+    }
+
+    #[test]
+    fn git_dir_from_the_environment() {
+        let c = &git_commits("GIT_DIR=r/.git GIT_WORK_TREE=r git commit")[0];
+        assert_eq!(c.git_dir.as_deref(), Some("r/.git"));
+        assert_eq!(c.work_tree.as_deref(), Some("r"));
+        let c = &git_commits("export GIT_DIR=r/.git; git commit")[0];
+        assert_eq!(c.git_dir.as_deref(), Some("r/.git"));
+        let c = &git_commits("GIT_DIR=r/.git; export GIT_DIR; git commit")[0];
+        assert_eq!(c.git_dir.as_deref(), Some("r/.git"));
+        // Not exported: git does not see it.
+        assert_eq!(git_commits("GIT_DIR=r/.git; git commit")[0].git_dir, None);
+        // Does not leak out of a subshell.
+        assert_eq!(
+            git_commits("(export GIT_DIR=r/.git); git commit")[0].git_dir,
+            None
+        );
+        assert_eq!(
+            git_commits("export GIT_DIR=r/.git; env -u GIT_DIR git commit")[0].git_dir,
+            None
+        );
+        assert_eq!(
+            git_commits("GIT_DIR=a git --git-dir=b commit")[0]
+                .git_dir
+                .as_deref(),
+            Some("b")
+        );
+        // Variables that do not change config lookup.
+        assert!(!git_calls("GIT_PAGER=cat git lg")[0].config_overridden);
+        assert!(!git_calls("GIT_EDITOR=true GIT_WORK_TREE=x git lg")[0].config_overridden);
+        assert!(git_calls("GIT_CONFIG_GLOBAL=/x git lg")[0].config_overridden);
+        assert!(git_calls("GIT_DIR=/x git lg")[0].config_overridden);
+    }
+
+    #[test]
+    fn subcommand_args_are_kept() {
+        let c = &git_calls("git -C r rebase --continue")[0];
+        assert_eq!(c.subcommand, "rebase");
+        assert_eq!(c.args, v(&["--continue"]));
+    }
+
+    #[test]
+    fn too_deep_is_opaque() {
+        let mut c = "git commit".to_string();
+        for _ in 0..10 {
+            c = format!("eval {c}");
+        }
+        let calls = git_calls(&c);
+        assert!(calls.iter().any(|g| g.opaque), "{calls:?}");
     }
 }
