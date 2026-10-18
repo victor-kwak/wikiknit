@@ -313,7 +313,9 @@ A note *needs a link pass* when its content differs from its content at its last
 is per vault, so a pass in one session counts for every session. Each session also records the vault
 as it was when it started, so it is asked only about notes that changed while it ran. Without
 `--session` and `$WIKIKNIT_SESSION`, wikiknit uses the one session active in the last 12 hours, and
-refuses to guess when there are several.
+refuses to guess when there are several. A session with no record yet (the hooks never saw it start,
+or a mistyped id) is started on the spot with every pending note counted as its own, and a warning
+on stderr says so: an empty list then does not mean the session changed nothing.
 
 State lives in `$XDG_STATE_HOME/wikiknit/` (or `~/.local/state/wikiknit/`), not in the vault, so it
 works with or without git.

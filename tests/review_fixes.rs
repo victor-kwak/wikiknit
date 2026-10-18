@@ -522,3 +522,44 @@ fn one_weak_signal_is_not_a_suggestion_and_every_one_has_a_reason() {
         "{all:?}"
     );
 }
+
+#[test]
+fn an_unknown_session_warns_instead_of_reading_as_nothing_changed() {
+    let v = vault("", &[("a.md", "# a\n[[b]]\n"), ("b.md", "# b\n[[a]]\n")]);
+    for args in [
+        &["changed"][..],
+        &["check", "--changed"],
+        &["suggest", "--changed"],
+    ] {
+        let out = wk(v.path())
+            .env("WIKIKNIT_SESSION", format!("typo-{}", args[0]))
+            .args(args)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(
+            err.contains("had no record") && err.contains("0 note(s) pending"),
+            "{args:?}: {err}"
+        );
+    }
+    // Once a session has a record, no warning; pending notes are still listed.
+    fs::write(v.path().join("a.md"), "# a\n[[b]] edited\n").unwrap();
+    let out = wk(v.path())
+        .env("WIKIKNIT_SESSION", "typo-changed")
+        .arg("changed")
+        .output()
+        .unwrap();
+    assert!(out.stderr.is_empty(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "# id\na\n");
+    let out = wk(v.path())
+        .env("WIKIKNIT_SESSION", "fresh")
+        .arg("changed")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("1 note(s) pending"),
+        "{out:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "# id\na\n");
+}

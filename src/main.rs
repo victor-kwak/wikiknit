@@ -436,8 +436,16 @@ fn session_changed(vault: &Vault, flag: Option<&str>) -> Result<(Store, String, 
     let now = state::current_hashes(vault);
     // A session the hooks never saw start (plugin added mid-session): start it the way the
     // hooks do, with pending notes counted as its own.
-    let s = store.start_session(&session, &now, true)?;
+    let (s, created) = store.open_session(&session, &now, true)?;
     let changed = store.changed(&s, &now)?;
+    if created {
+        // An empty list here must not read as "nothing changed": the session was unknown.
+        eprintln!(
+            "wikiknit: session {session} had no record (hooks not run, or a mistyped id?); \
+             started it now, counting the {} note(s) pending from any session as its changes",
+            changed.len()
+        );
+    }
     Ok((store, session, changed))
 }
 

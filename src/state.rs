@@ -263,9 +263,20 @@ impl Store {
         now: &Hashes,
         carry_pending: bool,
     ) -> Result<Session, Error> {
+        Ok(self.open_session(session, now, carry_pending)?.0)
+    }
+
+    /// [`Store::start_session`], and whether the record was created now (the session had
+    /// none: its changes before now cannot be told from other sessions' pending notes).
+    pub fn open_session(
+        &self,
+        session: &str,
+        now: &Hashes,
+        carry_pending: bool,
+    ) -> Result<(Session, bool), Error> {
         let _lock = self.lock()?;
         if let Some(s) = self.load_session(session)? {
-            return Ok(s);
+            return Ok((s, false));
         }
         let linked = self.linked_locked(now)?; // also makes sure the vault record exists
         let mut start = now.clone();
@@ -283,7 +294,7 @@ impl Store {
             last_stop_digest: None,
         };
         self.save_session(session, &s)?;
-        Ok(s)
+        Ok((s, true))
     }
 
     /// Pending notes that changed while this session ran.
