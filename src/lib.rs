@@ -3,30 +3,17 @@
 //! The library loads a vault into a [`Vault`], resolves every link, and runs
 //! rules over it. The binary in `main.rs` is a thin CLI on top.
 
-pub mod aliases;
 pub mod catalog;
-pub mod chunk;
 pub mod config;
-pub mod context;
-pub mod edits;
-#[cfg(feature = "semantic")]
-pub mod embedder;
 pub mod filter;
+pub mod git;
 pub mod graph;
-pub mod hook;
 pub mod links;
 pub mod mentions;
 pub mod parse;
 pub mod rules;
-pub mod search;
-#[cfg(feature = "semantic")]
-pub mod semantic;
-pub mod shell;
-pub mod state;
-pub mod suggest;
 pub mod text;
 pub mod vault;
-pub mod vectors;
 
 use std::path::{Path, PathBuf};
 

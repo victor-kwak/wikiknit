@@ -1,4 +1,4 @@
-//! End-to-end tests for `search`, `links`, filters, and the output format (v0.3 review).
+//! End-to-end tests for `links` and the output format (v0.3 review).
 
 use std::fs;
 use std::path::Path;
@@ -23,13 +23,9 @@ fn vault(files: &[(&str, &str)]) -> TempDir {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Value {
-    let state = dir.join(".state");
     let out = Command::cargo_bin("wikiknit")
         .unwrap()
         .current_dir(dir)
-        .env("XDG_STATE_HOME", &state)
-        // Hermetic: no embedding model from the real cache.
-        .env("XDG_CACHE_HOME", dir.join(".cache"))
         .arg("--format")
         .arg("json")
         .args(args)
@@ -42,15 +38,6 @@ fn run(dir: &Path, args: &[&str]) -> Value {
             String::from_utf8_lossy(&out.stderr)
         )
     })
-}
-
-fn ids(items: &Value) -> Vec<String> {
-    items["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["id"].as_str().unwrap().to_string())
-        .collect()
 }
 
 fn sample() -> TempDir {
@@ -80,81 +67,6 @@ fn sample() -> TempDir {
             ),
         ),
     ])
-}
-
-#[test]
-fn identifiers_are_split_into_parts() {
-    let v = sample();
-    for q in ["snapshot", "snapshot.sh", "ed25519", "id_ed25519"] {
-        assert_eq!(
-            ids(&run(v.path(), &["search", q])),
-            ["Projects/foo/overview"],
-            "{q}"
-        );
-    }
-    // A phrase across an identifier still matches: its parts do not shift positions.
-    assert_eq!(
-        ids(&run(v.path(), &["search", "\"runs snapshot.sh nightly\""])),
-        ["Projects/foo/overview"]
-    );
-}
-
-#[test]
-fn snippets_show_the_match() {
-    let v = sample();
-    let r = run(v.path(), &["search", "tunnel"]);
-    let hit = &r["items"][0];
-    assert_eq!(hit["id"], "Notes/long");
-    let snippet = hit["snippet"].as_str().unwrap();
-    assert!(snippet.contains("tunnel"), "{snippet}");
-    assert!(
-        snippet.starts_with("...") && snippet.ends_with("..."),
-        "{snippet}"
-    );
-}
-
-#[test]
-fn filters_do_not_change_scores() {
-    let v = sample();
-    let all = run(v.path(), &["search", "cloudflare"]);
-    let typed = run(v.path(), &["search", "cloudflare", "--type", "project"]);
-    let score = |r: &Value, id: &str| {
-        r["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|h| h["id"] == id)
-            .map(|h| h["score"].as_f64().unwrap())
-    };
-    assert_eq!(
-        score(&all, "Projects/foo/overview"),
-        score(&typed, "Projects/foo/overview")
-    );
-    assert_eq!(ids(&typed), ["Projects/foo/overview"]);
-}
-
-#[test]
-fn cjk_single_characters_and_phrases_within_lines() {
-    let v = sample();
-    assert_eq!(ids(&run(v.path(), &["search", "京"])), ["Notes/tower"]);
-    assert_eq!(
-        ids(&run(v.path(), &["search", "東京タワー"])),
-        ["Notes/tower"]
-    );
-    // "bar" and "baz" are on different lines: not a phrase.
-    assert!(ids(&run(v.path(), &["search", "\"bar baz\""])).is_empty());
-    assert_eq!(
-        ids(&run(v.path(), &["search", "\"foo bar\""])),
-        ["Reference/keys"]
-    );
-}
-
-#[test]
-fn link_targets_are_not_indexed_as_words() {
-    let v = sample();
-    // INDEX links into Notes/ and every overview link ends in `overview`; those are paths, not prose.
-    assert!(ids(&run(v.path(), &["search", "notes"])).is_empty());
-    assert!(ids(&run(v.path(), &["search", "overview"])).is_empty());
 }
 
 #[test]
@@ -189,29 +101,32 @@ fn json_keys_follow_the_text_header_order() {
     let out = Command::cargo_bin("wikiknit")
         .unwrap()
         .current_dir(v.path())
-        .env("XDG_STATE_HOME", v.path().join(".state"))
-        .env("XDG_CACHE_HOME", v.path().join(".cache"))
-        .args(["--format", "json", "search", "cloudflare"])
+        .args(["--format", "json", "links", "Reference/keys"])
         .output()
         .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
         text.starts_with(
-            r#"{"schema_version":1,"command":"search","mode":"lexical","items":[{"id":"#
+            r#"{"schema_version":1,"command":"links","note":"Reference/keys","items":[{"dir":"in","#
+        ),
+        "{text}"
+    );
+    // An edge with every field set lists them in header order (empty fields are left out).
+    assert!(
+        text.contains(
+            r#"{"dir":"both","depth":1,"id":"Projects/foo/overview","hub":false,"type":"project","via":"Reference/keys","source":"Reference/keys","line":6,"context":"Used by [[Projects/foo/overview|foo]].","back_line":7,"back_context":"See [[Reference/keys]].","count":1,"summary":"#
         ),
         "{text}"
     );
     let header = Command::cargo_bin("wikiknit")
         .unwrap()
         .current_dir(v.path())
-        .env("XDG_STATE_HOME", v.path().join(".state"))
-        .env("XDG_CACHE_HOME", v.path().join(".cache"))
-        .args(["search", "cloudflare"])
+        .args(["links", "Reference/keys"])
         .output()
         .unwrap();
     let first = String::from_utf8(header.stdout).unwrap();
     assert!(
-        first.starts_with("# id\tscore\ttype\tsimilarity\tmatched\tcoverage\tline\tsnippet\n"),
+        first.starts_with("# dir\tdepth\tid\thub\ttype\tvia\tsource\tline\tcontext\tback_line\tback_context\tcount\tsummary\n"),
         "{first}"
     );
 }

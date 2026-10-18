@@ -1,10 +1,11 @@
 # wikiknit
 
-Rust CLI + Claude Code plugin that lints and knits wikilinks in Markdown vaults. User docs: `README.md`.
+Rust CLI + Claude Code plugin that lints wikilinks in Markdown vaults that agents keep as memory. User docs: `README.md`.
 
-- Layout: `src/` (lib + `main.rs` CLI), `tests/cli.rs` (end-to-end against `tests/fixtures/<vault>/`), `plugin/` (Claude Code plugin: hooks + `link` and `context` skills), `.claude-plugin/marketplace.json` (this repo as a marketplace).
+- Layout: `src/` (lib + `main.rs` CLI), `tests/*.rs` (end-to-end: the real binary on temp vaults or `tests/fixtures/<vault>/`; `tests/lean.rs` runs real git, including a real pre-commit hook), `plugin/` (Claude Code plugin: the `link` skill, no hooks), `.claude-plugin/marketplace.json` (this repo as a marketplace).
 - Checks before commit: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. After plugin edits: `claude plugin validate ./plugin` and `claude plugin validate .`.
 - Tests run the real binary on fixture vaults. No mocks. New rule -> new fixture case.
-- Hook contract: exit 0 = allow, exit 2 + stderr = hold with reason, exit 1 = non-blocking error. `pre-commit` fails closed: once it finds a commit in the command, any error (config, state, vault, timeout, panic) exits 2 with the error; the parse itself runs under the deadline, and a command it cannot classify in time is held. The parser must not recurse on input size (long pipelines): keep per-command work iterative. Other hooks exit 1 on internal errors, never 2. Keep the pre-commit deadline (`WIKIKNIT_HOOK_TIMEOUT_MS`, 8 s) below the plugin hook timeout in `plugin/hooks/hooks.json` (10 s).
-- The core stays agent-agnostic. Anything Claude-specific lives in `hook.rs` and `plugin/`.
+- Scope: deterministic checks that find real defects in an agent's vault, or stay quiet. Search, context packs, link suggestions, and the Claude Code commit gate were removed in 0.7 after an evaluation showed they cost more than they helped (Claude Code's own Grep/Read did as well); add a feature only with measured evidence that it helps an agent.
+- `--changed`/`--staged` compare with git HEAD and report only introduced findings (`git.rs` exports HEAD or the index to a temp dir). Inside a git hook, `GIT_DIR`/`GIT_INDEX_FILE` name the index being committed: keep them (made absolute) for the vault's repo, and clear them for other repos (`drift`). Git calls run with the repo's programs turned off (fsmonitor, hooks, pager, signatures, network); they only read (`--staged` writes its tree into a temporary object store). A hook's relative `GIT_*` values: try the cwd reading, then the top reading, and keep the first whose paths exist; a hook for another repository (submodule superproject, outer repo) checks nothing.
+- The core stays agent-agnostic. Anything Claude-specific lives in `plugin/`.
 - Install locally: `cargo install --path . --locked` (to `~/.cargo/bin`).

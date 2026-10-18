@@ -29,8 +29,9 @@ pub enum Severity {
     Error,
 }
 
+// Unknown keys land in `removed` (`deny_unknown_fields` does not work with `flatten`); `load`
+// rejects any that is not a removed feature's.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default = "default_vault")]
     vault: PathBuf,
@@ -46,18 +47,6 @@ struct RawConfig {
     generic_names: Vec<String>,
     #[serde(default)]
     alias_only: Vec<String>,
-    #[serde(default = "default_stemmer")]
-    stemmer: String,
-    #[serde(default = "default_embedding_model")]
-    embedding_model: String,
-    #[serde(default = "default_link_section")]
-    link_section: String,
-    #[serde(default = "default_min_similarity")]
-    min_similarity: f32,
-    #[serde(default = "default_semantic_margin")]
-    semantic_margin: f32,
-    #[serde(default)]
-    no_backlink_from: Vec<String>,
     #[serde(default)]
     require_link: Vec<RawRequireLink>,
     #[serde(default)]
@@ -67,8 +56,25 @@ struct RawConfig {
     #[serde(default)]
     stale: Vec<RawStale>,
     #[serde(default)]
+    drift: Vec<RawDrift>,
+    #[serde(default)]
+    forbid_link: Vec<RawForbidLink>,
+    #[serde(default)]
     severity: BTreeMap<String, Severity>,
+    /// Keys of features removed in 0.7 (search, suggest): read and ignored, with a note.
+    #[serde(flatten)]
+    removed: BTreeMap<String, toml::Value>,
 }
+
+/// Top-level keys that configured removed features: accepted so old configs still load.
+const REMOVED_KEYS: &[&str] = &[
+    "stemmer",
+    "embedding_model",
+    "link_section",
+    "min_similarity",
+    "semantic_margin",
+    "no_backlink_from",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +103,25 @@ struct RawStale {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawDrift {
+    path: Option<String>,
+    #[serde(default = "default_repo_field")]
+    repo_field: String,
+    #[serde(default = "default_commit_field")]
+    commit_field: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawForbidLink {
+    target: String,
+    from: Option<String>,
+    near: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawWhen {
     field: Option<String>,
     matches: Option<String>,
@@ -106,48 +131,13 @@ struct RawWhen {
 fn default_vault() -> PathBuf {
     PathBuf::from(".")
 }
-fn default_stemmer() -> String {
-    "english".into()
+fn default_repo_field() -> String {
+    "path".into()
 }
 
-fn default_embedding_model() -> String {
-    "BGESmallENV15Q".into()
+fn default_commit_field() -> String {
+    "verified_commit".into()
 }
-
-fn default_min_similarity() -> f32 {
-    0.5
-}
-
-fn default_semantic_margin() -> f32 {
-    0.12
-}
-
-fn default_link_section() -> String {
-    "## Related".into()
-}
-
-/// Snowball stemmers `search` can use (`none` turns stemming off).
-pub const STEMMERS: &[&str] = &[
-    "none",
-    "arabic",
-    "danish",
-    "dutch",
-    "english",
-    "finnish",
-    "french",
-    "german",
-    "greek",
-    "hungarian",
-    "italian",
-    "norwegian",
-    "portuguese",
-    "romanian",
-    "russian",
-    "spanish",
-    "swedish",
-    "tamil",
-    "turkish",
-];
 
 fn default_min_alias_len() -> usize {
     4
@@ -194,6 +184,28 @@ pub struct Stale {
     pub fix: Option<String>,
 }
 
+/// A note that records the commit it was last checked against (`verified_commit`) and the
+/// repository it describes (`path`): the `drift` rule counts the commits made since.
+#[derive(Debug, Clone)]
+pub struct Drift {
+    /// Only notes whose id matches; `None` = every note with both fields.
+    pub path: Option<Regex>,
+    /// Frontmatter field with the repository folder (`~/` is the home directory).
+    pub repo_field: String,
+    /// Frontmatter field with the commit the note was checked against.
+    pub commit_field: String,
+}
+
+/// Links that must not be written: to notes matching `target`, from notes matching `from`,
+/// on a line or under a heading matching `near` (`Issues/resolved/` under "open issues").
+#[derive(Debug, Clone)]
+pub struct ForbidLink {
+    pub target: Regex,
+    pub from: Option<Regex>,
+    pub near: Option<Regex>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Absolute vault root.
@@ -212,25 +224,14 @@ pub struct Config {
     /// Vault-relative prefixes whose notes are found in prose by their aliases only,
     /// not by their name (for notes named with common words, like `Systems/display`).
     pub alias_only: Vec<String>,
-    /// Stemmer for `search` (a name from [`STEMMERS`]).
-    pub stemmer: String,
-    /// fastembed model for semantic search (e.g. `BGESmallENV15Q`, `MultilingualE5Small`).
-    pub embedding_model: String,
-    /// Heading of the section `suggest` puts new links under (e.g. `## Related`).
-    pub link_section: String,
-    /// Cosine similarity below which a note is not a semantic match (model-dependent).
-    pub min_similarity: f32,
-    /// A semantic match must also stand this far above the median note for the query (vaults
-    /// of 10+ notes), so a query about nothing in the vault matches nothing.
-    pub semantic_margin: f32,
-    /// Prefixes of notes whose links do not ask for a link back (logs: `Sessions/`).
-    pub no_backlink_from: Vec<String>,
     pub require_link: Vec<RequireLink>,
     pub require_inbound: Vec<RequireInbound>,
     /// Prefixes of notes that need no inbound link (logs, inboxes): the `orphan` rule skips them.
     pub orphan_exempt: Vec<String>,
     /// Freshness rules; the first whose `path` matches a note applies to it.
     pub stale: Vec<Stale>,
+    pub drift: Vec<Drift>,
+    pub forbid_link: Vec<ForbidLink>,
     severity: BTreeMap<String, Severity>,
 }
 
@@ -247,21 +248,23 @@ impl Config {
             min_alias_len: default_min_alias_len(),
             generic_names: default_generic_names(),
             alias_only: Vec::new(),
-            stemmer: default_stemmer(),
-            embedding_model: default_embedding_model(),
-            link_section: default_link_section(),
-            min_similarity: default_min_similarity(),
-            semantic_margin: default_semantic_margin(),
-            no_backlink_from: Vec::new(),
             require_link: Vec::new(),
             require_inbound: Vec::new(),
             orphan_exempt: Vec::new(),
             stale: Vec::new(),
+            drift: Vec::new(),
+            forbid_link: Vec::new(),
             severity: BTreeMap::new(),
         }
     }
 
     pub fn load(path: &Path) -> Result<Self, Error> {
+        Self::load_with(path, true)
+    }
+
+    /// `load`, with notes about removed keys on stderr only when `notes` (a copy of the config
+    /// from another git version is loaded quietly: the note is about the file on disk).
+    pub fn load_with(path: &Path, notes: bool) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
         let raw: RawConfig = toml::from_str(&text).map_err(|e| Error::Config {
             path: path.to_path_buf(),
@@ -365,13 +368,46 @@ impl Config {
                 fix: s.fix,
             });
         }
-        let stemmer = raw.stemmer.to_lowercase();
-        if !STEMMERS.contains(&stemmer.as_str()) {
-            return Err(bad(format!(
-                "stemmer: unknown `{}` (one of: {})",
-                raw.stemmer,
-                STEMMERS.join(", ")
-            )));
+        // One note per key and run, though `--changed` loads a config up to three times.
+        static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        for key in raw.removed.keys() {
+            if !REMOVED_KEYS.contains(&key.as_str()) {
+                return Err(bad(format!("unknown field `{key}`")));
+            }
+            let mut warned = WARNED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !notes || warned.contains(key) {
+                continue;
+            }
+            warned.push(key.clone());
+            eprintln!(
+                "wikiknit: {}: `{key}` is ignored (its feature was removed in 0.7); delete it",
+                path.display()
+            );
+        }
+        let regex = |p: &str, key: &str| Regex::new(p).map_err(|e| bad(format!("{key}: {e}")));
+        let mut drift = Vec::new();
+        for d in raw.drift {
+            if d.repo_field.trim().is_empty() || d.commit_field.trim().is_empty() {
+                return Err(bad(
+                    "drift.repo_field and drift.commit_field must name frontmatter fields".into(),
+                ));
+            }
+            drift.push(Drift {
+                path: d.path.map(|p| regex(&p, "drift.path")).transpose()?,
+                repo_field: d.repo_field,
+                commit_field: d.commit_field,
+            });
+        }
+        let mut forbid_link = Vec::new();
+        for f in raw.forbid_link {
+            forbid_link.push(ForbidLink {
+                target: regex(&f.target, "forbid_link.target")?,
+                from: f.from.map(|p| regex(&p, "forbid_link.from")).transpose()?,
+                near: f.near.map(|p| regex(&p, "forbid_link.near")).transpose()?,
+                message: f.message,
+            });
         }
         for key in raw.severity.keys() {
             if !crate::rules::RULES.iter().any(|(name, _)| name == key) {
@@ -391,16 +427,6 @@ impl Config {
                 .map(|s| s.to_lowercase())
                 .collect(),
             alias_only: raw.alias_only.into_iter().map(|p| prefix_ref(&p)).collect(),
-            stemmer,
-            embedding_model: raw.embedding_model,
-            link_section: raw.link_section,
-            min_similarity: raw.min_similarity,
-            semantic_margin: raw.semantic_margin,
-            no_backlink_from: raw
-                .no_backlink_from
-                .into_iter()
-                .map(|p| prefix_ref(&p))
-                .collect(),
             require_link,
             require_inbound,
             orphan_exempt: raw
@@ -409,17 +435,27 @@ impl Config {
                 .map(|p| prefix_ref(&p))
                 .collect(),
             stale,
+            drift,
+            forbid_link,
             severity: raw.severity,
         })
     }
 
-    /// Find `wikiknit.toml` in `start` or any parent directory.
+    /// Find `wikiknit.toml` in `start` or a parent directory, up to the top of the git work
+    /// tree `start` is in (the folder holding `.git`): a config above the repository belongs
+    /// to something else.
     #[must_use]
     pub fn find(start: &Path) -> Option<PathBuf> {
-        start
-            .ancestors()
-            .map(|dir| dir.join(CONFIG_FILE))
-            .find(|p| p.is_file())
+        for dir in start.ancestors() {
+            let file = dir.join(CONFIG_FILE);
+            if file.is_file() {
+                return Some(file);
+            }
+            if dir.join(".git").exists() {
+                return None;
+            }
+        }
+        None
     }
 
     /// Effective severity for a rule (config override, else the rule default).
@@ -440,13 +476,16 @@ impl Config {
     }
 
     #[must_use]
-    pub fn is_no_backlink_from(&self, id: &str) -> bool {
-        under_any(&self.no_backlink_from, id)
-    }
-
-    #[must_use]
     pub fn is_orphan_exempt(&self, id: &str) -> bool {
         under_any(&self.orphan_exempt, id)
+    }
+
+    /// The drift rule for a note: the first `[[drift]]` whose `path` matches it.
+    #[must_use]
+    pub fn drift_rule(&self, id: &str) -> Option<&Drift> {
+        self.drift
+            .iter()
+            .find(|d| d.path.as_ref().is_none_or(|p| p.is_match(id)))
     }
 
     /// The freshness rule for a note: the first `[[stale]]` whose `path` matches it.

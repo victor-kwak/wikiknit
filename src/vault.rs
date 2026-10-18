@@ -63,6 +63,51 @@ impl Note {
         (line, &self.text[start..end], offset.saturating_sub(start))
     }
 
+    /// The text of the last ATX heading (`## Open issues`) above `offset`, in the body (not
+    /// the frontmatter, where `# x` is a YAML comment) and outside code.
+    #[must_use]
+    pub fn heading_before(&self, offset: usize) -> Option<String> {
+        let mut fence: Option<char> = None;
+        let mut heading = None;
+        // The body starts on the line after the closing `---`.
+        let start = self.parsed.frontmatter.yaml.as_ref().map_or(0, |r| {
+            let mut line = self.line_of(r.end.min(self.text.len().saturating_sub(1)));
+            while line <= self.line_starts.len() {
+                let s = self.line_start(line);
+                let text = self.text[s..].lines().next().unwrap_or_default().trim_end();
+                if s >= r.end && (text == "---" || text == "...") {
+                    return self.line_start(line + 1).min(self.text.len());
+                }
+                line += 1;
+            }
+            self.text.len()
+        });
+        let end = offset.min(self.text.len());
+        for l in self.text.get(start..end).unwrap_or_default().lines() {
+            // Four spaces or a tab: indented code, not a heading.
+            let indent = l.chars().take_while(|c| *c == ' ').count();
+            if indent >= 4 || l.starts_with('\t') {
+                continue;
+            }
+            let t = l.trim_start();
+            if let Some(c) = fence {
+                if t.starts_with(&String::from(c).repeat(3)) {
+                    fence = None;
+                }
+                continue;
+            }
+            if t.starts_with("```") || t.starts_with("~~~") {
+                fence = t.chars().next();
+                continue;
+            }
+            let hashes = t.chars().take_while(|&c| c == '#').count();
+            if (1..=6).contains(&hashes) && t[hashes..].starts_with([' ', '\t']) {
+                heading = Some(t[hashes..].trim().trim_end_matches('#').trim().to_string());
+            }
+        }
+        heading
+    }
+
     /// The text of the line containing `offset`, trimmed.
     #[must_use]
     pub fn line_text(&self, offset: usize) -> &str {

@@ -19,14 +19,9 @@ fn vault(config: &str, files: &[(&str, &str)]) -> TempDir {
 }
 
 fn check(dir: &Path, args: &[&str]) -> Vec<Value> {
-    let state = dir.join(".state");
     let out = Command::cargo_bin("wikiknit")
         .unwrap()
         .current_dir(dir)
-        .env("XDG_STATE_HOME", &state)
-        .env("XDG_CACHE_HOME", state.join("cache"))
-        .env_remove("WIKIKNIT_SESSION")
-        .env_remove("CLAUDE_PROJECT_DIR")
         .args(["--format", "json", "check"])
         .args(args)
         .output()
@@ -133,7 +128,6 @@ fn stale_config_errors() {
     let out = Command::cargo_bin("wikiknit")
         .unwrap()
         .current_dir(v.path())
-        .env("XDG_STATE_HOME", v.path().join(".state"))
         .arg("check")
         .output()
         .unwrap();
@@ -180,7 +174,7 @@ fn required_inbound_links() {
     assert_eq!(b["severity"], "error");
     assert_eq!(
         b["fix"],
-        "in INDEX: insert after line 5: - [[Projects/b/overview]]"
+        "in INDEX: add [[Projects/b/overview]] after line 5, with its links to similar notes"
     );
     // Selecting only the `from` note still finds the missing link (editing it can drop one).
     let only_index = check(v.path(), &["INDEX"]);
@@ -212,14 +206,21 @@ fn required_inbound_edge_cases() {
     let m = by_rule(&f, "missing-required-inbound");
     assert_eq!(m.len(), 1, "{m:?}");
     assert_eq!(m[0]["note"], "p/b");
-    assert_eq!(m[0]["fix"], "in INDEX: insert after line 2: - [[b]]");
-    // Only INDEX selected: the finding is about INDEX, at the line to edit.
+    assert_eq!(
+        m[0]["fix"],
+        "in INDEX: add [[b]] after line 2, with its links to similar notes"
+    );
+    // Only INDEX selected: the finding is about INDEX, at the line its new link goes after.
     let f = check(v.path(), &["INDEX"]);
     let m = by_rule(&f, "missing-required-inbound");
     assert_eq!(m.len(), 1);
     assert_eq!(m[0]["note"], "INDEX");
     assert_eq!(m[0]["line"], 2);
     assert_eq!(m[0]["message"], "must link [[p/b]] (require_inbound)");
+    assert_eq!(
+        m[0]["fix"],
+        "in INDEX: add [[b]] after line 2, with its links to similar notes"
+    );
     // A note linked only from a hub is not an orphan.
     assert!(by_rule(&f, "orphan").is_empty());
     assert!(
@@ -285,7 +286,7 @@ fn code_that_names_no_note_is_not_a_link_in_code() {
 }
 
 #[test]
-fn several_required_links_into_one_note_create_the_section_once() {
+fn several_required_links_into_one_note_each_get_a_fix() {
     let v = vault(
         "[[require_link]]\nwhen = { path = \"^s$\" }\ntarget = \"a\"\n\n\
          [[require_link]]\nwhen = { path = \"^s$\" }\ntarget = \"b\"\n",
@@ -300,16 +301,18 @@ fn several_required_links_into_one_note_create_the_section_once() {
         .iter()
         .map(|x| x["fix"].as_str().unwrap())
         .collect();
-    assert_eq!(fixes.len(), 2, "{f:?}");
     assert_eq!(
-        fixes.iter().filter(|x| x.starts_with("append")).count(),
-        1,
-        "{fixes:?}"
+        fixes,
+        [
+            "add [[a]] where the note lists what it is about (a Related section, or the frontmatter)",
+            "add [[b]] where the note lists what it is about (a Related section, or the frontmatter)",
+        ],
+        "{f:?}"
     );
 }
 
 #[test]
-fn several_required_inbound_links_into_one_note_create_the_section_once() {
+fn several_required_inbound_links_into_one_note_each_get_a_fix() {
     let v = vault(
         "[[require_inbound]]\nwhen = { path = \"^p/\" }\nfrom = \"hub\"\n",
         &[
@@ -320,19 +323,19 @@ fn several_required_inbound_links_into_one_note_create_the_section_once() {
             ("p/c.md", "# c\n[[p/a]]\n"),
         ],
     );
-    // hub links no p/ note, so all three go in a new link section, created once.
+    // hub links no p/ note, so no line is named: each fix only says what to add.
     let f = check(v.path(), &[]);
     let fixes: Vec<&str> = by_rule(&f, "missing-required-inbound")
         .iter()
         .map(|x| x["fix"].as_str().unwrap())
         .collect();
-    assert_eq!(fixes.len(), 3, "{f:?}");
     assert_eq!(
-        fixes
-            .iter()
-            .filter(|x| x.starts_with("in hub: append"))
-            .count(),
-        1,
-        "{fixes:?}"
+        fixes,
+        [
+            "in hub: add [[a]]",
+            "in hub: add [[b]]",
+            "in hub: add [[c]]"
+        ],
+        "{f:?}"
     );
 }

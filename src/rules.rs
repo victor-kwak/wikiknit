@@ -5,7 +5,6 @@ use std::collections::{BTreeSet, HashMap};
 use serde::Serialize;
 
 use crate::config::{LinkStyle, Severity, When};
-use crate::edits::Planned;
 use crate::parse::{LinkKind, Location};
 use crate::vault::Note;
 use crate::vault::{Form, Target, Vault};
@@ -27,6 +26,8 @@ pub const RULES: &[(&str, Severity)] = &[
     ("duplicate-alias", Severity::Error),
     ("file-not-utf8", Severity::Warn),
     ("duplicate-note-id", Severity::Warn),
+    ("drift", Severity::Warn),
+    ("forbidden-link", Severity::Error),
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,18 +39,11 @@ pub struct Finding {
     pub message: String,
     /// How to fix it (empty when there is no specific fix).
     pub fix: String,
-    /// The fix is an edit in a note: written in output order with the other edits there.
+    /// What the finding is about, stable across edits elsewhere: the message without positions,
+    /// counts, or other notes' names. `--changed`/`--staged` compare findings by note, rule,
+    /// and key.
     #[serde(skip)]
-    plan: Option<FixPlan>,
-}
-
-/// A fix that edits note `editor` (an index into `vault.notes`).
-#[derive(Debug, Clone)]
-struct FixPlan {
-    editor: usize,
-    plan: Planned,
-    /// The fix names the edited note (`in INDEX: ...`): the finding is about another note.
-    prefix: bool,
+    pub key: String,
 }
 
 impl Finding {
@@ -62,9 +56,17 @@ impl Finding {
 struct Sink<'a> {
     vault: &'a Vault,
     out: Vec<Finding>,
+    /// The key for the next `push_fix` (its message when unset).
+    next_key: Option<String>,
 }
 
 impl Sink<'_> {
+    /// Give the next finding this key instead of its message.
+    fn key(&mut self, key: impl Into<String>) -> &mut Self {
+        self.next_key = Some(key.into());
+        self
+    }
+
     fn push_fix(
         &mut self,
         rule: &'static str,
@@ -73,6 +75,7 @@ impl Sink<'_> {
         message: String,
         fix: String,
     ) {
+        let key = self.next_key.take().unwrap_or_else(|| message.clone());
         let severity = match self.vault.config.severity(rule) {
             Severity::Off => return,
             Severity::Warn => "warn",
@@ -85,56 +88,28 @@ impl Sink<'_> {
             rule,
             message,
             fix,
-            plan: None,
+            key,
         });
-    }
-
-    /// A finding whose fix is an edit in `editor`; the edit text is written by `sequence`.
-    /// When the edited note is the finding's note, the finding's line is the edit's line.
-    fn push_planned(
-        &mut self,
-        rule: &'static str,
-        note: &str,
-        message: String,
-        editor: usize,
-        plan: Planned,
-    ) {
-        let before = self.out.len();
-        self.push_fix(rule, note, 1, message, String::new());
-        if let Some(f) = self.out.get_mut(before) {
-            let prefix = self.vault.notes[editor].id != note;
-            f.plan = Some(FixPlan {
-                editor,
-                plan,
-                prefix,
-            });
-        }
     }
 }
 
-/// Write the edit of every planned fix, per edited note in output order, so the fixes apply
-/// one after another.
-fn sequence(vault: &Vault, out: &mut [Finding]) {
-    let mut by_editor: std::collections::BTreeMap<usize, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for (k, f) in out.iter().enumerate() {
-        if let Some(p) = &f.plan {
-            by_editor.entry(p.editor).or_default().push(k);
-        }
-    }
-    for (editor, ks) in by_editor {
-        let note = &vault.notes[editor];
-        let plans: Vec<Planned> = ks
-            .iter()
-            .filter_map(|&k| out[k].plan.as_ref().map(|p| p.plan.clone()))
-            .collect();
-        for (k, (line, edit)) in ks.into_iter().zip(crate::edits::plan(vault, note, &plans)) {
-            let f = &mut out[k];
-            if f.plan.as_ref().is_some_and(|p| p.prefix) {
-                f.fix = format!("in {}: {edit}", note.id);
+/// A link to `target` as this vault writes links.
+#[must_use]
+pub fn link_text(vault: &Vault, target: &Note) -> String {
+    match vault.config.link_style {
+        LinkStyle::FullPath => format!("[[{}]]", target.id),
+        LinkStyle::Shortest => {
+            let stem = target.stem();
+            let unique = vault
+                .notes
+                .iter()
+                .filter(|n| n.stem().eq_ignore_ascii_case(stem))
+                .count()
+                == 1;
+            if unique {
+                format!("[[{stem}]]")
             } else {
-                f.fix = edit;
-                f.line = line.max(1);
+                format!("[[{}]]", target.id)
             }
         }
     }
@@ -303,6 +278,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
     let mut sink = Sink {
         vault,
         out: Vec::new(),
+        next_key: None,
     };
     let mut closest = Closest::new(vault);
     // Every broken target in the selected notes, hinted in one parallel pass.
@@ -340,7 +316,8 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             );
         }
         if let Some(err) = &p.frontmatter.error {
-            sink.push_fix(
+            // The parser's message has positions: one finding per note.
+            sink.key("").push_fix(
                 "frontmatter-invalid",
                 &note.id,
                 2,
@@ -478,7 +455,8 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                             Target::File(f) => f.clone(),
                             _ => String::new(),
                         };
-                        sink.push_fix(
+                        // Keyed by the link as written: where its target lives is not this note's change.
+                        sink.key(shown.clone()).push_fix(
                             "link-style",
                             &note.id,
                             line,
@@ -503,18 +481,16 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 .map(|&t| format!("[[{}]]", vault.notes[t].id))
                 .collect();
             let fix = if back.is_empty() {
-                "link it from a related note (`wikiknit search` finds one), or add its folder to `orphan_exempt`"
-                    .to_string()
+                "link it from a related note, or add its folder to `orphan_exempt`".to_string()
             } else {
                 format!(
-                    "link it from {} ({}); `wikiknit suggest {}` gives the edits",
+                    "link it from {} ({})",
                     back.join(" or "),
                     if back.len() == 1 {
                         "it links that note"
                     } else {
                         "it links them"
                     },
-                    shell_word(&note.id)
                 )
             };
             sink.push_fix("orphan", &note.id, 1, "no note links here".into(), fix);
@@ -528,7 +504,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 .and_then(|v| v.get(&rule.field))
                 .is_none()
         {
-            sink.push_fix(
+            sink.key(format!("{} missing", rule.field)).push_fix(
                 "stale",
                 &note.id,
                 1,
@@ -552,24 +528,26 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             let line = frontmatter_line(note, &rule.field);
             let field = &rule.field;
             match value.as_str().and_then(parse_date) {
-                Some(day) if today - day > i64::from(rule.days) => sink.push_fix(
-                    "stale",
-                    &note.id,
-                    line,
-                    format!(
-                        "`{field}` is {} days old (limit {})",
-                        today - day,
-                        rule.days
-                    ),
-                    rule.fix.clone().unwrap_or_else(|| {
+                Some(day) if today - day > i64::from(rule.days) => {
+                    sink.key(format!("{field} old")).push_fix(
+                        "stale",
+                        &note.id,
+                        line,
                         format!(
-                            "check the note against its source, then set `{field}: {}`",
-                            format_date(today)
-                        )
-                    }),
-                ),
+                            "`{field}` is {} days old (limit {})",
+                            today - day,
+                            rule.days
+                        ),
+                        rule.fix.clone().unwrap_or_else(|| {
+                            format!(
+                                "check the note against its source, then set `{field}: {}`",
+                                format_date(today)
+                            )
+                        }),
+                    )
+                }
                 Some(_) => {}
-                None => sink.push_fix(
+                None => sink.key(format!("{field} not a date")).push_fix(
                     "stale",
                     &note.id,
                     line,
@@ -585,15 +563,15 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 &note.id,
                 1,
                 "note links to no other note".into(),
-                format!(
-                    "`wikiknit suggest {}` lists link candidates",
-                    shell_word(&note.id)
-                ),
+                "link the notes it is about (project, system, issue, person); `wikiknit catalog` lists every note".into(),
             );
         }
 
+        drift(vault, note, &mut sink);
+        forbidden_links(vault, note, &resolved, &mut sink);
+
         // Missing required links of this note: (target id, note index if it exists), in rule
-        // order. Their edits are made together, so applying them in order gives a valid note.
+        // order.
         let mut missing: Vec<(String, Option<usize>)> = Vec::new();
         for req in &cfg.require_link {
             let caps = match &req.when {
@@ -617,15 +595,18 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             }
         }
         for (target, at) in missing {
-            match (at, me) {
-                (Some(t), Some(me)) => sink.push_planned(
+            match at {
+                Some(t) => sink.push_fix(
                     "missing-required-link",
                     &note.id,
+                    1,
                     format!("must link [[{target}]]"),
-                    me,
-                    Planned::Link { target: t },
+                    format!(
+                        "add {} where the note lists what it is about (a Related section, or the frontmatter)",
+                        link_text(vault, &vault.notes[t])
+                    ),
                 ),
-                _ => sink.push_fix(
+                None => sink.push_fix(
                     "missing-required-link",
                     &note.id,
                     1,
@@ -654,8 +635,6 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
     duplicate_aliases(vault, &is_selected, &mut sink);
     sink.out
         .sort_by(|a, b| (&a.note, a.line, a.rule).cmp(&(&b.note, b.line, b.rule)));
-    // Edits last, in this final order: each fix applies after the ones above it.
-    sequence(vault, &mut sink.out);
     sink.out
 }
 
@@ -710,10 +689,10 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
             .clone()
     };
     // (from note, target note) pairs already reported: two rules asking for the same link
-    // give one edit.
+    // give one finding.
     let mut planned: BTreeSet<(usize, usize)> = BTreeSet::new();
     for (i, note) in vault.notes.iter().enumerate() {
-        for (rule, req) in cfg.require_inbound.iter().enumerate() {
+        for req in &cfg.require_inbound {
             let caps = match &req.when {
                 When::Field { field, pattern } => note
                     .parsed
@@ -761,25 +740,30 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
                     if !planned.insert((f, i)) {
                         continue;
                     }
-                    // The edit goes next to the `from` note's links to similar notes, else in
-                    // its link section; written in output order by `sequence`.
-                    let plan = Planned::Sibling { target: i, rule };
+                    let at = sibling(vault, &vault.notes[f], &req.when);
+                    let fix = match at {
+                        Some(line) => format!(
+                            "in {from}: add {} after line {line}, with its links to similar notes",
+                            link_text(vault, note)
+                        ),
+                        None => format!("in {from}: add {}", link_text(vault, note)),
+                    };
                     if target_selected {
-                        sink.push_planned(
+                        sink.push_fix(
                             "missing-required-inbound",
                             &note.id,
+                            1,
                             format!("must be linked from [[{from}]]"),
-                            f,
-                            plan,
+                            fix,
                         );
                     } else {
                         // Only the `from` note is being checked: the finding is about it.
-                        sink.push_planned(
+                        sink.push_fix(
                             "missing-required-inbound",
                             &from,
+                            at.unwrap_or(1),
                             format!("must link [[{}]] (require_inbound)", note.id),
-                            f,
-                            plan,
+                            fix,
                         );
                     }
                 }
@@ -796,14 +780,9 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
     }
 }
 
-/// Where `editor` already links other notes matching `when` (an index section listing
-/// projects), the edit puts the new link after the last of them, as the same kind of line.
-pub(crate) fn sibling_edit(
-    vault: &Vault,
-    editor: &Note,
-    when: &When,
-    target: &Note,
-) -> Option<(usize, String)> {
+/// The line of `editor`'s last body link to a note matching `when` (an index section listing
+/// open issues): where a new link of the same kind belongs.
+fn sibling(vault: &Vault, editor: &Note, when: &When) -> Option<usize> {
     let matches = |n: &Note| match when {
         When::Field { field, pattern } => n
             .parsed
@@ -819,24 +798,142 @@ pub(crate) fn sibling_edit(
         .filter(|r| matches!(r.target, Target::Note(i) if matches(&vault.notes[i])))
         .map(|r| r.raw.span.start)
         .max()?;
-    let (line, text, _) = editor.line_at(last);
-    let indent: String = text.chars().take_while(|c| c.is_whitespace()).collect();
-    let rest = text.trim_start();
-    let link = crate::suggest::link_text(vault, target);
-    if rest.starts_with('|') {
-        return Some((
-            line,
-            format!("insert after line {line}: a table row for {link}, like line {line}"),
-        ));
+    Some(editor.line_at(last).0)
+}
+
+/// `drift`: the note names a repository and the commit it was checked against; report the
+/// commits made since, so the note is checked before anyone relies on it.
+fn drift(vault: &Vault, note: &Note, sink: &mut Sink<'_>) {
+    let Some(rule) = vault.config.drift_rule(&note.id) else {
+        return;
+    };
+    let fm = &note.parsed.frontmatter;
+    // As written: YAML reads `1234567` as a number and `0e12345` as zero.
+    let Some(commit) = fm.yaml.as_ref().and_then(|r| {
+        crate::parse::Frontmatter::raw_scalar(&note.text[r.clone()], &rule.commit_field)
+    }) else {
+        return;
+    };
+    let commit = commit.as_str();
+    let Some(repo) = fm.str_field(&rule.repo_field).map(str::trim) else {
+        return;
+    };
+    // Only a commit id goes to git ("none (not a git repo)" is a note to the reader).
+    if !(4..=64).contains(&commit.len()) || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return;
     }
-    let marker = ["- ", "* ", "+ "]
-        .into_iter()
-        .find(|m| rest.starts_with(m))
-        .unwrap_or("- ");
-    Some((
-        line,
-        format!("insert after line {line}: {indent}{marker}{link}"),
-    ))
+    let dir = match repo.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(rest),
+            None => return,
+        },
+        None => std::path::PathBuf::from(repo),
+    };
+    if !dir.is_absolute() {
+        return;
+    }
+    let line = frontmatter_line(note, &rule.commit_field);
+    let field = &rule.commit_field;
+    match crate::git::drift(&dir, commit) {
+        crate::git::Drift::NoRepo => sink.key("no repo").push_fix(
+            "drift",
+            &note.id,
+            line,
+            format!("`{}` {repo} is not a git repository", rule.repo_field),
+            format!("fix `{}`, or remove `{field}`", rule.repo_field),
+        ),
+        crate::git::Drift::UnknownCommit => sink.key(format!("unknown {commit}")).push_fix(
+            "drift",
+            &note.id,
+            line,
+            format!("`{field}` {commit} is not a commit in {repo}"),
+            format!(
+                "check the note against {repo}, then set `{field}` to its current commit (`git -C {repo} rev-parse --short HEAD`)"
+            ),
+        ),
+        crate::git::Drift::Since { commits: 0, .. } => {}
+        crate::git::Drift::Since {
+            commits,
+            head,
+            date,
+        } => sink.key(format!("behind {commit}")).push_fix(
+            "drift",
+            &note.id,
+            line,
+            format!("{commits} commit(s) in {repo} since `{field}` {commit} (HEAD {head}, {date})"),
+            format!(
+                "`git -C {repo} log --oneline {commit}..HEAD`; update what changed, then set `{field}: {head}`"
+            ),
+        ),
+    }
+}
+
+/// `forbid_link`: links the config rules out, such as a resolved issue listed as open.
+fn forbidden_links(
+    vault: &Vault,
+    note: &Note,
+    resolved: &[crate::vault::Resolved],
+    sink: &mut Sink<'_>,
+) {
+    let rules: Vec<&crate::config::ForbidLink> = vault
+        .config
+        .forbid_link
+        .iter()
+        .filter(|r| r.from.as_ref().is_none_or(|f| f.is_match(&note.id)))
+        .collect();
+    if rules.is_empty() {
+        return;
+    }
+    for r in resolved {
+        let Target::Note(t) = r.target else { continue };
+        let target = &vault.notes[t].id;
+        for rule in &rules {
+            if !rule.target.is_match(target) {
+                continue;
+            }
+            if let Some(near) = &rule.near {
+                let (_, text, _) = note.line_at(r.raw.span.start);
+                // The line's own words (link targets taken out: `Issues/open/x` is not "open"),
+                // or the heading the link is under.
+                let words = strip_links(text);
+                let heading = note.heading_before(r.raw.span.start).unwrap_or_default();
+                if !near.is_match(&words) && !near.is_match(&heading) {
+                    continue;
+                }
+            }
+            sink.key(target.clone()).push_fix(
+                "forbidden-link",
+                &note.id,
+                note.line_of(r.raw.span.start),
+                rule.message.clone().unwrap_or_else(|| {
+                    format!("[[{target}]] must not be linked here (forbid_link)")
+                }),
+                format!("remove the link to [[{target}]], or move it where it belongs"),
+            );
+        }
+    }
+}
+
+/// `text` without link targets: `[[...]]` whole, and the `(...)` of `[text](target)`.
+fn strip_links(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("[[") {
+        out.push_str(&rest[..i]);
+        rest = rest[i..].find("]]").map_or("", |j| &rest[i + j + 2..]);
+    }
+    out.push_str(rest);
+    let text = out;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find("](") {
+        out.push_str(&rest[..=i]);
+        rest = rest[i + 2..]
+            .find(')')
+            .map_or("", |j| &rest[i + 2 + j + 1..]);
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A note id as one shell word for a hint: as is when safe, else single-quoted.
@@ -975,7 +1072,8 @@ fn duplicate_aliases(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &m
                 .map(|&j| vault.notes[j].id.as_str())
                 .collect();
             if !others.is_empty() {
-                sink.push_fix(
+                // Keyed by the alias alone: which other notes share it is not this note's change.
+                sink.key(key.clone()).push_fix(
                     "duplicate-alias",
                     &n.id,
                     1,

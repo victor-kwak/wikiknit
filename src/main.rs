@@ -1,5 +1,4 @@
-use std::collections::BTreeSet;
-use std::io::Read as _;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -9,15 +8,9 @@ use serde::Serialize;
 
 use wikiknit::config::{CONFIG_FILE, Config};
 use wikiknit::filter::Filter;
-use wikiknit::hook::{self, Outcome};
+use wikiknit::git::{Repo, Source};
 use wikiknit::links::{self, Direction};
-use wikiknit::state::{self, Store};
-use wikiknit::{Vault, catalog, graph, mentions, rules, search};
-
-/// `context --query`: hits after the first must score this share of the best hit...
-const SEED_SCORE: f64 = 0.5;
-/// ...and match by meaning or cover this share of the query's weight.
-const SEED_COVERAGE: f64 = 0.6;
+use wikiknit::{Vault, catalog, graph, mentions, rules};
 
 /// Version of the `--format json` envelope and record fields.
 const SCHEMA_VERSION: u32 = 1;
@@ -36,7 +29,7 @@ macro_rules! out {
     }};
 }
 
-/// Lint and knit wikilinks in a Markdown vault.
+/// Lint wikilinks in a Markdown vault.
 ///
 /// Output is for agents: one record per line, tab-separated, after a `# field...` header;
 /// nothing when there are no records. Lists inside a field are `;`-separated. `--format json` prints one compact JSON object:
@@ -63,127 +56,6 @@ enum Format {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Mode {
-    Hybrid,
-    Lexical,
-    Semantic,
-}
-
-/// Notes ranked by meaning for `query`, and the mode actually used. Never downloads a model:
-/// without one (or without the `semantic` feature) search is lexical, with a note on stderr.
-#[cfg(feature = "semantic")]
-fn meaning(
-    vault: &Vault,
-    query: &str,
-    include_hubs: bool,
-    mode: Mode,
-) -> Result<(Option<Vec<search::Meaning>>, Mode)> {
-    if mode == Mode::Lexical {
-        return Ok((None, Mode::Lexical));
-    }
-    let sem = match wikiknit::semantic::Semantic::open(vault, false) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("wikiknit: semantic search unavailable ({e}); using lexical");
-            return Ok((None, Mode::Lexical));
-        }
-    };
-    let Some(mut sem) = sem else {
-        eprintln!(
-            "wikiknit: semantic search is off until `wikiknit embed` downloads the model and indexes the vault; using lexical"
-        );
-        return Ok((None, Mode::Lexical));
-    };
-    // Keep the index current for a few changed or new notes (a few seconds at most); more
-    // needs `embed`. Done before the coverage check when the missing notes could fit, so a
-    // few new notes do not turn semantic search off.
-    let update = refresh(&mut sem, vault)?;
-    // A partial index would rank only the notes it happens to have: use it only when it
-    // covers nearly the whole vault.
-    let (indexed, total) = sem.coverage(vault);
-    if !sem.covers(vault) {
-        eprintln!(
-            "wikiknit: the semantic index covers {indexed} of {total} notes; run `wikiknit embed`; using lexical"
-        );
-        return Ok((None, Mode::Lexical));
-    }
-    if update.stale > 0 {
-        eprintln!(
-            "wikiknit: {} note(s) changed since `wikiknit embed`; their old vectors are used",
-            update.stale
-        );
-    }
-    let ranked = sem.rank(vault, query, include_hubs)?;
-    Ok((Some(ranked), mode))
-}
-
-/// The semantic index for `suggest`, refreshed for a few changed notes when the model is
-/// available; `None` without an index.
-/// Chunks `search` and `suggest` embed themselves before answering; more needs `embed`.
-#[cfg(feature = "semantic")]
-const REFRESH_CHUNKS: usize = 64;
-
-/// Embed up to [`REFRESH_CHUNKS`] changed or new notes, unless the index is so far behind that
-/// one refresh cannot make it cover the vault (then only `embed` helps, and every search
-/// would pay for a partial refresh).
-#[cfg(feature = "semantic")]
-fn refresh(
-    sem: &mut wikiknit::semantic::Semantic,
-    vault: &Vault,
-) -> Result<wikiknit::semantic::Update> {
-    let (indexed, total) = sem.coverage(vault);
-    // Each missing note is at least one chunk: more missing notes than the refresh budget
-    // cannot all fit, so a refresh would not make the index usable.
-    if !sem.covers(vault) && total - indexed > REFRESH_CHUNKS {
-        return Ok(sem.update(vault, Some(0))?);
-    }
-    Ok(sem.update(vault, Some(REFRESH_CHUNKS))?)
-}
-
-#[cfg(feature = "semantic")]
-fn semantic_index(vault: &Vault) -> Result<Option<wikiknit::vectors::Index>> {
-    if let Ok(Some(mut sem)) = wikiknit::semantic::Semantic::open(vault, false) {
-        refresh(&mut sem, vault)?;
-        if !sem.covers(vault) {
-            let (indexed, total) = sem.coverage(vault);
-            eprintln!(
-                "wikiknit: the semantic index covers {indexed} of {total} notes; run `wikiknit embed` for similarity-based suggestions"
-            );
-        }
-        return Ok(Some(sem.index));
-    }
-    index_file(vault)
-}
-
-#[cfg(not(feature = "semantic"))]
-fn semantic_index(vault: &Vault) -> Result<Option<wikiknit::vectors::Index>> {
-    index_file(vault)
-}
-
-/// The semantic index as saved (no model needed to read it).
-fn index_file(vault: &Vault) -> Result<Option<wikiknit::vectors::Index>> {
-    let store = Store::open(&vault.config.vault)?;
-    let model = &vault.config.embedding_model;
-    Ok(wikiknit::vectors::Index::load(
-        &wikiknit::vectors::path(store.dir(), model),
-        model,
-    )?)
-}
-
-#[cfg(not(feature = "semantic"))]
-fn meaning(
-    _vault: &Vault,
-    _query: &str,
-    _include_hubs: bool,
-    mode: Mode,
-) -> Result<(Option<Vec<search::Meaning>>, Mode)> {
-    if mode != Mode::Lexical {
-        eprintln!("wikiknit: built without the `semantic` feature; using lexical search");
-    }
-    Ok((None, Mode::Lexical))
-}
-
 /// Note filters (each kind must match; repeat a flag to accept any of its values).
 #[derive(Debug, Args, Default)]
 struct FilterArgs {
@@ -206,14 +78,6 @@ struct FilterArgs {
 }
 
 impl FilterArgs {
-    fn is_set(&self) -> bool {
-        !(self.types.is_empty()
-            && self.paths.is_empty()
-            && self.wheres.is_empty()
-            && self.tags.is_empty()
-            && self.linked_to.is_none())
-    }
-
     fn build(&self, vault: &Vault) -> Result<Filter> {
         Ok(Filter::new(
             vault,
@@ -228,14 +92,37 @@ impl FilterArgs {
 
 #[derive(Debug, Args)]
 struct Select {
-    /// Only notes changed in the session that still need a link pass.
-    #[arg(long)]
+    /// Only what the uncommitted changes add: findings in the vault as it is on disk that the
+    /// last commit does not have (needs git).
+    #[arg(long, conflicts_with_all = ["staged", "paths"])]
     changed: bool,
-    /// Session id (default: $WIKIKNIT_SESSION, else the one active session).
-    #[arg(long)]
-    session: Option<String>,
+    /// Only what the next commit adds: findings in the staged vault that the last commit does
+    /// not have. For a git pre-commit hook.
+    #[arg(long, conflicts_with = "paths")]
+    staged: bool,
     /// Notes to include (ids, vault paths, or file paths). Default: every note.
     paths: Vec<String>,
+}
+
+impl Select {
+    /// The vault version to compare with the last commit, if any.
+    fn since_head(&self) -> Option<Change> {
+        if self.staged {
+            Some(Change::Staged)
+        } else if self.changed {
+            Some(Change::WorkTree)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    /// The vault on disk.
+    WorkTree,
+    /// The index.
+    Staged,
 }
 
 #[derive(Debug, Subcommand)]
@@ -244,84 +131,6 @@ enum Command {
     Check(Select),
     /// List unlinked mentions: text naming another note (name or alias) without a link.
     Mentions(Select),
-    /// Ranked full-text search: title, aliases, headings, frontmatter, body.
-    Search {
-        /// Words and "quoted phrases".
-        #[arg(required = true, num_args = 1..)]
-        query: Vec<String>,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-        /// Also search hub notes (excluded by default: they mention everything).
-        #[arg(long)]
-        include_hubs: bool,
-        /// hybrid: words + meaning (needs `wikiknit embed` once; falls back to lexical);
-        /// lexical: words only (BM25); semantic: meaning only.
-        #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
-        mode: Mode,
-        #[command(flatten)]
-        filter: FilterArgs,
-    },
-    /// Ranked link candidates for a note, each with reasons and the edit to apply.
-    Suggest {
-        /// The note: id, path, name, alias, or folder.
-        #[arg(required_unless_present = "changed")]
-        note: Option<String>,
-        /// Every note changed in the session that still needs a link pass.
-        #[arg(long, conflicts_with = "note")]
-        changed: bool,
-        #[arg(long)]
-        session: Option<String>,
-        /// Suggestions per note.
-        #[arg(long, default_value_t = 8)]
-        limit: usize,
-        /// Leave out weaker candidates (a mention scores about 3; a weak text match under 0.5;
-        /// one shared value or two shared links about 0.5-1).
-        #[arg(long, default_value_t = 0.75)]
-        min_score: f64,
-    },
-    /// A context pack sized to a token budget: the note (or the best search hits for a
-    /// question), then the notes linked to and from it. Whole notes while they fit, an excerpt
-    /// of a large seed, summaries for the rest; each entry says why it is included.
-    Context {
-        /// The note: id, path, name, or alias.
-        #[arg(required_unless_present = "query")]
-        note: Option<String>,
-        /// A question or topic: its top search hits are the seeds. With a note: the
-        /// note's excerpt focuses on the sections about it.
-        #[arg(long)]
-        query: Option<String>,
-        /// Token budget (estimated: ~4 characters per token).
-        #[arg(long, default_value_t = 4000, value_parser = clap::value_parser!(u64).range(200..))]
-        budget: u64,
-        /// Link hops from the seeds.
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
-        depth: u64,
-        /// Search hits used as seeds for --query.
-        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
-        seeds: u64,
-        #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
-        mode: Mode,
-        /// Filters for the --query seeds.
-        #[command(flatten)]
-        filter: FilterArgs,
-    },
-    /// Alias candidates: terms the vault uses for a note that do not name it yet, with the
-    /// evidence and the frontmatter edit.
-    Aliases {
-        /// Only aliases for this note (id, path, name, or alias).
-        note: Option<String>,
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Notes that must use a term (as link text, or capitalized in prose) before it counts.
-        #[arg(long, default_value_t = 2)]
-        min_notes: usize,
-    },
-    /// Build or update the semantic index (downloads the embedding model on first use).
-    Embed {
-        /// Re-embed every note, not only changed ones.
-        #[arg(long)]
-        rebuild: bool,
-    },
     /// Notes linked to or from a note, with the line each link is written on.
     Links {
         /// The note: id, path, name, or alias.
@@ -345,163 +154,25 @@ enum Command {
     },
     /// Link graph summary: isolated notes and components, hub notes excluded.
     Graph,
-    /// List notes changed in the session that still need a link pass.
-    Changed {
-        #[arg(long)]
-        session: Option<String>,
-        /// Every note in the vault that needs a link pass, from any session or editor.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Record a link pass: the notes' current content counts as linked, for every session.
-    Mark {
-        #[arg(long)]
-        session: Option<String>,
-        /// Mark every pending note in the vault, not only this session's.
-        #[arg(long)]
-        all: bool,
-        /// Notes to mark. Default: the session's changed notes.
-        paths: Vec<String>,
-    },
-    /// Start a session record (hooks do this); --reset restarts it from the vault as it is now.
-    Baseline {
-        #[arg(long)]
-        session: String,
-        #[arg(long)]
-        reset: bool,
-    },
-    /// Run as a Claude Code hook (JSON on stdin).
+    /// Removed in 0.7 (the Claude Code hooks). Kept as a no-op that exits 0, so a session
+    /// whose plugin still has the old hooks is not blocked by an unknown subcommand.
+    #[command(hide = true)]
     Hook {
-        #[arg(value_enum)]
-        event: hook::Event,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Command::Hook { event } = cli.command {
-        return run_hook(event);
+    if matches!(cli.command, Command::Hook { .. }) {
+        return ExitCode::SUCCESS;
     }
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("wikiknit: {e:#}");
             ExitCode::from(2)
-        }
-    }
-}
-
-/// Hook errors exit 1 (non-blocking in Claude Code); a hold exits 2. `pre-commit` holds a
-/// commit it cannot check (an error, bad input that mentions a commit, running out of time):
-/// exit 1 would let the commit through.
-fn run_hook(event: hook::Event) -> ExitCode {
-    let pre_commit = event == hook::Event::PreCommit;
-    let mut stdin = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut stdin) {
-        eprintln!("wikiknit hook: reading stdin: {e}");
-        return ExitCode::from(1);
-    }
-    let input: hook::Input = match serde_json::from_str(&stdin) {
-        Ok(i) => i,
-        Err(e) => {
-            if pre_commit && stdin.contains("commit") {
-                eprintln!(
-                    "Commit held by wikiknit: it could not read the hook input ({e}), so it \
-                     cannot check this commit."
-                );
-                return ExitCode::from(2);
-            }
-            eprintln!("wikiknit hook: bad input JSON: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let result = if pre_commit {
-        pre_commit_within_deadline(input)
-    } else {
-        hook::run(event, &input)
-    };
-    match result {
-        Ok(Outcome::Allow) => ExitCode::SUCCESS,
-        Ok(Outcome::Block(msg)) => {
-            eprintln!("{msg}");
-            ExitCode::from(2)
-        }
-        Err(e) => {
-            eprintln!("wikiknit hook: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-/// Default time the pre-commit check may take; below the plugin's 10 s hook timeout, after
-/// which Claude Code would go ahead with the commit.
-const HOOK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// Run the pre-commit check, holding a commit that cannot be checked in time
-/// (`$WIKIKNIT_HOOK_TIMEOUT_MS` overrides the deadline).
-fn pre_commit_within_deadline(input: hook::Input) -> Result<Outcome, wikiknit::Error> {
-    let deadline = std::env::var("WIKIKNIT_HOOK_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map_or(HOOK_DEADLINE, std::time::Duration::from_millis);
-    enum Msg {
-        /// From the command text alone: could it commit?
-        MayCommit(bool),
-        Done(Result<Outcome, wikiknit::Error>),
-        /// The check panicked.
-        Crashed,
-    }
-    let start = std::time::Instant::now();
-    let (tx, rx) = std::sync::mpsc::channel();
-    // Everything, the parse included, runs under the deadline, with room for deep input; a
-    // panic is reported, not lost.
-    let worker = std::thread::Builder::new()
-        .stack_size(256 << 20)
-        .spawn(move || {
-            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = tx.send(Msg::MayCommit(hook::may_commit(&input)));
-                hook::run(hook::Event::PreCommit, &input)
-            }));
-            let _ = tx.send(match run {
-                Ok(result) => Msg::Done(result),
-                Err(_) => Msg::Crashed,
-            });
-        });
-    let hold = |why: String| Ok(Outcome::Block(format!("Commit held by wikiknit: {why}")));
-    if worker.is_err() {
-        return hold("it could not start its check, so this commit was not checked.".into());
-    }
-    // `None`: not known yet (the parse itself has not finished), so a commit is assumed.
-    let mut may_commit: Option<bool> = None;
-    loop {
-        let left = deadline.saturating_sub(start.elapsed());
-        match rx.recv_timeout(left) {
-            Ok(Msg::MayCommit(m)) => may_commit = Some(m),
-            Ok(Msg::Done(result)) => return result,
-            Ok(Msg::Crashed) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if may_commit == Some(false) {
-                    return Err(wikiknit::Error::Usage("pre-commit check failed".into()));
-                }
-                return hold(
-                    "its check of this command failed, so the commit was not checked. Split \
-                     the command into simpler ones and retry."
-                        .into(),
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if may_commit == Some(false) {
-                    return Err(wikiknit::Error::Usage(format!(
-                        "pre-commit check timed out after {} ms",
-                        deadline.as_millis()
-                    )));
-                }
-                return hold(format!(
-                    "checking this command ran out of time ({} ms), so the commit was not \
-                     checked. Retry; if it keeps timing out, run `wikiknit changed` to see why, \
-                     or split the command into simpler ones.",
-                    deadline.as_millis()
-                ));
-            }
         }
     }
 }
@@ -540,35 +211,199 @@ fn load_config(cli: &Cli) -> Result<Config> {
     }
 }
 
-/// The session's id and its changed notes (pending and changed while it ran).
-fn session_changed(vault: &Vault, flag: Option<&str>) -> Result<(Store, String, BTreeSet<String>)> {
-    let store = Store::open(&vault.config.vault)?;
-    let guessed =
-        flag.is_none() && std::env::var_os(state::SESSION_ENV).is_none_or(|v| v.is_empty());
-    let session = store.resolve_session(flag)?;
-    if guessed {
-        eprintln!("wikiknit: session {session} (the only active one; pass --session to choose)");
+/// The vault as `change` has it and as the last commit has it, each with the `wikiknit.toml`
+/// of that version when the repository has one (its rules, its vault folder), and the notes
+/// renamed in between (old id -> new id). Copies live in `tmp`. `None`: the repository being
+/// committed (a hook's) is not the vault's, so the commit changes nothing in the vault.
+struct Versions {
+    after: Vault,
+    before: Vault,
+    renamed: BTreeMap<String, String>,
+}
+
+/// `a/./b/../c` -> `a/c`, as a path from the top with `/`; `None` if it climbs out.
+fn normalize(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for p in path.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            p => parts.push(p),
+        }
     }
-    let now = state::current_hashes(vault);
-    // A session the hooks never saw start (plugin added mid-session): start it the way the
-    // hooks do, with pending notes counted as its own.
-    let (s, created) = store.open_session(&session, &now, true)?;
-    let changed = store.changed(&s, &now)?;
-    if created {
-        // An empty list here must not read as "nothing changed": the session was unknown.
+    Some(parts.join("/"))
+}
+
+fn versions(disk: &Config, change: Change, tmp: &tempfile::TempDir) -> Result<Option<Versions>> {
+    let mut repo = Repo::of(&disk.vault, change == Change::Staged)?;
+    if !repo.in_commit {
         eprintln!(
-            "wikiknit: session {session} had no record (hooks not run, or a mistyped id?); \
-             started it now, counting the {} note(s) pending from any session as its changes",
-            changed.len()
+            "wikiknit: the repository being committed ({}) is not the vault's ({}); nothing to check",
+            repo.committing.as_deref().unwrap_or(&repo.top).display(),
+            repo.top.display()
         );
+        return Ok(None);
     }
-    Ok((store, session, changed))
+    let source = match change {
+        Change::WorkTree => Source::WorkTree,
+        Change::Staged => Source::Staged,
+    };
+    if source == Source::Staged {
+        repo.scratch_objects(&tmp.path().join("objects"))?;
+    }
+    // The config file as a path from the repository top, when it is inside it.
+    let config_rel: Option<String> = disk
+        .source
+        .as_ref()
+        .and_then(|s| s.canonicalize().ok())
+        .and_then(|s| {
+            s.strip_prefix(&repo.top)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+        });
+    let disk_prefix = repo.prefix.trim_end_matches('/').to_string();
+    // One version: its config (if the repository has it there), its vault, and the vault
+    // folder as a path from the top (with a trailing `/`, or empty for the top).
+    let copy = |source: Source, name: &str| -> Result<(Vault, String)> {
+        let root = tmp.path().join(name);
+        let text = match &config_rel {
+            Some(r) => repo.read(source, r)?,
+            None => None,
+        };
+        // That version's vault folder, as written in its config.
+        let written = text.as_ref().and_then(|t| {
+            let table: toml::Table = std::str::from_utf8(t).ok()?.parse().ok()?;
+            let vault = table.get("vault").and_then(|v| v.as_str()).unwrap_or(".");
+            let dir = config_rel
+                .as_deref()?
+                .rsplit_once('/')
+                .map_or("", |(d, _)| d);
+            normalize(&format!("{dir}/{vault}"))
+        });
+        let mut paths = vec![disk_prefix.clone()];
+        paths.extend(written.clone());
+        paths.extend(config_rel.clone());
+        let content: Vec<String> = config_rel.iter().cloned().collect();
+        repo.export(source, &root, &paths, &content)?;
+        let root = root.canonicalize()?;
+        let fallback = || -> Result<Config> {
+            let dir = root.join(&disk_prefix);
+            std::fs::create_dir_all(&dir)?;
+            let mut c = disk.clone();
+            c.vault = dir.canonicalize()?;
+            Ok(c)
+        };
+        let config = match (&config_rel, &written) {
+            (Some(r), Some(w)) => {
+                std::fs::create_dir_all(root.join(w))?;
+                match Config::load_with(&root.join(r), false) {
+                    Ok(c) if c.vault.starts_with(&root) => c,
+                    Ok(_) => fallback()?,
+                    // The commit would record a config that does not load.
+                    Err(e) if source == Source::Staged => {
+                        bail!("the staged {r} does not load: {e}")
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "wikiknit: the {name} version of {r} does not load ({e}); using the one on disk"
+                        );
+                        fallback()?
+                    }
+                }
+            }
+            _ => fallback()?,
+        };
+        let mut prefix = config
+            .vault
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        Ok((Vault::load(config)?, prefix))
+    };
+    let (after, after_prefix) = copy(source, "after")?;
+    let (before, before_prefix) = copy(Source::Head, "before")?;
+    let id = |path: &str, prefix: &str| {
+        path.strip_prefix(prefix)?
+            .strip_suffix(".md")
+            .map(str::to_string)
+    };
+    let renamed = repo
+        .renames(source)?
+        .into_iter()
+        .filter_map(|(old, new)| Some((id(&old, &before_prefix)?, id(&new, &after_prefix)?)))
+        .collect();
+    Ok(Some(Versions {
+        after,
+        before,
+        renamed,
+    }))
+}
+
+/// The records of `after` that `before` does not have, by key (each record of `before`
+/// cancels one record of `after` with the same key).
+fn introduced<T, K: Ord>(
+    after: Vec<T>,
+    before: &[T],
+    key_after: impl Fn(&T) -> K,
+    key_before: impl Fn(&T) -> K,
+) -> Vec<T> {
+    let mut old: BTreeMap<K, usize> = BTreeMap::new();
+    for b in before {
+        *old.entry(key_before(b)).or_default() += 1;
+    }
+    after
+        .into_iter()
+        .filter(|a| match old.get_mut(&key_after(a)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// A note id after the renames.
+fn renamed<'a>(v: &'a Versions, id: &'a str) -> &'a str {
+    v.renamed.get(id).map_or(id, String::as_str)
+}
+
+/// The findings `v.after` has and `v.before` does not.
+fn new_findings(v: &Versions) -> Vec<rules::Finding> {
+    let key = |f: &rules::Finding, note: &str| (note.to_string(), f.rule, f.key.clone());
+    introduced(
+        rules::check(&v.after, None),
+        &rules::check(&v.before, None),
+        |f| key(f, &f.note),
+        |f| {
+            (
+                renamed(v, &f.note).to_string(),
+                f.rule,
+                renamed(v, &f.key).to_string(),
+            )
+        },
+    )
+}
+
+/// The mentions `v.after` has and `v.before` does not.
+fn new_mentions(v: &Versions) -> Vec<mentions::Mention> {
+    let key = |m: &mentions::Mention, note: &str, target: &str| {
+        (note.to_string(), m.term.to_lowercase(), target.to_string())
+    };
+    introduced(
+        mentions::find(&v.after, None),
+        &mentions::find(&v.before, None),
+        |m| key(m, &m.note, &m.target),
+        |m| key(m, renamed(v, &m.note), renamed(v, &m.target)),
+    )
 }
 
 fn selection(vault: &Vault, sel: &Select) -> Result<Option<BTreeSet<String>>> {
-    if sel.changed {
-        return Ok(Some(session_changed(vault, sel.session.as_deref())?.2));
-    }
     if sel.paths.is_empty() {
         return Ok(None);
     }
@@ -638,71 +473,34 @@ fn emit_with<T: Serialize>(
     }
 }
 
-#[cfg(feature = "semantic")]
-fn embed(vault: &Vault, fmt: Format, rebuild: bool) -> Result<ExitCode> {
-    let name = &vault.config.embedding_model;
-    if !wikiknit::embedder::is_cached(name)? {
-        eprintln!("wikiknit: downloading embedding model {name} (first use)");
-    }
-    let mut sem =
-        wikiknit::semantic::Semantic::open(vault, true)?.context("embedding model did not load")?;
-    if rebuild {
-        sem.index.notes.clear();
-        sem.rebuild = true;
-    }
-    let started = std::time::Instant::now();
-    let update = sem.update(vault, None)?;
-    let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
-    let mut extra = serde_json::Map::new();
-    extra.insert("seconds".into(), seconds.into());
-    emit_with(
-        fmt,
-        "embed",
-        &[
-            "model",
-            "embedded",
-            "chunks",
-            "removed",
-            "stale",
-            "total_notes",
-            "total_chunks",
-            "seconds",
-        ],
-        &[update],
-        |u| {
-            vec![
-                u.model.clone(),
-                u.embedded.to_string(),
-                u.chunks.to_string(),
-                u.removed.to_string(),
-                u.stale.to_string(),
-                u.total_notes.to_string(),
-                u.total_chunks.to_string(),
-                seconds.to_string(),
-            ]
-        },
-        extra,
-    );
-    Ok(ExitCode::SUCCESS)
-}
-
-#[cfg(not(feature = "semantic"))]
-fn embed(_vault: &Vault, _fmt: Format, _rebuild: bool) -> Result<ExitCode> {
-    bail!("this wikiknit was built without the `semantic` feature")
-}
-
 fn opt(s: Option<&String>) -> String {
     s.cloned().unwrap_or_default()
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
     let config = load_config(&cli)?;
-    let vault = Vault::load(config)?;
+    // `--changed`/`--staged` read their own copies of the vault.
+    let since = match &cli.command {
+        Command::Check(s) | Command::Mentions(s) => s.since_head(),
+        _ => None,
+    };
+    let loaded = match since {
+        Some(_) => None,
+        None => Some(Vault::load(config.clone())?),
+    };
+    let vault = || loaded.as_ref().expect("loaded unless --changed/--staged");
     let fmt = cli.format;
     match &cli.command {
         Command::Check(sel) => {
-            let selected = selection(&vault, sel)?;
-            let findings = rules::check(&vault, selected.as_ref());
+            let findings = match sel.since_head() {
+                Some(change) => {
+                    let tmp = tempfile::tempdir()?;
+                    versions(&config, change, &tmp)?
+                        .map(|v| new_findings(&v))
+                        .unwrap_or_default()
+                }
+                None => rules::check(vault(), selection(vault(), sel)?.as_ref()),
+            };
             let errors = findings.iter().filter(|f| f.is_error()).count();
             emit(
                 fmt,
@@ -720,6 +518,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     ]
                 },
             );
+            if errors > 0 && sel.staged {
+                eprintln!(
+                    "wikiknit: this commit adds {errors} link error(s) to the vault (above). Fix \
+                     them and stage the fixes, then commit again."
+                );
+            }
             Ok(if errors > 0 {
                 ExitCode::from(1)
             } else {
@@ -727,8 +531,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
         Command::Mentions(sel) => {
-            let selected = selection(&vault, sel)?;
-            let found = mentions::find(&vault, selected.as_ref());
+            let found = match sel.since_head() {
+                Some(change) => {
+                    let tmp = tempfile::tempdir()?;
+                    versions(&config, change, &tmp)?
+                        .map(|v| new_mentions(&v))
+                        .unwrap_or_default()
+                }
+                None => mentions::find(vault(), selection(vault(), sel)?.as_ref()),
+            };
             emit(
                 fmt,
                 "mentions",
@@ -747,277 +558,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Search {
-            query,
-            limit,
-            include_hubs,
-            mode,
-            filter,
-        } => {
-            let filter = filter.build(&vault)?;
-            let query = query.join(" ");
-            let (ranked, used) = meaning(&vault, &query, *include_hubs, *mode)?;
-            let hits = search::search(
-                &vault,
-                &query,
-                &filter,
-                &search::Options {
-                    include_hubs: *include_hubs,
-                    limit: *limit,
-                    semantic: ranked.as_deref(),
-                    lexical: used != Mode::Semantic,
-                },
-            );
-            let mut extra = serde_json::Map::new();
-            extra.insert("mode".into(), format!("{used:?}").to_lowercase().into());
-            emit_with(
-                fmt,
-                "search",
-                &[
-                    "id",
-                    "score",
-                    "type",
-                    "similarity",
-                    "matched",
-                    "coverage",
-                    "line",
-                    "snippet",
-                ],
-                &hits,
-                |h| {
-                    vec![
-                        h.id.clone(),
-                        format!("{:.2}", h.score),
-                        opt(h.kind.as_ref()),
-                        h.similarity.map(|s| format!("{s:.3}")).unwrap_or_default(),
-                        h.matched.join(";"),
-                        format!("{:.2}", h.coverage),
-                        h.line.to_string(),
-                        h.snippet.clone(),
-                    ]
-                },
-                extra,
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Embed { rebuild } => embed(&vault, fmt, *rebuild),
-        Command::Context {
-            note,
-            query,
-            budget,
-            depth,
-            seeds,
-            mode,
-            filter,
-        } => {
-            let mut extra = serde_json::Map::new();
-            if query.as_deref().is_some_and(|q| q.trim().is_empty()) {
-                bail!("--query is empty");
-            }
-            let focus_for = |i: usize, q: Option<&str>, extra_line: Option<usize>| {
-                let mut f = q.map_or_else(Vec::new, |q| {
-                    search::matching_lines(&vault, &vault.notes[i], q)
-                });
-                if let Some(l) = extra_line.filter(|&l| l > 0)
-                    && !f.iter().any(|&(x, _)| x == l)
-                {
-                    f.push((l, 1.0));
-                }
-                f
-            };
-            let mut weak = false;
-            let seeds: Vec<wikiknit::context::Seed> = if let Some(start) = note {
-                if filter.is_set() {
-                    bail!(
-                        "filters choose --query seeds; with a note, use `wikiknit links` to filter its neighbors"
-                    );
-                }
-                let start = vault.find_note(start)?;
-                vec![wikiknit::context::Seed {
-                    note: start,
-                    score: 1.0,
-                    why: match query {
-                        Some(q) => format!("the note asked for, focused on \"{q}\""),
-                        None => "the note asked for".into(),
-                    },
-                    focus: focus_for(start, query.as_deref(), None),
-                    snippet: None,
-                }]
-            } else {
-                let q = query.as_deref().expect("required by clap");
-                let filter = filter.build(&vault)?;
-                let (ranked, used) = meaning(&vault, q, false, *mode)?;
-                extra.insert("mode".into(), format!("{used:?}").to_lowercase().into());
-                let hits = search::search(
-                    &vault,
-                    q,
-                    &filter,
-                    &search::Options {
-                        include_hubs: false,
-                        // A wider pool: weak hits are dropped below, stronger ones further
-                        // down take their place.
-                        limit: usize::try_from(*seeds)
-                            .unwrap_or(usize::MAX)
-                            .saturating_mul(3),
-                        semantic: ranked.as_deref(),
-                        lexical: used != Mode::Semantic,
-                    },
-                );
-                let by_meaning = |h: &search::Hit| h.matched.contains(&"semantic");
-                let strong = |h: &search::Hit| by_meaning(h) || h.coverage >= SEED_COVERAGE;
-                // Seeds are the hits that match by meaning or cover most of the question,
-                // close to the best of them. When none does, the best hit alone, and the
-                // pack says it is weak: the vault may not cover the question.
-                weak = !hits.is_empty() && !hits.iter().any(strong);
-                let top = hits
-                    .iter()
-                    .find(|h| strong(h))
-                    .or(hits.first())
-                    .map_or(1.0, |h| h.score.max(1e-9));
-                let max_seeds = usize::try_from(*seeds).unwrap_or(usize::MAX);
-                hits.iter()
-                    .enumerate()
-                    .filter(|(k, h)| {
-                        if weak {
-                            *k == 0
-                        } else {
-                            strong(h) && h.score / top >= SEED_SCORE
-                        }
-                    })
-                    .take(max_seeds)
-                    .filter_map(|(_, h)| {
-                        let note = vault.index_of(&h.id)?;
-                        let sim = h
-                            .similarity
-                            .map(|s| format!("; similarity {s:.2}"))
-                            .unwrap_or_default();
-                        let at = if h.line == 0 {
-                            String::new()
-                        } else {
-                            format!(" at line {}", h.line)
-                        };
-                        Some(wikiknit::context::Seed {
-                            note,
-                            score: h.score / top,
-                            why: format!(
-                                "search hit: matched {}{at}; covers {:.0}% of the query{sim}",
-                                h.matched.join(", "),
-                                h.coverage * 100.0
-                            ),
-                            focus: focus_for(note, Some(q), Some(h.line)),
-                            snippet: (!h.snippet.is_empty()).then(|| h.snippet.clone()),
-                        })
-                    })
-                    .collect()
-            };
-            if seeds.is_empty() {
-                eprintln!("wikiknit: no note matches the query");
-            }
-            if weak {
-                eprintln!(
-                    "wikiknit: the best match covers little of the query; the vault may not cover it"
-                );
-            }
-            let size = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
-            let pack = wikiknit::context::build(&vault, &seeds, size(*depth), size(*budget), weak);
-            match fmt {
-                Format::Json => {
-                    extra.insert("budget".into(), pack.budget.into());
-                    extra.insert("used".into(), pack.used.into());
-                    extra.insert("weak".into(), pack.weak.into());
-                    extra.insert("omitted".into(), pack.omitted.clone().into());
-                    extra.insert("omitted_more".into(), pack.omitted_more.into());
-                    emit_with(fmt, "context", &[], &pack.entries, |_| Vec::new(), extra);
-                }
-                Format::Text => out!("{}", wikiknit::context::render(&pack).trim_end()),
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Aliases {
-            note,
-            limit,
-            min_notes,
-        } => {
-            let only = note.as_deref().map(|n| vault.find_note(n)).transpose()?;
-            if let Some(i) = only
-                && vault.config.is_hub(&vault.notes[i].id)
-            {
-                eprintln!(
-                    "wikiknit: {} is a hub; hubs get no aliases",
-                    vault.notes[i].id
-                );
-            }
-            let found = wikiknit::aliases::suggest(&vault, only, *limit, (*min_notes).max(1));
-            let joined =
-                |a: &wikiknit::aliases::AliasSuggestion,
-                 f: &dyn Fn(&wikiknit::aliases::Term) -> String,
-                 sep: &str| { a.terms.iter().map(f).collect::<Vec<_>>().join(sep) };
-            emit(
-                fmt,
-                "aliases",
-                &[
-                    "target", "score", "terms", "notes", "reasons", "line", "edit",
-                ],
-                &found,
-                |a| {
-                    vec![
-                        a.target.clone(),
-                        format!("{:.2}", a.score),
-                        joined(a, &|x| x.term.clone(), ";"),
-                        joined(a, &|x| x.notes.to_string(), ";"),
-                        joined(
-                            a,
-                            &|x| format!("{}: {}", x.term, x.reasons.join(", ")),
-                            " | ",
-                        ),
-                        a.line.to_string(),
-                        a.edit.clone(),
-                    ]
-                },
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Suggest {
-            note,
-            changed,
-            session,
-            limit,
-            min_score,
-        } => {
-            let starts: Vec<usize> = if *changed {
-                session_changed(&vault, session.as_deref())?
-                    .2
-                    .iter()
-                    .filter_map(|id| vault.index_of(id))
-                    .collect()
-            } else {
-                vec![vault.find_note(note.as_deref().expect("required by clap"))?]
-            };
-            let index = semantic_index(&vault)?;
-            // Vault-wide structures once, then every note (in parallel, order kept).
-            let all = wikiknit::suggest::Suggester::new(&vault, index.as_ref())
-                .suggest_many(&starts, *limit, *min_score);
-            emit(
-                fmt,
-                "suggest",
-                &[
-                    "note", "action", "target", "score", "reasons", "line", "edit",
-                ],
-                &all,
-                |s| {
-                    vec![
-                        s.note.clone(),
-                        s.action.to_string(),
-                        s.target.clone(),
-                        format!("{:.2}", s.score),
-                        s.reasons.join("; "),
-                        s.line.to_string(),
-                        s.edit.clone(),
-                    ]
-                },
-            );
-            Ok(ExitCode::SUCCESS)
-        }
         Command::Links {
             note,
             depth,
@@ -1025,14 +565,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             inbound,
             filter,
         } => {
+            let vault = vault();
             let start = vault.find_note(note)?;
-            let filter = filter.build(&vault)?;
+            let filter = filter.build(vault)?;
             let dir = match (outbound, inbound) {
                 (true, _) => Direction::Out,
                 (_, true) => Direction::In,
                 _ => Direction::Both,
             };
-            let edges = links::neighbors(&vault, start, *depth, dir, &filter);
+            let edges = links::neighbors(vault, start, *depth, dir, &filter);
             let mut extra = serde_json::Map::new();
             extra.insert("note".into(), vault.notes[start].id.clone().into());
             emit_with(
@@ -1076,11 +617,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Catalog { filter } => {
-            let filter = filter.build(&vault)?;
-            let entries: Vec<catalog::Entry> = catalog::build(&vault)
+            let vault = vault();
+            let filter = filter.build(vault)?;
+            let entries: Vec<catalog::Entry> = catalog::build(vault)
                 .into_iter()
                 .filter(|e| {
-                    filter.is_empty() || vault.get(&e.id).is_some_and(|n| filter.matches(&vault, n))
+                    filter.is_empty() || vault.get(&e.id).is_some_and(|n| filter.matches(vault, n))
                 })
                 .collect();
             emit(
@@ -1102,8 +644,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Command::Hook { .. } => unreachable!("handled in main"),
         Command::Graph => {
-            let r = graph::report(&vault);
+            let vault = vault();
+            let r = graph::report(vault);
             let mut rows: Vec<serde_json::Value> = r
                 .isolated
                 .iter()
@@ -1150,64 +694,5 @@ fn run(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Changed { session, all } => {
-            let changed: Vec<String> = if *all {
-                Store::open(&vault.config.vault)?
-                    .pending(&state::current_hashes(&vault))?
-                    .into_iter()
-                    .collect()
-            } else {
-                session_changed(&vault, session.as_deref())?
-                    .2
-                    .into_iter()
-                    .collect()
-            };
-            emit(fmt, "changed", &["id"], &changed, |id| vec![id.clone()]);
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Mark {
-            session,
-            all,
-            paths,
-        } => {
-            let now = state::current_hashes(&vault);
-            let (store, ids) = if *all {
-                let store = Store::open(&vault.config.vault)?;
-                let pending = store.pending(&now)?;
-                (store, pending)
-            } else if !paths.is_empty() {
-                (Store::open(&vault.config.vault)?, ids_for(&vault, paths)?)
-            } else {
-                // A mistyped id must not start a new session that takes every pending note.
-                let store = Store::open(&vault.config.vault)?;
-                let id = store.resolve_session(session.as_deref())?;
-                if store.load_session(&id)?.is_none() {
-                    let known = store.sessions();
-                    bail!(
-                        "no session `{id}` for this vault (known: {}); pass a known --session, \
-                         or --all to mark every pending note",
-                        if known.is_empty() {
-                            "none".to_string()
-                        } else {
-                            known.join(", ")
-                        }
-                    );
-                }
-                let (store, _, changed) = session_changed(&vault, Some(&id))?;
-                (store, changed)
-            };
-            let marked: Vec<String> = store.mark(&ids, &now)?.into_iter().collect();
-            emit(fmt, "mark", &["marked"], &marked, |id| vec![id.clone()]);
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Baseline { session, reset } => {
-            let store = Store::open(&vault.config.vault)?;
-            if *reset {
-                let _ = std::fs::remove_file(store.session_path(session));
-            }
-            store.start_session(session, &state::current_hashes(&vault), false)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Hook { .. } => unreachable!("handled in main"),
     }
 }

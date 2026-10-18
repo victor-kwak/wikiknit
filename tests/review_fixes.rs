@@ -1,5 +1,5 @@
-//! End-to-end regressions for the v0.5 review findings (suggest, aliases, mentions, rules,
-//! parse, config, vault). Each test builds a small vault in a temp dir and runs the real binary.
+//! End-to-end regressions for the v0.5 review findings (mentions, rules, parse, config,
+//! vault). Each test builds a small vault in a temp dir and runs the real binary.
 
 use std::fs;
 use std::path::Path;
@@ -23,13 +23,7 @@ fn vault(config: &str, files: &[(&str, &str)]) -> TempDir {
 
 fn wk(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("wikiknit").unwrap();
-    cmd.current_dir(dir)
-        .env("XDG_STATE_HOME", dir.join(".state"))
-        // Hermetic: no embedding model from the real cache.
-        .env("XDG_CACHE_HOME", dir.join(".cache"))
-        .env_remove("WIKIKNIT_SESSION")
-        .env_remove("CLAUDE_PROJECT_DIR")
-        .env_remove("CLAUDE_ENV_FILE");
+    cmd.current_dir(dir);
     cmd
 }
 
@@ -58,13 +52,7 @@ fn many_tags_and_links_in_one_note_stay_fast() {
         big.push_str(&format!("#t{i} [[other]] see Other `c`\n"));
     }
     let v = vault("", &[("big.md", &big), ("other.md", "# Other\n")]);
-    for cmd in [
-        &["catalog"][..],
-        &["mentions"],
-        &["check"],
-        &["aliases"],
-        &["suggest", "big"],
-    ] {
+    for cmd in [&["catalog"][..], &["mentions"], &["check"], &["graph"]] {
         let out = wk(v.path())
             .args(cmd)
             .timeout(Duration::from_secs(60))
@@ -184,7 +172,7 @@ fn hubs_are_normalized_like_other_note_references() {
 }
 
 #[test]
-fn check_mentions_and_mark_accept_names_and_aliases() {
+fn check_and_mentions_accept_names_and_aliases() {
     let v = vault(
         "",
         &[
@@ -209,69 +197,26 @@ fn check_mentions_and_mark_accept_names_and_aliases() {
     let out = wk(v.path()).args(["check", "nosuch"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no note matches"));
-    // First use snapshots the vault; then a change to `other` is pending until marked.
-    items(v.path(), &["changed", "--all"]);
-    fs::write(v.path().join("other.md"), "# Other\n[[gate]]\n").unwrap();
-    let marked = items(v.path(), &["mark", "Other"]);
-    assert_eq!(marked, [Value::from("other")], "{marked:?}");
 }
 
 #[test]
 fn fix_hints_quote_ids_with_spaces() {
-    let v = vault(
-        "",
-        &[
-            ("my note.md", "# my note\n"),
-            ("b.md", "# b\n[[my note]]\n"),
-        ],
-    );
+    // Past 1000 distinct broken targets, the rest get a command to rerun instead of a hint.
+    let mut body = String::from("# my note\n[[b]]\n");
+    for i in 0..1001 {
+        body.push_str(&format!("[[gone{i:04}]]\n"));
+    }
+    let v = vault("", &[("my note.md", &body), ("b.md", "# b\n[[my note]]\n")]);
     let f = items(v.path(), &["check"]);
     let hint = f
         .iter()
-        .find(|x| x["note"] == "my note" && x["rule"] == "no-outbound-links")
-        .unwrap();
+        .find(|x| {
+            x["rule"] == "unresolved-link" && x["fix"].as_str().unwrap().starts_with("too many")
+        })
+        .unwrap_or_else(|| panic!("no rerun hint: {} findings", f.len()));
     assert_eq!(
-        hint["fix"], "`wikiknit suggest 'my note'` lists link candidates",
+        hint["fix"], "too many broken links for hints; `wikiknit check 'my note'` gives them",
         "{hint}"
-    );
-}
-
-#[test]
-fn alias_edits_use_the_parsed_yaml_value() {
-    let v = vault(
-        "",
-        &[
-            ("m.md", "---\naliases: [one,\n  two]\ntype: x\n---\n# m\n"),
-            ("t.md", "---\naliases: ~\n---\n# t\n"),
-            ("n.md", "---\naliases: null # none yet\n---\n# n\n"),
-            (
-                "a.md",
-                "# a\n[[m|Emm Note]] [[t|Tee Note]] [[n|Enn Note]]\n",
-            ),
-            (
-                "b.md",
-                "# b\n[[m|Emm Note]] [[t|Tee Note]] [[n|Enn Note]]\n",
-            ),
-        ],
-    );
-    let found = items(v.path(), &["aliases"]);
-    let edit = |t: &str| {
-        found
-            .iter()
-            .find(|x| x["target"] == t)
-            .unwrap_or_else(|| panic!("{t}: {found:?}"))["edit"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    assert_eq!(
-        edit("m"),
-        "lines 2-3: replace with: aliases: [\"one\", \"two\", \"Emm Note\"]"
-    );
-    assert_eq!(edit("t"), "line 2: replace with: aliases: [\"Tee Note\"]");
-    assert_eq!(
-        edit("n"),
-        "line 2: replace with: aliases: [\"Enn Note\"] # none yet"
     );
 }
 
@@ -308,13 +253,6 @@ fn domain_aliases_are_found_in_inline_code() {
     // Only the code span that holds just the domain; not a command, a code block, or a
     // longer domain.
     assert_eq!(pairs, [("Reference/cogno".to_string(), 2, 1)], "{m:?}");
-    // The suggested edit replaces the whole code span, backticks included.
-    let s = items(v.path(), &["suggest", "b"]);
-    let cogno = s.iter().find(|x| x["target"] == "Reference/cogno").unwrap();
-    assert_eq!(
-        cogno["edit"], "line 2: replace \"`cognopraxis.com`\" with [[cogno|cognopraxis.com]]",
-        "{cogno}"
-    );
 }
 
 #[test]
@@ -337,219 +275,4 @@ fn links_in_math_are_not_links() {
     // Dollar amounts are not math: links between them still count.
     let l = items(v.path(), &["links", "b", "--out"]);
     assert_eq!(l.len(), 1, "{l:?}");
-}
-
-/// `s` plus three notes linking it (each a `link` suggestion edited in `s`).
-fn linked_from_three(config: &str, s: &str) -> TempDir {
-    vault(
-        config,
-        &[
-            ("s.md", s),
-            ("a.md", "# a\n[[s]]\n"),
-            ("b.md", "# b\n[[s]]\n"),
-            ("c.md", "# c\n[[s]]\n"),
-        ],
-    )
-}
-
-fn edits_in(s: &[Value], note: &str) -> Vec<(u64, String)> {
-    s.iter()
-        .filter(|x| x["note"] == note && x["action"] != "mention")
-        .map(|x| {
-            (
-                x["line"].as_u64().unwrap(),
-                x["edit"].as_str().unwrap().to_string(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn several_links_into_one_note_create_the_section_once() {
-    let v = linked_from_three("", "# s\nText.\n");
-    let s = items(v.path(), &["suggest", "s"]);
-    assert_eq!(
-        edits_in(&s, "s"),
-        [
-            (
-                2,
-                "append after line 2: ## Related\\n\\n- [[a]]".to_string()
-            ),
-            (5, "insert after line 5: - [[b]]".to_string()),
-            (6, "insert after line 6: - [[c]]".to_string()),
-        ],
-        "{s:?}"
-    );
-    // An existing section: each edit after the previous one.
-    let v = linked_from_three("", "# s\n\n## Related\n\n- [[x]]\n");
-    let s = items(v.path(), &["suggest", "s"]);
-    let e = edits_in(&s, "s");
-    assert_eq!(
-        e[0],
-        (5, "insert after line 5: - [[a]]".to_string()),
-        "{e:?}"
-    );
-    assert_eq!(e[2], (7, "insert after line 7: - [[c]]".to_string()));
-}
-
-#[test]
-fn several_links_into_one_frontmatter_key_add_it_once() {
-    let cfg = "link_section = \"frontmatter:related\"\n";
-    let v = linked_from_three(cfg, "---\ntype: x\n---\n# s\n");
-    let s = items(v.path(), &["suggest", "s"]);
-    let e = edits_in(&s, "s");
-    assert_eq!(
-        e,
-        [
-            (2, "insert after line 2: related: [\"[[a]]\"]".to_string()),
-            (
-                3,
-                "line 3: replace with: related: [\"[[a]]\", \"[[b]]\"]".to_string()
-            ),
-            (
-                3,
-                "line 3: replace with: related: [\"[[a]]\", \"[[b]]\", \"[[c]]\"]".to_string()
-            ),
-        ],
-        "{e:?}"
-    );
-    // No frontmatter: one `---` block, then additions to it.
-    let v = linked_from_three(cfg, "# s\n");
-    let s = items(v.path(), &["suggest", "s"]);
-    let e = edits_in(&s, "s");
-    assert_eq!(
-        e.iter().filter(|(_, x)| x.contains("---")).count(),
-        1,
-        "{e:?}"
-    );
-    assert_eq!(e[0].0, 1);
-    assert!(e[1..].iter().all(|(l, _)| *l == 2), "{e:?}");
-}
-
-#[test]
-fn heading_section_prefers_an_existing_related_frontmatter_list() {
-    let v = linked_from_three("", "---\nrelated: [\"[[x]]\"]\n---\n# s\n");
-    let s = items(v.path(), &["suggest", "s"]);
-    let e = edits_in(&s, "s");
-    assert_eq!(e.len(), 3, "{s:?}");
-    assert_eq!(
-        e[2],
-        (
-            2,
-            "line 2: replace with: related: [\"[[x]]\", \"[[a]]\", \"[[b]]\", \"[[c]]\"]"
-                .to_string()
-        ),
-        "{e:?}"
-    );
-}
-
-#[test]
-fn mention_edit_gives_a_column_when_the_term_occurs_earlier_on_the_line() {
-    let v = vault(
-        "",
-        &[
-            ("s.md", "# s\nRun `ACME Corp` then call ACME Corp today.\n"),
-            ("acme.md", "---\naliases: [ACME Corp]\n---\n# acme\n[[s]]\n"),
-        ],
-    );
-    let s = items(v.path(), &["suggest", "s"]);
-    let m = s.iter().find(|x| x["action"] == "mention").unwrap();
-    assert_eq!(
-        m["edit"], "line 2, column 27: replace \"ACME Corp\" with [[acme|ACME Corp]]",
-        "{m}"
-    );
-}
-
-#[test]
-fn one_weak_signal_is_not_a_suggestion_and_every_one_has_a_reason() {
-    // 70 notes (the dogfood vault's size); `stack: bun` in 6 of them. The start note's title
-    // matches 10 notes well and the other bun notes weakly (search ranks past 5, which gave no
-    // reason). A moderately common value plus that faint text match is not a link.
-    let fruits = ["apple", "kiwi", "mango", "pear", "plum"];
-    let mut files: Vec<(String, String)> = vec![(
-        "bun0.md".into(),
-        "---\nstack: [bun]\n---\n# Deploy pipeline\n[[f0]]\n".into(),
-    )];
-    for (i, fruit) in fruits.iter().enumerate() {
-        files.push((
-            format!("bun{}.md", i + 1),
-            format!("---\nstack: [bun]\n---\n# Deploy {fruit}\n[[f{i}]]\n"),
-        ));
-    }
-    for i in 0..10 {
-        files.push((
-            format!("step{i}.md"),
-            format!("---\nstack: [go]\n---\n# Deploy pipeline step{i}\n[[f{i}]]\n"),
-        ));
-    }
-    for i in 0..54 {
-        files.push((
-            format!("f{i}.md"),
-            format!("# filler{i}\n[[f{}]]\n", (i + 1) % 54),
-        ));
-    }
-    let refs: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(a, b)| (a.as_str(), b.as_str()))
-        .collect();
-    let v = vault("", &refs);
-    let s = items(v.path(), &["suggest", "bun0"]);
-    assert!(
-        s.iter()
-            .filter(|x| x["note"] == "bun0")
-            .all(|x| !x["target"].as_str().unwrap().starts_with("bun")),
-        "a shared value and a faint text match are not enough: {s:?}"
-    );
-    let all = items(
-        v.path(),
-        &["suggest", "bun0", "--min-score", "0", "--limit", "100"],
-    );
-    assert!(
-        !all.is_empty()
-            && all
-                .iter()
-                .all(|x| !x["reasons"].as_array().unwrap().is_empty()),
-        "{all:?}"
-    );
-}
-
-#[test]
-fn an_unknown_session_warns_instead_of_reading_as_nothing_changed() {
-    let v = vault("", &[("a.md", "# a\n[[b]]\n"), ("b.md", "# b\n[[a]]\n")]);
-    for args in [
-        &["changed"][..],
-        &["check", "--changed"],
-        &["suggest", "--changed"],
-    ] {
-        let out = wk(v.path())
-            .env("WIKIKNIT_SESSION", format!("typo-{}", args[0]))
-            .args(args)
-            .output()
-            .unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(out.stdout.is_empty(), "{out:?}");
-        assert!(
-            err.contains("had no record") && err.contains("0 note(s) pending"),
-            "{args:?}: {err}"
-        );
-    }
-    // Once a session has a record, no warning; pending notes are still listed.
-    fs::write(v.path().join("a.md"), "# a\n[[b]] edited\n").unwrap();
-    let out = wk(v.path())
-        .env("WIKIKNIT_SESSION", "typo-changed")
-        .arg("changed")
-        .output()
-        .unwrap();
-    assert!(out.stderr.is_empty(), "{out:?}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "# id\na\n");
-    let out = wk(v.path())
-        .env("WIKIKNIT_SESSION", "fresh")
-        .arg("changed")
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("1 note(s) pending"),
-        "{out:?}"
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "# id\na\n");
 }

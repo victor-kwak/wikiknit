@@ -1,6 +1,6 @@
 {
   "name": "wikiknit",
-  "description": "wikiknit: wikilink upkeep for Markdown vaults in Claude Code.",
+  "description": "wikiknit: link linting for Markdown vaults in Claude Code.",
   "owner": {
     "name": "Victor Kwak"
   },
@@ -8,7 +8,7 @@
     {
       "name": "wikiknit",
       "source": "./plugin",
-      "description": "Wikilink upkeep for Markdown vaults: commit/stop hooks plus a link skill."
+      "description": "Link linting for Markdown vaults: a link skill for the notes an agent writes."
     }
   ]
 }

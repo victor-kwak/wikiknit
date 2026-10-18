@@ -1,8 +1,8 @@
 {
   "name": "wikiknit",
   "displayName": "wikiknit",
-  "version": "0.6.1",
-  "description": "Context and links for AI agents on a Markdown vault: the context skill builds ranked, token-budgeted context packs; hooks hold vault commits until changed notes get a link pass, and the link skill adds related links in both directions. Needs the wikiknit CLI on PATH.",
+  "version": "0.7.0",
+  "description": "Linting for a Markdown vault an AI agent keeps as memory: the link skill tells the agent how to link the notes it writes and to run `wikiknit check --changed` before committing. No hooks; pair it with a git pre-commit hook running `wikiknit check --staged`. Needs the wikiknit CLI on PATH.",
   "author": {
     "name": "Victor Kwak"
   },

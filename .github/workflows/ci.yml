@@ -15,16 +15,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-  lean:
-    # Without the `semantic` feature: no ONNX Runtime, BM25 only.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - run: cargo test --no-default-features
   audit:
     runs-on: ubuntu-latest
     # audit-check reports findings (also warnings, like unmaintained crates) as a check run.

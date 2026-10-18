@@ -60,6 +60,30 @@ impl Frontmatter {
         self.value.as_ref()?.get(key)?.as_str()
     }
 
+    /// The text of top-level scalar `key` as written in `yaml` (this frontmatter's source),
+    /// unquoted and without a trailing comment: for values YAML would read as numbers, such
+    /// as commit ids (`1234567`, `0e12345`).
+    #[must_use]
+    pub fn raw_scalar(yaml: &str, key: &str) -> Option<String> {
+        for line in yaml.lines() {
+            let Some(rest) = line.strip_prefix(key) else {
+                continue;
+            };
+            let Some(value) = rest.strip_prefix(':') else {
+                continue;
+            };
+            let value = value.trim();
+            for q in ['"', '\''] {
+                if let Some(inner) = value.strip_prefix(q).and_then(|v| v.split(q).next()) {
+                    return Some(inner.to_string());
+                }
+            }
+            let value = value.split(" #").next().unwrap_or_default().trim();
+            return (!value.is_empty()).then(|| value.to_string());
+        }
+        None
+    }
+
     /// `tags` (or `tag`): a list, or a string of space- or comma-separated tags. Normalized
     /// (no `#`, lowercase).
     #[must_use]
@@ -168,7 +192,11 @@ pub fn parse(text: &str) -> Parsed {
         if src.trim().is_empty() {
             out.frontmatter.value = Some(Value::Object(serde_json::Map::new()));
         } else {
-            match serde_saphyr::from_str::<Value>(src) {
+            // A value YAML would read as an infinite float (a commit id like `89e8573`) stays
+            // the text it is, instead of failing the whole frontmatter.
+            let mut options = serde_saphyr::Options::default();
+            options.non_finite_float_policy = serde_saphyr::NonFiniteFloatPolicy::AsString;
+            match serde_saphyr::from_str_with_options::<Value>(src, options) {
                 Ok(v) => {
                     collect_frontmatter_links(&v, text, &range, &mut out);
                     out.frontmatter.value = Some(v);
