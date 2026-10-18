@@ -834,6 +834,8 @@ fn drift(vault: &Vault, note: &Note, sink: &mut Sink<'_>) {
     }
     let line = frontmatter_line(note, &rule.commit_field);
     let field = &rule.commit_field;
+    // The repository as one shell word for the commands in fixes: it comes from a note.
+    let quoted = shell_word(&dir.to_string_lossy());
     match crate::git::drift(&dir, commit) {
         crate::git::Drift::NoRepo => sink.key("no repo").push_fix(
             "drift",
@@ -848,7 +850,7 @@ fn drift(vault: &Vault, note: &Note, sink: &mut Sink<'_>) {
             line,
             format!("`{field}` {commit} is not a commit in {repo}"),
             format!(
-                "check the note against {repo}, then set `{field}` to its current commit (`git -C {repo} rev-parse --short HEAD`)"
+                "check the note against {repo}, then set `{field}` to its current commit (`git -C {quoted} rev-parse --short HEAD`)"
             ),
         ),
         crate::git::Drift::Since { commits: 0, .. } => {}
@@ -862,7 +864,7 @@ fn drift(vault: &Vault, note: &Note, sink: &mut Sink<'_>) {
             line,
             format!("{commits} commit(s) in {repo} since `{field}` {commit} (HEAD {head}, {date})"),
             format!(
-                "`git -C {repo} log --oneline {commit}..HEAD`; update what changed, then set `{field}: {head}`"
+                "`git -C {quoted} log --oneline {commit}..HEAD`; update what changed, then set `{field}: {head}`"
             ),
         ),
     }

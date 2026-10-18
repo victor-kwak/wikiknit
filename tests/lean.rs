@@ -1455,3 +1455,41 @@ fn a_stray_git_dir_does_not_change_a_manual_check() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A repository path from a note goes into the fix's command as one quoted shell word.
+#[test]
+fn drift_fix_quotes_the_repository_path() {
+    let outer = TempDir::new().unwrap();
+    let p = outer.path().join("p $(touch pwned); x");
+    fs::create_dir_all(&p).unwrap();
+    git(&p, &["init", "-q", "-b", "main"]);
+    for n in ["one", "two"] {
+        write(&p, "f.txt", n);
+        git(&p, &["add", "f.txt"]);
+        git(&p, &["commit", "-qm", n]);
+    }
+    let first = String::from_utf8_lossy(&git(&p, &["rev-list", "--max-parents=0", "HEAD"]).stdout)
+        .trim()[..7]
+        .to_string();
+    let r = repo("v", "[[drift]]\n");
+    let d = r.path();
+    write(
+        d,
+        "v/a.md",
+        &format!(
+            "---\npath: \"{}\"\nverified_commit: {first}\n---\n# a\n[[b]]\n",
+            p.display()
+        ),
+    );
+    write(d, "v/b.md", "# b\n[[a]]\n");
+    let found = items(d, &["check"]);
+    let fix = found
+        .iter()
+        .find(|f| f["rule"] == "drift")
+        .map(|f| f["fix"].as_str().unwrap().to_string())
+        .expect("a drift finding");
+    assert!(
+        fix.contains(&format!("git -C '{}' log", p.display())),
+        "{fix}"
+    );
+}
