@@ -220,7 +220,12 @@ impl Store {
                 .filter(|id| !committed.contains_key(*id))
                 .cloned()
                 .collect();
-            let ignored = ignored_notes(&self.vault, &new);
+            // Ignored and not in the index: `git add -f` puts an ignored note in a commit.
+            let tracked = tracked_ids(&self.vault);
+            let ignored: BTreeSet<String> = ignored_notes(&self.vault, &new)
+                .into_iter()
+                .filter(|id| tracked.as_ref().is_some_and(|t| !t.contains(id)))
+                .collect();
             let hashes: Hashes = now
                 .iter()
                 .map(|(id, h)| {
@@ -494,10 +499,32 @@ pub fn git_ignores_dir(dir: &Path) -> bool {
     };
     let top = PathBuf::from(String::from_utf8_lossy(&top).trim_end());
     // Exit 0: ignored. `--no-index`: by the ignore rules alone.
-    safe_git(&top)
+    let ignored = safe_git(&top)
         .args(["check-ignore", "-q", "--no-index", "--", prefix])
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|s| s.success());
+    // Files added with `git add -f` are tracked, and committed, despite the ignore rules.
+    ignored && tracked_ids(dir).is_some_and(|t| t.is_empty())
+}
+
+/// Note ids (vault-relative, no `.md`) of the vault files in git's index: tracked or staged.
+/// `None` when git cannot tell.
+fn tracked_ids(vault: &Path) -> Option<BTreeSet<String>> {
+    let out = safe_git(vault)
+        .args(["ls-files", "--cached", "-z", "--", "."])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        out.stdout
+            .split(|b| *b == 0)
+            .filter_map(|p| std::str::from_utf8(p).ok())
+            .filter_map(|p| p.strip_suffix(".md"))
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// The ids among `ids` whose note file git ignores.

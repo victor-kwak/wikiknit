@@ -690,6 +690,34 @@ fn an_ignored_vault_is_outside_git() {
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
 }
 
+/// Security review: an ignored vault folder whose notes were added with `git add -f` is
+/// tracked, so its changed notes are gated; so is a force-added note in a tracked vault.
+#[test]
+fn force_added_notes_in_an_ignored_vault_are_gated() {
+    let s = Setup::new("vault = \"notes\"\n");
+    let repo = s.repo();
+    fs::create_dir_all(repo.join("notes")).unwrap();
+    fs::write(repo.join("notes/n.md"), "# n\n[[m]]\n").unwrap();
+    fs::write(repo.join("notes/m.md"), "# m\n[[n]]\n").unwrap();
+    fs::write(repo.join(".gitignore"), "notes/\n").unwrap();
+    git(
+        &repo,
+        &["add", "-f", "notes/n.md", "notes/m.md", ".gitignore"],
+    );
+    git(&repo, &["commit", "-q", "-m", "notes"]);
+    fs::write(repo.join("notes/n.md"), "# n\nedited [[m]]\n").unwrap();
+    let out = s.pre_commit("git commit -am x");
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    // A new ignored note that is staged with -f is pending too.
+    let s = Setup::standard();
+    let repo = s.repo();
+    fs::write(repo.join(".gitignore"), "vault/secret.md\n").unwrap();
+    fs::write(repo.join("vault/secret.md"), "# secret\n[[a]]\n").unwrap();
+    git(&repo, &["add", "-f", "vault/secret.md"]);
+    let out = s.pre_commit("git commit -m x");
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+}
+
 /// Final review 5b: after a lost-state rebuild, a note put back to its committed content is
 /// not pending any more.
 #[test]
@@ -728,8 +756,8 @@ fn a_worktree_hold_names_its_vault() {
     assert_eq!(code(&out), Some(0), "{}", stderr(&out));
 }
 
-/// Final review 11: `cd "$HOME/..."` and `cd $VAR` with a literal value are followed; a
-/// target that stays unknown says so.
+/// Final review 11: `cd "$HOME/..."` is followed; a variable target is unknown (its value
+/// cannot be known for certain), and the hold says so.
 #[test]
 fn cd_targets_with_home_and_variables() {
     let s = Setup::standard();
@@ -743,19 +771,22 @@ fn cd_targets_with_home_and_variables() {
         "cd \"$HOME/other\" && git commit -m x",
         "cd ${HOME}/other && git commit -m x",
         "cd ~/other && git commit -m x",
-        "R=../other; cd $R && git commit -m x",
-        "export R=../other; cd \"$R\" && git commit -m x",
     ] {
         let out = s.pre_commit_in(&repo, Some(&repo), command, &env);
         assert_eq!(code(&out), Some(0), "held: {command}: {}", stderr(&out));
     }
-    let out = s.pre_commit_in(&repo, Some(&repo), "cd $UNSET && git commit -am x", &env);
-    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("cannot tell which repository"),
-        "{}",
-        stderr(&out)
-    );
+    for command in [
+        "cd $UNSET && git commit -am x",
+        "R=../other; cd $R && git commit -m x",
+    ] {
+        let out = s.pre_commit_in(&repo, Some(&repo), command, &env);
+        assert_eq!(code(&out), Some(2), "{command}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("cannot tell which repository"),
+            "{}",
+            stderr(&out)
+        );
+    }
 }
 
 /// Final review 13: `mark --session` with a session that does not exist refuses, instead of

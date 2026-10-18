@@ -196,16 +196,16 @@ impl Ctx {
     /// it still depends on something this parser cannot see).
     fn cd_target(&self, dir: &str) -> Option<String> {
         let mut d = dir.to_string();
-        for home in ["${HOME}", "$HOME"] {
-            if let Some(rest) = d.strip_prefix(home) {
-                d = format!("~{rest}");
-            }
-        }
-        for (k, v) in &self.vars {
-            if !is_dynamic_word(v) {
-                d = d
-                    .replace(&format!("${{{k}}}"), v)
-                    .replace(&format!("${k}"), v);
+        // `$HOME` is the user's home unless the command set HOME. Any other variable's value
+        // cannot be known for certain here (it may be set conditionally, in a loop, by `read`),
+        // so a target that uses one is unknown.
+        if !self.vars.contains_key("HOME") {
+            for home in ["${HOME}", "$HOME"] {
+                if let Some(rest) = d.strip_prefix(home)
+                    && (rest.is_empty() || rest.starts_with('/'))
+                {
+                    d = format!("~{rest}");
+                }
             }
         }
         let bad_tilde = d.starts_with('~') && d != "~" && !d.starts_with("~/");
@@ -3951,13 +3951,22 @@ mod tests {
             ("cd a || exit 1; git commit", v(&["a"])),
             ("true && cd a && git commit", v(&["a"])),
             ("cd a; cd b; cd -; git commit", v(&["a"])),
-            ("R=x/y; cd $R && git commit", v(&["x/y"])),
             ("cd \"$HOME/r\" && git commit", v(&["~/r"])),
             ("false && cd a; cd /abs; git commit", v(&["/abs"])),
         ] {
             let g = &git_commits(c)[0];
             assert!(!g.dir_unknown, "{c}: {g:?}");
             assert_eq!(g.dirs, want, "{c}");
+        }
+        // A variable's value is not known for certain (set conditionally, by `read`, in a
+        // loop): its target is unknown. So is `$HOME` once the command sets HOME.
+        for c in [
+            "R=x/y; cd $R && git commit",
+            "[ -d a ] && R=a; cd \"$R\" && git commit",
+            "HOME=/x; cd $HOME/r && git commit",
+            "cd $HOMEX/r && git commit",
+        ] {
+            assert!(git_commits(c)[0].dir_unknown, "{c}");
         }
     }
 
