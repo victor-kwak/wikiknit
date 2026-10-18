@@ -859,16 +859,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 vec![vault.find_note(note.as_deref().expect("required by clap"))?]
             };
             let index = semantic_index(&vault)?;
-            let mut all = Vec::new();
-            for start in starts {
-                all.extend(wikiknit::suggest::suggest(
-                    &vault,
-                    start,
-                    index.as_ref(),
-                    *limit,
-                    *min_score,
-                ));
-            }
+            // Vault-wide structures once, then every note (in parallel, order kept).
+            let all = wikiknit::suggest::Suggester::new(&vault, index.as_ref())
+                .suggest_many(&starts, *limit, *min_score);
             emit(
                 fmt,
                 "suggest",

@@ -217,9 +217,8 @@ struct Signals {
 
 /// Link candidates for note `start` scoring at least `min_score`, best first (at most
 /// `limit`). One strong signal (a mention, a link here) scores 2-3; a weak text match alone
-/// scores under 0.5.
+/// scores under 0.5. For many notes, build one [`Suggester`] and reuse it.
 #[must_use]
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 pub fn suggest(
     vault: &Vault,
     start: usize,
@@ -227,266 +226,339 @@ pub fn suggest(
     limit: usize,
     min_score: f64,
 ) -> Vec<Suggestion> {
-    let cfg = &vault.config;
-    let note = &vault.notes[start];
-    let out_links = vault.outbound_all();
-    let linked: &BTreeSet<usize> = &out_links[start];
-    let eligible = |i: usize| i != start && !cfg.is_hub(&vault.notes[i].id);
-    let mut sig: BTreeMap<usize, Signals> = BTreeMap::new();
+    Suggester::new(vault, index).suggest(start, limit, min_score)
+}
 
-    // 1. mentions in this note
-    let only: BTreeSet<String> = BTreeSet::from([note.id.clone()]);
-    for m in mentions::find(vault, Some(&only)) {
-        let Some(t) = vault.index_of(&m.target) else {
-            continue;
-        };
-        if !eligible(t) {
-            continue;
-        }
-        let s = sig.entry(t).or_default();
-        s.mention = 1.0;
-        s.reasons
-            .push(format!("mentions \"{}\" (line {})", m.term, m.line));
-        let link = link_text(vault, &vault.notes[t]);
-        let inner = link.trim_start_matches("[[").trim_end_matches("]]");
-        // Inside a table row the alias pipe must be escaped, or it splits the cell.
-        let in_table =
-            m.context.trim_start().starts_with('|') || m.context.matches('|').count() >= 2;
-        let pipe = if in_table { "\\|" } else { "|" };
-        s.mention_edit = Some((
-            m.line,
-            format!(
-                "line {}: replace \"{}\" with [[{inner}{pipe}{}]]",
-                m.line, m.term, m.term
-            ),
-        ));
-    }
+/// What `suggest` needs from the whole vault, computed once: the mention matcher, template
+/// headings, the hub-free link graph, frontmatter values and their document frequency, and
+/// note vectors. Suggestions for many notes (`suggest --changed`) reuse it.
+pub struct Suggester<'a> {
+    vault: &'a Vault,
+    index: Option<&'a Index>,
+    matcher: mentions::Matcher,
+    common: BTreeSet<String>,
+    /// Undirected links between non-hub notes.
+    adj: Vec<BTreeSet<usize>>,
+    frontmatter: Vec<BTreeSet<(String, String)>>,
+    /// Notes holding each frontmatter value.
+    df: HashMap<(String, String), usize>,
+    /// Mean vector per note (index order), when there is an index.
+    vectors: Vec<Option<Vec<f32>>>,
+}
 
-    // 2. notes that link here without a link back
-    // (A log, like a session note, links what it touched; that does not ask for a link back.)
-    for (i, outs) in out_links.iter().enumerate() {
-        if outs.contains(&start)
-            && !linked.contains(&i)
-            && eligible(i)
-            && !cfg.is_no_backlink_from(&vault.notes[i].id)
-        {
-            let s = sig.entry(i).or_default();
-            s.links_here = 1.0;
-            s.reasons.push("links here".into());
-        }
-    }
-
-    // 2b. notes this one links to that do not link back
-    for &t in linked {
-        if eligible(t) && !out_links[t].contains(&start) {
-            let s = sig.entry(t).or_default();
-            s.no_link_back = 1.0;
-            s.reasons.push("linked from here; no link back".into());
-        }
-    }
-
-    // 3a. similar meaning
-    if let Some(idx) = index
-        && let Some(me) = idx.note_vector(&note.id)
-    {
-        let sims: Vec<(usize, f32)> = vault
-            .notes
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| eligible(*i))
-            .filter_map(|(i, n)| idx.note_vector(&n.id).map(|v| (i, vectors::dot(&me, &v))))
-            .collect();
-        // Note-to-note similarity runs high (most notes in one vault share vocabulary), so only
-        // clearly similar notes count: linear from NOTE_SIMILARITY_LOW (0) to +0.2 (1).
-        for (i, sim) in sims {
-            let rel = ((sim - NOTE_SIMILARITY_LOW) / 0.2).clamp(0.0, 1.0);
-            if rel > 0.0 {
-                let s = sig.entry(i).or_default();
-                s.semantic = f64::from(rel);
-                if rel >= 0.25 {
-                    s.reasons.push(format!("similar meaning ({sim:.2})"));
+impl<'a> Suggester<'a> {
+    #[must_use]
+    pub fn new(vault: &'a Vault, index: Option<&'a Index>) -> Self {
+        use rayon::prelude::*;
+        let cfg = &vault.config;
+        let out_links = vault.outbound_all();
+        let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); vault.notes.len()];
+        for (i, outs) in out_links.iter().enumerate() {
+            if cfg.is_hub(&vault.notes[i].id) {
+                continue;
+            }
+            for &j in outs {
+                if !cfg.is_hub(&vault.notes[j].id) {
+                    adj[i].insert(j);
+                    adj[j].insert(i);
                 }
             }
         }
-    }
-
-    // 3b. similar text: the note's title, aliases, and headings as a query
-    let mut query = crate::catalog::title(note, &cfg.generic_names)
-        .unwrap_or_else(|| note.name(&cfg.generic_names).to_string());
-    for a in note.parsed.frontmatter.aliases() {
-        query.push(' ');
-        query.push_str(&a);
-    }
-    let common = common_headings(vault);
-    for line in note.text[note.parsed.body_start..].lines() {
-        let l = line.trim_start();
-        if l.starts_with("## ") || l.starts_with("### ") {
-            let h = l.trim_start_matches('#').trim();
-            if !common.contains(&h.to_lowercase()) {
-                query.push(' ');
-                query.push_str(h);
+        let frontmatter: Vec<BTreeSet<(String, String)>> =
+            vault.notes.par_iter().map(frontmatter_values).collect();
+        let mut df: HashMap<(String, String), usize> = HashMap::new();
+        for vals in &frontmatter {
+            for kv in vals {
+                *df.entry(kv.clone()).or_default() += 1;
             }
         }
-    }
-    // Quotes in a title or heading must not turn into phrase rules.
-    let query = query.replace('"', " ");
-    let hits = search::search(
-        vault,
-        &query,
-        &Filter::default(),
-        &search::Options {
-            include_hubs: false,
-            limit: 25,
-            semantic: None,
-            lexical: true,
-        },
-    );
-    let mut rank = 0usize;
-    for h in &hits {
-        let Some(i) = vault.index_of(&h.id) else {
-            continue;
+        let vectors = match index {
+            Some(idx) => vault
+                .notes
+                .par_iter()
+                .map(|n| idx.note_vector(&n.id))
+                .collect(),
+            None => Vec::new(),
         };
-        if !eligible(i) {
-            continue;
-        }
-        rank += 1;
-        let s = sig.entry(i).or_default();
-        s.lexical = 1.0 / rank as f64;
-        if rank <= 5 {
-            s.reasons.push(format!("similar text (#{rank})"));
+        Self {
+            vault,
+            index,
+            matcher: mentions::Matcher::new(vault),
+            common: common_headings(vault),
+            adj,
+            frontmatter,
+            df,
+            vectors,
         }
     }
 
-    // 4. shared neighbors (Adamic-Adar), hubs left out
-    let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); vault.notes.len()];
-    for (i, outs) in out_links.iter().enumerate() {
-        if cfg.is_hub(&vault.notes[i].id) {
-            continue;
-        }
-        for &j in outs {
-            if !cfg.is_hub(&vault.notes[j].id) {
-                adj[i].insert(j);
-                adj[j].insert(i);
-            }
-        }
-    }
-    let mut shared: HashMap<usize, (f64, Vec<usize>)> = HashMap::new();
-    for &z in &adj[start] {
-        let degree = adj[z].len();
-        if degree < 2 {
-            continue;
-        }
-        let w = 1.0 / (degree as f64).ln();
-        for &t in &adj[z] {
-            if eligible(t) {
-                let e = shared.entry(t).or_default();
-                e.0 += w;
-                e.1.push(z);
-            }
-        }
-    }
-    for (t, (score, via)) in shared {
-        // One shared neighbor is common and says little; two or more is a pattern.
-        if via.len() < 2 {
-            continue;
-        }
-        let s = sig.entry(t).or_default();
-        s.neighbors = (score / 2.0).min(1.0);
-        let names: Vec<&str> = via
-            .iter()
-            .take(3)
-            .map(|&z| vault.notes[z].id.as_str())
+    /// Suggestions for several notes, in the order given (computed in parallel).
+    #[must_use]
+    pub fn suggest_many(&self, starts: &[usize], limit: usize, min_score: f64) -> Vec<Suggestion> {
+        use rayon::prelude::*;
+        let per: Vec<Vec<Suggestion>> = starts
+            .par_iter()
+            .map(|&s| self.suggest(s, limit, min_score))
             .collect();
-        s.reasons.push(format!(
-            "{} shared link(s): {}",
-            via.len(),
-            names.join(", ")
-        ));
+        per.into_iter().flatten().collect()
     }
 
-    // 5. rare shared frontmatter values
-    let mine = frontmatter_values(note);
-    if !mine.is_empty() {
-        let all: Vec<BTreeSet<(String, String)>> =
-            vault.notes.iter().map(frontmatter_values).collect();
-        let mut df: HashMap<&(String, String), usize> = HashMap::new();
-        for vals in &all {
-            for kv in vals.intersection(&mine) {
-                *df.entry(kv).or_default() += 1;
-            }
-        }
-        let n = vault.notes.len() as f64;
-        for (t, vals) in all.iter().enumerate() {
+    /// Link candidates for note `start`: see [`suggest`].
+    #[must_use]
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    pub fn suggest(&self, start: usize, limit: usize, min_score: f64) -> Vec<Suggestion> {
+        let vault = self.vault;
+        let cfg = &vault.config;
+        let note = &vault.notes[start];
+        let out_links = vault.outbound_all();
+        let linked: &BTreeSet<usize> = &out_links[start];
+        let eligible = |i: usize| i != start && !cfg.is_hub(&vault.notes[i].id);
+        let mut sig: BTreeMap<usize, Signals> = BTreeMap::new();
+
+        // 1. mentions in this note
+        for m in self.matcher.in_note(vault, start) {
+            let Some(t) = vault.index_of(&m.target) else {
+                continue;
+            };
             if !eligible(t) {
                 continue;
             }
-            let common: Vec<&(String, String)> = vals
-                .intersection(&mine)
-                .filter(|kv| df[kv] <= 2 || (df[kv] as f64) / n <= COMMON_VALUE)
-                .collect();
-            if common.is_empty() {
+            let s = sig.entry(t).or_default();
+            s.mention = 1.0;
+            s.reasons
+                .push(format!("mentions \"{}\" (line {})", m.term, m.line));
+            let link = link_text(vault, &vault.notes[t]);
+            let inner = link.trim_start_matches("[[").trim_end_matches("]]");
+            // Inside a table row the alias pipe must be escaped, or it splits the cell.
+            let in_table =
+                m.context.trim_start().starts_with('|') || m.context.matches('|').count() >= 2;
+            let pipe = if in_table { "\\|" } else { "|" };
+            s.mention_edit = Some((
+                m.line,
+                format!(
+                    "line {}: replace \"{}\" with [[{inner}{pipe}{}]]",
+                    m.line, m.term, m.term
+                ),
+            ));
+        }
+
+        // 2. notes that link here without a link back
+        // (A log, like a session note, links what it touched; that does not ask for a link
+        // back.)
+        for (i, outs) in out_links.iter().enumerate() {
+            if outs.contains(&start)
+                && !linked.contains(&i)
+                && eligible(i)
+                && !cfg.is_no_backlink_from(&vault.notes[i].id)
+            {
+                let s = sig.entry(i).or_default();
+                s.links_here = 1.0;
+                s.reasons.push("links here".into());
+            }
+        }
+
+        // 2b. notes this one links to that do not link back
+        for &t in linked {
+            if eligible(t) && !out_links[t].contains(&start) {
+                let s = sig.entry(t).or_default();
+                s.no_link_back = 1.0;
+                s.reasons.push("linked from here; no link back".into());
+            }
+        }
+
+        // 3a. similar meaning
+        if self.index.is_some()
+            && let Some(me) = &self.vectors[start]
+        {
+            // Note-to-note similarity runs high (most notes in one vault share vocabulary), so
+            // only clearly similar notes count: linear from NOTE_SIMILARITY_LOW (0) to +0.2 (1).
+            for (i, v) in self.vectors.iter().enumerate() {
+                let Some(v) = v else { continue };
+                if !eligible(i) {
+                    continue;
+                }
+                let sim = vectors::dot(me, v);
+                let rel = ((sim - NOTE_SIMILARITY_LOW) / 0.2).clamp(0.0, 1.0);
+                if rel > 0.0 {
+                    let s = sig.entry(i).or_default();
+                    s.semantic = f64::from(rel);
+                    if rel >= 0.25 {
+                        s.reasons.push(format!("similar meaning ({sim:.2})"));
+                    }
+                }
+            }
+        }
+
+        // 3b. similar text: the note's title, aliases, and headings as a query
+        let mut query = crate::catalog::title(note, &cfg.generic_names)
+            .unwrap_or_else(|| note.name(&cfg.generic_names).to_string());
+        for a in note.parsed.frontmatter.aliases() {
+            query.push(' ');
+            query.push_str(&a);
+        }
+        for line in note.text[note.parsed.body_start..].lines() {
+            let l = line.trim_start();
+            if l.starts_with("## ") || l.starts_with("### ") {
+                let h = l.trim_start_matches('#').trim();
+                if !self.common.contains(&h.to_lowercase()) {
+                    query.push(' ');
+                    query.push_str(h);
+                }
+            }
+        }
+        // Quotes in a title or heading must not turn into phrase rules.
+        let query = query.replace('"', " ");
+        let hits = search::search(
+            vault,
+            &query,
+            &Filter::default(),
+            &search::Options {
+                include_hubs: false,
+                limit: 25,
+                semantic: None,
+                lexical: true,
+            },
+        );
+        let mut rank = 0usize;
+        for h in &hits {
+            let Some(i) = vault.index_of(&h.id) else {
+                continue;
+            };
+            if !eligible(i) {
                 continue;
             }
-            let score: f64 = common.iter().map(|kv| (n / df[kv] as f64).ln()).sum();
+            rank += 1;
+            let s = sig.entry(i).or_default();
+            s.lexical = 1.0 / rank as f64;
+            if rank <= 5 {
+                s.reasons.push(format!("similar text (#{rank})"));
+            }
+        }
+
+        // 4. shared neighbors (Adamic-Adar), hubs left out
+        let adj = &self.adj;
+        let mut shared: HashMap<usize, (f64, Vec<usize>)> = HashMap::new();
+        for &z in &adj[start] {
+            let degree = adj[z].len();
+            if degree < 2 {
+                continue;
+            }
+            let w = 1.0 / (degree as f64).ln();
+            for &t in &adj[z] {
+                if eligible(t) {
+                    let e = shared.entry(t).or_default();
+                    e.0 += w;
+                    e.1.push(z);
+                }
+            }
+        }
+        for (t, (score, via)) in shared {
+            // One shared neighbor is common and says little; two or more is a pattern.
+            if via.len() < 2 {
+                continue;
+            }
             let s = sig.entry(t).or_default();
-            // Absolute: one value only these two notes share (~ln(n/2)) counts fully.
-            s.frontmatter = (score / (n / 2.0).ln().max(1.0)).min(1.0);
-            let shown: Vec<String> = common
+            s.neighbors = (score / 2.0).min(1.0);
+            let names: Vec<&str> = via
                 .iter()
                 .take(3)
-                .map(|(k, v)| format!("{k}: {v}"))
+                .map(|&z| vault.notes[z].id.as_str())
                 .collect();
-            s.reasons.push(format!("same {}", shown.join(", ")));
+            s.reasons.push(format!(
+                "{} shared link(s): {}",
+                via.len(),
+                names.join(", ")
+            ));
         }
-    }
 
-    // Normalize per signal, weight, rank.
-    let max = |f: fn(&Signals) -> f64| sig.values().map(f).fold(0.0f64, f64::max).max(1e-9);
-    let m_lex = max(|s| s.lexical);
-    let mut out: Vec<Suggestion> = sig
-        .into_iter()
-        .map(|(t, s)| {
-            let score = 3.0 * s.mention
-                + 2.0 * s.links_here
-                + 1.0 * s.no_link_back
-                + 1.5 * s.semantic
-                + 1.0 * s.lexical / m_lex
-                + 1.0 * s.neighbors
-                + 1.0 * s.frontmatter;
-            let target = &vault.notes[t];
-            let (action, editor, (line, edit)) = if linked.contains(&t) {
-                // Already linked from here: suggest the link back, edited in the target.
-                ("backlink", target, add_link_edit(vault, target, note))
-            } else if let Some(me) = s.mention_edit.clone() {
-                ("mention", note, me)
-            } else {
-                ("link", note, add_link_edit(vault, note, target))
-            };
-            let (target_id, score) = if action == "backlink" {
-                (note.id.clone(), score)
-            } else {
-                (target.id.clone(), score)
-            };
-            Suggestion {
-                note: editor.id.clone(),
-                action,
-                target: target_id,
-                score: (score * 100.0).round() / 100.0,
-                reasons: s.reasons,
-                line,
-                edit,
+        // 5. rare shared frontmatter values
+        let mine = &self.frontmatter[start];
+        if !mine.is_empty() {
+            let df = &self.df;
+            let n = vault.notes.len() as f64;
+            for (t, vals) in self.frontmatter.iter().enumerate() {
+                if !eligible(t) {
+                    continue;
+                }
+                let common: Vec<&(String, String)> = vals
+                    .intersection(mine)
+                    .filter(|kv| df[*kv] <= 2 || (df[*kv] as f64) / n <= COMMON_VALUE)
+                    .collect();
+                if common.is_empty() {
+                    continue;
+                }
+                let score: f64 = common.iter().map(|kv| (n / df[*kv] as f64).ln()).sum();
+                let s = sig.entry(t).or_default();
+                // Absolute: one value only these two notes share (~ln(n/2)) counts fully.
+                s.frontmatter = (score / (n / 2.0).ln().max(1.0)).min(1.0);
+                let shown: Vec<String> = common
+                    .iter()
+                    .take(3)
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect();
+                s.reasons.push(format!("same {}", shown.join(", ")));
             }
-        })
-        .collect();
-    // Back-links only where the other note does not already link here.
-    out.retain(|s| {
-        s.action != "backlink" || {
-            let t = vault.index_of(&s.note).expect("note exists");
-            !out_links[t].contains(&start)
         }
-    });
-    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.target.cmp(&b.target)));
-    out.retain(|s| s.score >= min_score);
-    out.truncate(limit);
-    out
+
+        // Normalize per signal, weight, rank.
+        let max = |f: fn(&Signals) -> f64| sig.values().map(f).fold(0.0f64, f64::max).max(1e-9);
+        let m_lex = max(|s| s.lexical);
+        let mut ranked: Vec<(f64, usize, Signals)> = sig
+            .into_iter()
+            .map(|(t, s)| {
+                let score = 3.0 * s.mention
+                    + 2.0 * s.links_here
+                    + 1.0 * s.no_link_back
+                    + 1.5 * s.semantic
+                    + 1.0 * s.lexical / m_lex
+                    + 1.0 * s.neighbors
+                    + 1.0 * s.frontmatter;
+                ((score * 100.0).round() / 100.0, t, s)
+            })
+            // Back-links only where the other note does not already link here.
+            .filter(|(_, t, _)| !(linked.contains(t) && out_links[*t].contains(&start)))
+            .collect();
+        let id_of = |t: usize, linked_t: bool| {
+            if linked_t {
+                note.id.as_str()
+            } else {
+                vault.notes[t].id.as_str()
+            }
+        };
+        ranked.sort_by(|a, b| {
+            b.0.total_cmp(&a.0).then_with(|| {
+                id_of(a.1, linked.contains(&a.1)).cmp(id_of(b.1, linked.contains(&b.1)))
+            })
+        });
+        ranked.retain(|(score, _, _)| *score >= min_score);
+        ranked.truncate(limit);
+        ranked
+            .into_iter()
+            .map(|(score, t, s)| {
+                let target = &vault.notes[t];
+                let (action, editor, (line, edit)) = if linked.contains(&t) {
+                    // Already linked from here: suggest the link back, edited in the target.
+                    ("backlink", target, add_link_edit(vault, target, note))
+                } else if let Some(me) = s.mention_edit.clone() {
+                    ("mention", note, me)
+                } else {
+                    ("link", note, add_link_edit(vault, note, target))
+                };
+                let target_id = if action == "backlink" {
+                    note.id.clone()
+                } else {
+                    target.id.clone()
+                };
+                Suggestion {
+                    note: editor.id.clone(),
+                    action,
+                    target: target_id,
+                    score,
+                    reasons: s.reasons,
+                    line,
+                    edit,
+                }
+            })
+            .collect()
+    }
 }
