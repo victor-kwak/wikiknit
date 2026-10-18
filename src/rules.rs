@@ -528,6 +528,9 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             );
         }
 
+        // Missing required links of this note: (target id, note index if it exists), in rule
+        // order. Their edits are made together, so applying them in order gives a valid note.
+        let mut missing: Vec<(String, Option<usize>)> = Vec::new();
         for req in &cfg.require_link {
             let caps = match &req.when {
                 When::Field { field, pattern } => p
@@ -544,24 +547,31 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             let linked = vault
                 .index_of(&target)
                 .is_some_and(|t| outbound.contains(&t));
-            if !linked {
-                let exists = if vault.get(&target).is_some() {
-                    ""
-                } else {
-                    " (that note does not exist yet)"
-                };
-                let fix = match vault.get(&target) {
-                    Some(t) => crate::suggest::add_link_edit(vault, note, t).1,
-                    None => format!("create [[{target}]] first, then link it"),
-                };
-                sink.push_fix(
-                    "missing-required-link",
-                    &note.id,
-                    1,
-                    format!("must link [[{target}]]{exists}"),
-                    fix,
-                );
+            if !linked && !missing.iter().any(|(m, _)| *m == target) {
+                let at = vault.index_of(&target);
+                missing.push((target, at));
             }
+        }
+        let existing: Vec<&crate::vault::Note> = missing
+            .iter()
+            .filter_map(|(_, t)| t.map(|i| &vault.notes[i]))
+            .collect();
+        let mut edits = crate::suggest::add_link_edits(vault, note, &existing).into_iter();
+        for (target, at) in missing {
+            let (exists, fix) = match at {
+                Some(_) => ("", edits.next().map(|(_, e)| e).unwrap_or_default()),
+                None => (
+                    " (that note does not exist yet)",
+                    format!("create [[{target}]] first, then link it"),
+                ),
+            };
+            sink.push_fix(
+                "missing-required-link",
+                &note.id,
+                1,
+                format!("must link [[{target}]]{exists}"),
+                fix,
+            );
         }
     }
 
@@ -636,6 +646,35 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
             })
             .clone()
     };
+    // Findings whose edit goes into a `from` note's link section (no sibling links to sit
+    // next to): (from note, target note, target selected). Their edits are made per `from`
+    // note together at the end, so the section is created once.
+    let mut into_section: Vec<(usize, usize, bool)> = Vec::new();
+    let push = |sink: &mut Sink<'_>,
+                note: &Note,
+                from: &str,
+                target_selected: bool,
+                line: usize,
+                edit: String| {
+        if target_selected {
+            sink.push_fix(
+                "missing-required-inbound",
+                &note.id,
+                1,
+                format!("must be linked from [[{from}]]"),
+                format!("in {from}: {edit}"),
+            );
+        } else {
+            // Only the `from` note is being checked: the finding is about it.
+            sink.push_fix(
+                "missing-required-inbound",
+                from,
+                line.max(1),
+                format!("must link [[{}]] (require_inbound)", note.id),
+                edit,
+            );
+        }
+    };
     for (i, note) in vault.notes.iter().enumerate() {
         for req in &cfg.require_inbound {
             let caps = match &req.when {
@@ -681,29 +720,14 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
             }
             match from_note {
                 Some(f) if out[f].contains(&i) => {}
-                Some(f) => {
-                    let editor = &vault.notes[f];
-                    let (line, edit) = sibling_edit(vault, editor, &req.when, note)
-                        .unwrap_or_else(|| crate::suggest::add_link_edit(vault, editor, note));
-                    if target_selected {
-                        sink.push_fix(
-                            "missing-required-inbound",
-                            &note.id,
-                            1,
-                            format!("must be linked from [[{from}]]"),
-                            format!("in {from}: {edit}"),
-                        );
-                    } else {
-                        // Only the `from` note is being checked: the finding is about it.
-                        sink.push_fix(
-                            "missing-required-inbound",
-                            &from,
-                            line.max(1),
-                            format!("must link [[{}]] (require_inbound)", note.id),
-                            edit,
-                        );
+                Some(f) => match sibling_edit(vault, &vault.notes[f], &req.when, note) {
+                    Some((line, edit)) => push(sink, note, &from, target_selected, line, edit),
+                    None => {
+                        if !into_section.iter().any(|&(ff, ii, _)| ff == f && ii == i) {
+                            into_section.push((f, i, target_selected));
+                        }
                     }
-                }
+                },
                 None if !target_selected => {}
                 None => sink.push_fix(
                     "missing-required-inbound",
@@ -713,6 +737,22 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
                     format!("create [[{from}]] with a link to [[{}]]", note.id),
                 ),
             }
+        }
+    }
+    let mut froms: Vec<usize> = into_section.iter().map(|&(f, _, _)| f).collect();
+    froms.sort_unstable();
+    froms.dedup();
+    for f in froms {
+        let editor = &vault.notes[f];
+        let rows: Vec<(usize, bool)> = into_section
+            .iter()
+            .filter(|&&(ff, _, _)| ff == f)
+            .map(|&(_, i, sel)| (i, sel))
+            .collect();
+        let targets: Vec<&Note> = rows.iter().map(|&(i, _)| &vault.notes[i]).collect();
+        let edits = crate::suggest::add_link_edits(vault, editor, &targets);
+        for ((i, sel), (line, edit)) in rows.into_iter().zip(edits) {
+            push(sink, &vault.notes[i], &editor.id, sel, line, edit);
         }
     }
 }

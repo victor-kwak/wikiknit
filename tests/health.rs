@@ -283,3 +283,56 @@ fn code_that_names_no_note_is_not_a_link_in_code() {
     assert_eq!(m.len(), 1, "{m:?}");
     assert!(m[0]["message"].as_str().unwrap().starts_with("[[b]]"));
 }
+
+#[test]
+fn several_required_links_into_one_note_create_the_section_once() {
+    let v = vault(
+        "[[require_link]]\nwhen = { path = \"^s$\" }\ntarget = \"a\"\n\n\
+         [[require_link]]\nwhen = { path = \"^s$\" }\ntarget = \"b\"\n",
+        &[
+            ("s.md", "# s\nText.\n"),
+            ("a.md", "# a\n[[b]] [[s]]\n"),
+            ("b.md", "# b\n[[a]]\n"),
+        ],
+    );
+    let f = check(v.path(), &["s"]);
+    let fixes: Vec<&str> = by_rule(&f, "missing-required-link")
+        .iter()
+        .map(|x| x["fix"].as_str().unwrap())
+        .collect();
+    assert_eq!(fixes.len(), 2, "{f:?}");
+    assert_eq!(
+        fixes.iter().filter(|x| x.starts_with("append")).count(),
+        1,
+        "{fixes:?}"
+    );
+}
+
+#[test]
+fn several_required_inbound_links_into_one_note_create_the_section_once() {
+    let v = vault(
+        "[[require_inbound]]\nwhen = { path = \"^p/\" }\nfrom = \"hub\"\n",
+        &[
+            ("hub.md", "# hub\nText [[other]].\n"),
+            ("other.md", "# other\n[[hub]]\n"),
+            ("p/a.md", "# a\n[[p/b]]\n"),
+            ("p/b.md", "# b\n[[p/c]]\n"),
+            ("p/c.md", "# c\n[[p/a]]\n"),
+        ],
+    );
+    // hub links no p/ note, so all three go in a new link section, created once.
+    let f = check(v.path(), &[]);
+    let fixes: Vec<&str> = by_rule(&f, "missing-required-inbound")
+        .iter()
+        .map(|x| x["fix"].as_str().unwrap())
+        .collect();
+    assert_eq!(fixes.len(), 3, "{f:?}");
+    assert_eq!(
+        fixes
+            .iter()
+            .filter(|x| x.starts_with("in hub: append"))
+            .count(),
+        1,
+        "{fixes:?}"
+    );
+}
