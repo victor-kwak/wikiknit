@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod chunk;
 pub mod config;
 pub mod context;
+pub mod edits;
 #[cfg(feature = "semantic")]
 pub mod embedder;
 pub mod filter;

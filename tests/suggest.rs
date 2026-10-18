@@ -129,7 +129,8 @@ fn suggest_follows_a_frontmatter_link_section() {
     // b links a; a does not link b: back-link in a's frontmatter `related`.
     let edit = back.iter().find(|x| x["action"] == "backlink").unwrap();
     assert_eq!(edit["note"], "a");
-    assert_eq!(edit["edit"], "add \"[[b]]\" to frontmatter `related`");
+    // A mechanical edit (the whole key line), so later edits can count lines.
+    assert_eq!(edit["edit"], "line 2: replace with: related: [\"[[b]]\"]");
     assert_eq!(edit["line"], 2);
 }
 

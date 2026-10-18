@@ -247,12 +247,17 @@ notes) linking here do not ask for a link back. Every row lists its reasons.
 Each row has the file to edit, the action (`mention`, `link`, `backlink`), the reasons, and the edit:
 where it goes (`link_section`, `## Related` by default, or `frontmatter:related` for a frontmatter list)
 and the link text in the vault's `link_style`. Without the heading, a note that already lists links in
-a frontmatter key named like it (`related:` for `## Related`) gets the link there. The edits for one
-note apply in output order: the first creates a missing section or key (`append after line 12: ...`,
-the last line), the others add to it (`insert after line 15 (the `- [[a]]` line under ## Related): ...`),
-with line numbers that count the earlier edits. A mention edit names a column when the text also
-occurs earlier on the line, and replaces a name written as inline code backticks and all. wikiknit
-never applies edits; an agent decides which suggestions are right and makes them.
+a frontmatter key named like it (`related:` for `## Related`) gets the link there. One row per note
+and link target. Every edit is mechanical (`insert after line N: ...`, `append after line N: ...`,
+`line N: replace with: ...`, `lines N-M: replace with: ...`, `line N[, column C]: replace "x" with
+...`), and the rows that edit one note apply in output order: each is written against the note as
+the rows above it leave it, so a missing section or key is created once and line numbers count the
+lines inserted above. A mention edit names a column when the text also occurs earlier on the line,
+and replaces a name written as inline code backticks and all. `check` fixes that add links
+(`missing-required-link`, `missing-required-inbound`) follow the same rule, in `check`'s output
+order, and a link into an index goes after its siblings. A log (`no_backlink_from`) gets no
+`backlink` rows for the notes it links. wikiknit never applies edits; an agent decides which
+suggestions are right and makes them.
 
 ### Context
 

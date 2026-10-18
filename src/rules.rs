@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::Serialize;
 
 use crate::config::{LinkStyle, Severity, When};
+use crate::edits::Planned;
 use crate::parse::{LinkKind, Location};
 use crate::vault::Note;
 use crate::vault::{Form, Target, Vault};
@@ -37,6 +38,18 @@ pub struct Finding {
     pub message: String,
     /// How to fix it (empty when there is no specific fix).
     pub fix: String,
+    /// The fix is an edit in a note: written in output order with the other edits there.
+    #[serde(skip)]
+    plan: Option<FixPlan>,
+}
+
+/// A fix that edits note `editor` (an index into `vault.notes`).
+#[derive(Debug, Clone)]
+struct FixPlan {
+    editor: usize,
+    plan: Planned,
+    /// The fix names the edited note (`in INDEX: ...`): the finding is about another note.
+    prefix: bool,
 }
 
 impl Finding {
@@ -72,7 +85,58 @@ impl Sink<'_> {
             rule,
             message,
             fix,
+            plan: None,
         });
+    }
+
+    /// A finding whose fix is an edit in `editor`; the edit text is written by `sequence`.
+    /// When the edited note is the finding's note, the finding's line is the edit's line.
+    fn push_planned(
+        &mut self,
+        rule: &'static str,
+        note: &str,
+        message: String,
+        editor: usize,
+        plan: Planned,
+    ) {
+        let before = self.out.len();
+        self.push_fix(rule, note, 1, message, String::new());
+        if let Some(f) = self.out.get_mut(before) {
+            let prefix = self.vault.notes[editor].id != note;
+            f.plan = Some(FixPlan {
+                editor,
+                plan,
+                prefix,
+            });
+        }
+    }
+}
+
+/// Write the edit of every planned fix, per edited note in output order, so the fixes apply
+/// one after another.
+fn sequence(vault: &Vault, out: &mut [Finding]) {
+    let mut by_editor: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (k, f) in out.iter().enumerate() {
+        if let Some(p) = &f.plan {
+            by_editor.entry(p.editor).or_default().push(k);
+        }
+    }
+    for (editor, ks) in by_editor {
+        let note = &vault.notes[editor];
+        let plans: Vec<Planned> = ks
+            .iter()
+            .filter_map(|&k| out[k].plan.as_ref().map(|p| p.plan.clone()))
+            .collect();
+        for (k, (line, edit)) in ks.into_iter().zip(crate::edits::plan(vault, note, &plans)) {
+            let f = &mut out[k];
+            if f.plan.as_ref().is_some_and(|p| p.prefix) {
+                f.fix = format!("in {}: {edit}", note.id);
+            } else {
+                f.fix = edit;
+                f.line = line.max(1);
+            }
+        }
     }
 }
 
@@ -552,26 +616,23 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 missing.push((target, at));
             }
         }
-        let existing: Vec<&crate::vault::Note> = missing
-            .iter()
-            .filter_map(|(_, t)| t.map(|i| &vault.notes[i]))
-            .collect();
-        let mut edits = crate::suggest::add_link_edits(vault, note, &existing).into_iter();
         for (target, at) in missing {
-            let (exists, fix) = match at {
-                Some(_) => ("", edits.next().map(|(_, e)| e).unwrap_or_default()),
-                None => (
-                    " (that note does not exist yet)",
+            match (at, me) {
+                (Some(t), Some(me)) => sink.push_planned(
+                    "missing-required-link",
+                    &note.id,
+                    format!("must link [[{target}]]"),
+                    me,
+                    Planned::Link { target: t },
+                ),
+                _ => sink.push_fix(
+                    "missing-required-link",
+                    &note.id,
+                    1,
+                    format!("must link [[{target}]] (that note does not exist yet)"),
                     format!("create [[{target}]] first, then link it"),
                 ),
-            };
-            sink.push_fix(
-                "missing-required-link",
-                &note.id,
-                1,
-                format!("must link [[{target}]]{exists}"),
-                fix,
-            );
+            }
         }
     }
 
@@ -593,6 +654,8 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
     duplicate_aliases(vault, &is_selected, &mut sink);
     sink.out
         .sort_by(|a, b| (&a.note, a.line, a.rule).cmp(&(&b.note, b.line, b.rule)));
+    // Edits last, in this final order: each fix applies after the ones above it.
+    sequence(vault, &mut sink.out);
     sink.out
 }
 
@@ -646,37 +709,11 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
             })
             .clone()
     };
-    // Findings whose edit goes into a `from` note's link section (no sibling links to sit
-    // next to): (from note, target note, target selected). Their edits are made per `from`
-    // note together at the end, so the section is created once.
-    let mut into_section: Vec<(usize, usize, bool)> = Vec::new();
-    let push = |sink: &mut Sink<'_>,
-                note: &Note,
-                from: &str,
-                target_selected: bool,
-                line: usize,
-                edit: String| {
-        if target_selected {
-            sink.push_fix(
-                "missing-required-inbound",
-                &note.id,
-                1,
-                format!("must be linked from [[{from}]]"),
-                format!("in {from}: {edit}"),
-            );
-        } else {
-            // Only the `from` note is being checked: the finding is about it.
-            sink.push_fix(
-                "missing-required-inbound",
-                from,
-                line.max(1),
-                format!("must link [[{}]] (require_inbound)", note.id),
-                edit,
-            );
-        }
-    };
+    // (from note, target note) pairs already reported: two rules asking for the same link
+    // give one edit.
+    let mut planned: BTreeSet<(usize, usize)> = BTreeSet::new();
     for (i, note) in vault.notes.iter().enumerate() {
-        for req in &cfg.require_inbound {
+        for (rule, req) in cfg.require_inbound.iter().enumerate() {
             let caps = match &req.when {
                 When::Field { field, pattern } => note
                     .parsed
@@ -720,14 +757,32 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
             }
             match from_note {
                 Some(f) if out[f].contains(&i) => {}
-                Some(f) => match sibling_edit(vault, &vault.notes[f], &req.when, note) {
-                    Some((line, edit)) => push(sink, note, &from, target_selected, line, edit),
-                    None => {
-                        if !into_section.iter().any(|&(ff, ii, _)| ff == f && ii == i) {
-                            into_section.push((f, i, target_selected));
-                        }
+                Some(f) => {
+                    if !planned.insert((f, i)) {
+                        continue;
                     }
-                },
+                    // The edit goes next to the `from` note's links to similar notes, else in
+                    // its link section; written in output order by `sequence`.
+                    let plan = Planned::Sibling { target: i, rule };
+                    if target_selected {
+                        sink.push_planned(
+                            "missing-required-inbound",
+                            &note.id,
+                            format!("must be linked from [[{from}]]"),
+                            f,
+                            plan,
+                        );
+                    } else {
+                        // Only the `from` note is being checked: the finding is about it.
+                        sink.push_planned(
+                            "missing-required-inbound",
+                            &from,
+                            format!("must link [[{}]] (require_inbound)", note.id),
+                            f,
+                            plan,
+                        );
+                    }
+                }
                 None if !target_selected => {}
                 None => sink.push_fix(
                     "missing-required-inbound",
@@ -739,27 +794,11 @@ fn required_inbound(vault: &Vault, is_selected: &dyn Fn(&str) -> bool, sink: &mu
             }
         }
     }
-    let mut froms: Vec<usize> = into_section.iter().map(|&(f, _, _)| f).collect();
-    froms.sort_unstable();
-    froms.dedup();
-    for f in froms {
-        let editor = &vault.notes[f];
-        let rows: Vec<(usize, bool)> = into_section
-            .iter()
-            .filter(|&&(ff, _, _)| ff == f)
-            .map(|&(_, i, sel)| (i, sel))
-            .collect();
-        let targets: Vec<&Note> = rows.iter().map(|&(i, _)| &vault.notes[i]).collect();
-        let edits = crate::suggest::add_link_edits(vault, editor, &targets);
-        for ((i, sel), (line, edit)) in rows.into_iter().zip(edits) {
-            push(sink, &vault.notes[i], &editor.id, sel, line, edit);
-        }
-    }
 }
 
 /// Where `editor` already links other notes matching `when` (an index section listing
 /// projects), the edit puts the new link after the last of them, as the same kind of line.
-fn sibling_edit(
+pub(crate) fn sibling_edit(
     vault: &Vault,
     editor: &Note,
     when: &When,
