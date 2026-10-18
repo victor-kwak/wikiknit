@@ -251,7 +251,7 @@ fn longer_phrases_do_not_hide_terms_and_sentence_starts_do_not_count() {
             ("ov.md", "# Overview\nx\n"),
             ("c.md", "# c\nOverview of the thing.\n"),
             ("d.md", "# d\nsee below. Overview here.\n"),
-            // A block scalar alias: no unsafe one-line edit.
+            // A block scalar alias: its lines are replaced whole.
             ("bs.md", "---\naliases: |\n  foo\n---\n# bs\n"),
             ("e.md", "# e\n[[bs|Block Name]] [[bs|Block Name]]\n"),
             ("f.md", "# f\n[[bs|Block Name]]\n"),
@@ -261,9 +261,9 @@ fn longer_phrases_do_not_hide_terms_and_sentence_starts_do_not_count() {
     let p = pairs(&found);
     assert!(p.contains(&("kb".into(), "Kafka Broker".into())), "{p:?}");
     assert!(p.iter().all(|(t, _)| t != "ov"), "{p:?}");
-    assert!(
-        edit_for(&found, "bs").contains("is a block scalar"),
-        "{}",
-        edit_for(&found, "bs")
+    // The parsed value makes a whole replacement of the key and its indented lines safe.
+    assert_eq!(
+        edit_for(&found, "bs"),
+        "lines 2-3: replace with: aliases: [\"foo\", \"Block Name\"]"
     );
 }

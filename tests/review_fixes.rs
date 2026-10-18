@@ -235,3 +235,42 @@ fn fix_hints_quote_ids_with_spaces() {
         "{hint}"
     );
 }
+
+#[test]
+fn alias_edits_use_the_parsed_yaml_value() {
+    let v = vault(
+        "",
+        &[
+            ("m.md", "---\naliases: [one,\n  two]\ntype: x\n---\n# m\n"),
+            ("t.md", "---\naliases: ~\n---\n# t\n"),
+            ("n.md", "---\naliases: null # none yet\n---\n# n\n"),
+            (
+                "a.md",
+                "# a\n[[m|Emm Note]] [[t|Tee Note]] [[n|Enn Note]]\n",
+            ),
+            (
+                "b.md",
+                "# b\n[[m|Emm Note]] [[t|Tee Note]] [[n|Enn Note]]\n",
+            ),
+        ],
+    );
+    let found = items(v.path(), &["aliases"]);
+    let edit = |t: &str| {
+        found
+            .iter()
+            .find(|x| x["target"] == t)
+            .unwrap_or_else(|| panic!("{t}: {found:?}"))["edit"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        edit("m"),
+        "lines 2-3: replace with: aliases: [\"one\", \"two\", \"Emm Note\"]"
+    );
+    assert_eq!(edit("t"), "line 2: replace with: aliases: [\"Tee Note\"]");
+    assert_eq!(
+        edit("n"),
+        "line 2: replace with: aliases: [\"Enn Note\"] # none yet"
+    );
+}

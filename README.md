@@ -268,8 +268,9 @@ One row per note, with one frontmatter edit that adds all its terms (separate ed
 its evidence, including how many notes use it without a link: they become `mentions` once the alias
 is added. In text output, `terms` and `notes` are `;`-separated, and `reasons` is
 `term: reason, reason` per term with ` | ` between terms. The edit keeps the YAML valid (a trailing
-comment stays; a scalar alias is quoted whole; a block scalar gets an instruction, not an edit). A
-term goes to one note only.
+comment stays; a scalar alias is quoted whole; `aliases: ~` or `null` counts as no alias; a value
+written over several lines, such as a flow list `[a,` / `b]` or a block scalar, is replaced whole
+and the edit names its lines: `lines 2-3: replace with: ...`). A term goes to one note only.
 
 ### Mentions
 

@@ -607,52 +607,89 @@ pub fn alias_edit(note: &Note, terms: &[&str]) -> (usize, String) {
         format!(" {}", comment.trim())
     };
     let value = strip_comment(value.trim());
-    if value.starts_with('|') || value.starts_with('>') {
-        // A block scalar holds one alias over several lines: no safe one-line edit.
-        return (
-            line_no,
-            format!(
-                "line {line_no}: `{name}` is a block scalar; replace it and its indented lines with a list: {name}: [<the current alias>, {list}]"
-            ),
-        );
+    // Lines after the key line that belong to its value: indented (or blank) lines, such as a
+    // flow list over several lines or a block scalar. Trailing blank lines are not part of it.
+    let mut extra = lines[k + 1..]
+        .iter()
+        .take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']))
+        .count();
+    while extra > 0 && lines[k + extra].trim().is_empty() {
+        extra -= 1;
     }
-    if value.is_empty() {
+    let block_items = lines[k + 1..k + 1 + extra]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| l.trim_start().starts_with("- ") || l.trim() == "-");
+    if value.is_empty() && extra > 0 && block_items {
         // A block list: add items after the last one.
-        let items = lines[k + 1..]
-            .iter()
-            .take_while(|l| l.trim_start().starts_with("- ") || l.trim() == "-")
-            .count();
-        if items == 0 {
-            return (
-                line_no,
-                format!("line {line_no}: replace with: {name}: [{list}]{comment}"),
-            );
-        }
-        let last = lines[k + items];
+        let last = lines[k + extra];
         let indent: String = last.chars().take_while(|c| c.is_whitespace()).collect();
-        let at = line_no + items;
+        let at = line_no + extra;
         let new: Vec<String> = quoted.iter().map(|q| format!("{indent}- {q}")).collect();
         return (at, format!("insert after line {at}: {}", new.join("\\n")));
     }
-    let new = if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        if inner.trim().is_empty() {
+    // A block list at the key's own indentation (`- a` at column 0) also belongs to the key.
+    if value.is_empty() && extra == 0 {
+        let items = lines[k + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("- ") || l.trim_end() == "-")
+            .count();
+        if items > 0 {
+            let at = line_no + items;
+            let new: Vec<String> = quoted.iter().map(|q| format!("- {q}")).collect();
+            return (at, format!("insert after line {at}: {}", new.join("\\n")));
+        }
+    }
+    // Everything else is replaced whole, from the parsed value: `~`/`null`/nothing is no
+    // alias; a scalar is one alias (`foo, bar` is one, not two); a list keeps its items.
+    let current: Vec<String> = match note
+        .parsed
+        .frontmatter
+        .value
+        .as_ref()
+        .and_then(|v| v.get(name.trim()))
+    {
+        Some(serde_json::Value::String(s)) => vec![s.trim_end_matches('\n').to_string()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|i| match i {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect(),
+        Some(serde_json::Value::Null) | None => Vec::new(),
+        Some(other) => vec![other.to_string()],
+    };
+    let single_flow =
+        extra == 0 && value.starts_with('[') && value.ends_with(']') && !value.starts_with("[[");
+    let new = if single_flow {
+        // One line `[a, b]`: keep the items as written.
+        let inner = value[1..value.len() - 1].trim();
+        if inner.is_empty() {
             format!("[{list}]")
         } else {
-            format!("[{}, {list}]", inner.trim())
+            format!("[{inner}, {list}]")
         }
     } else {
-        // One alias as a scalar: quote it whole (`foo, bar` is one alias, not two).
-        let one = if value.starts_with('"') || value.starts_with('\'') {
-            value.to_string()
-        } else {
-            serde_json::to_string(value).expect("a string serializes")
-        };
-        format!("[{one}, {list}]")
+        let mut all: Vec<String> = current
+            .iter()
+            .map(|c| serde_json::to_string(c).expect("a string serializes"))
+            .collect();
+        all.extend(quoted.iter().cloned());
+        format!("[{}]", all.join(", "))
     };
-    (
-        line_no,
-        format!("line {line_no}: replace with: {name}: {new}{comment}"),
-    )
+    if extra == 0 {
+        (
+            line_no,
+            format!("line {line_no}: replace with: {name}: {new}{comment}"),
+        )
+    } else {
+        let end = line_no + extra;
+        (
+            line_no,
+            format!("lines {line_no}-{end}: replace with: {name}: {new}"),
+        )
+    }
 }
 
 #[cfg(test)]
