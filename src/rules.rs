@@ -319,7 +319,10 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
                 "link-in-code",
                 &note.id,
                 note.line_of(l.span.start),
-                format!("[[{}]] is inside code, so it is not a link", l.target),
+                format!(
+                    "[[{}]] is inside code or math, so it is not a link",
+                    l.target
+                ),
                 "move it out of the code span if it should be a link".into(),
             );
         }

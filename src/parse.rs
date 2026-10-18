@@ -138,8 +138,11 @@ pub struct Parsed {
     pub links: Vec<RawLink>,
     /// Wikilinks found inside code spans or blocks (Obsidian ignores these).
     pub code_links: Vec<RawLink>,
-    /// Byte ranges of code spans and blocks.
+    /// Byte ranges of code spans and blocks, and of `$math$` / `$$math$$` (Obsidian does not
+    /// index links there either).
     pub code: Vec<Range<usize>>,
+    /// Byte ranges of inline code spans only (`` `x` ``), in order; also in `code`.
+    pub inline_code: Vec<Range<usize>>,
     /// Wikilinks inside raw HTML (not rendered as links).
     pub html_links: Vec<RawLink>,
     /// Byte ranges that are not prose for mention matching: raw HTML and external links.
@@ -411,6 +414,8 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
+    // `$...$` and `$$...$$` are math in Obsidian: LaTeX like `\text{[[x]]}` is not a link.
+    opts.insert(Options::ENABLE_MATH);
     let mut code_block: Option<usize> = None;
     let mut html: Vec<Range<usize>> = Vec::new();
     for (ev, range) in Parser::new_ext(body, opts).into_offset_iter() {
@@ -422,7 +427,11 @@ fn parse_body(text: &str, body_start: usize, out: &mut Parsed) {
                     out.code.push(start..abs.end);
                 }
             }
-            Event::Code(_) => out.code.push(abs),
+            Event::Code(_) => {
+                out.inline_code.push(abs.clone());
+                out.code.push(abs);
+            }
+            Event::InlineMath(_) | Event::DisplayMath(_) => out.code.push(abs),
             Event::Html(_) | Event::InlineHtml(_) => html.push(abs),
             Event::Start(Tag::Link {
                 link_type,
