@@ -66,8 +66,9 @@ impl Note {
     #[must_use]
     pub fn tags(&self) -> Vec<String> {
         let mut tags = self.parsed.frontmatter.tags();
+        let mut seen: std::collections::HashSet<String> = tags.iter().cloned().collect();
         for t in &self.parsed.tags {
-            if !tags.contains(t) {
+            if seen.insert(t.clone()) {
                 tags.push(t.clone());
             }
         }

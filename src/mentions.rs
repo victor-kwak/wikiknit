@@ -8,6 +8,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use regex::Regex;
 use serde::Serialize;
 
+use crate::parse::RangeSet;
 use crate::vault::{Note, Target, Vault};
 
 /// Bare URLs and autolinks: a name inside a URL (`github.com/<user>/<repo>`) is not prose.
@@ -128,10 +129,6 @@ pub(crate) fn is_unspaced(c: char) -> bool {
         | 0x20000..=0x2FA1F) // CJK extensions B-F, compatibility supplement
 }
 
-pub(crate) fn inside(ranges: &[Range<usize>], r: &Range<usize>) -> bool {
-    ranges.iter().any(|x| r.start < x.end && x.start < r.end)
-}
-
 /// Find unlinked mentions in the selected notes (`None` = every note).
 #[must_use]
 pub fn find(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Mention> {
@@ -158,6 +155,7 @@ pub fn find(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Mention> 
         skip.extend(p.html_links.iter().map(|l| l.span.clone()));
         skip.extend(p.non_prose.iter().cloned());
         skip.extend(URL.find_iter(&note.text).map(|m| m.range()));
+        let skip = RangeSet::new(skip);
 
         let body_start = p.body_start;
         let folded = fold(&note.text[body_start..]);
@@ -165,7 +163,7 @@ pub fn find(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Mention> 
         let mut hits: BTreeMap<usize, (usize, String, usize)> = BTreeMap::new();
         for m in terms.ac.find_iter(&folded.text) {
             let abs = body_start + folded.orig[m.start()]..body_start + folded.orig[m.end()];
-            if abs.is_empty() || inside(&skip, &abs) {
+            if abs.is_empty() || skip.overlaps(&abs) {
                 continue;
             }
             let matched = &note.text[abs.clone()];

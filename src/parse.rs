@@ -98,6 +98,37 @@ impl Frontmatter {
     }
 }
 
+/// Byte ranges, sorted and merged once, so an overlap test is a binary search (a note with
+/// many links and many tags or mentions stays linear-ish, not quadratic).
+#[derive(Debug, Clone, Default)]
+pub struct RangeSet {
+    /// Disjoint, sorted by start (and so by end).
+    ranges: Vec<Range<usize>>,
+}
+
+impl RangeSet {
+    #[must_use]
+    pub fn new(ranges: impl IntoIterator<Item = Range<usize>>) -> Self {
+        let mut all: Vec<Range<usize>> = ranges.into_iter().filter(|r| !r.is_empty()).collect();
+        all.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(all.len());
+        for r in all {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        Self { ranges: merged }
+    }
+
+    /// `r` overlaps one of the ranges (an empty `r` overlaps a range strictly around it).
+    #[must_use]
+    pub fn overlaps(&self, r: &Range<usize>) -> bool {
+        let i = self.ranges.partition_point(|x| x.end <= r.start);
+        self.ranges.get(i).is_some_and(|x| x.start < r.end)
+    }
+}
+
 /// Everything wikiknit needs from one note's text.
 #[derive(Debug, Clone, Default)]
 pub struct Parsed {
@@ -240,18 +271,18 @@ pub fn normalize_tag(raw: &str) -> Option<String> {
 
 fn collect_inline_tags(text: &str, body_start: usize, out: &mut Parsed) {
     let body = &text[body_start..];
-    let inside = |r: &Range<usize>| {
+    let skip = RangeSet::new(
         out.code
             .iter()
             .chain(out.non_prose.iter())
             .chain(out.links.iter().map(|l| &l.span))
-            .any(|x| r.start < x.end && x.start < r.end)
-    };
+            .cloned(),
+    );
     let mut tags = Vec::new();
     for m in TAG.captures_iter(body) {
         let g = m.get(1).expect("group");
         let abs = body_start + g.start()..body_start + g.end();
-        if inside(&abs) {
+        if skip.overlaps(&abs) {
             continue;
         }
         if let Some(t) = normalize_tag(g.as_str()) {
@@ -478,6 +509,22 @@ mod tests {
         assert_eq!(p.tags, vec!["todo", "area/ops"]);
         let s = parse("---\ntags: a, b c\n---\n");
         assert_eq!(s.frontmatter.tags(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn range_set_matches_the_linear_overlap_test() {
+        let ranges = vec![5..9, 0..2, 8..12, 20..21, 30..30];
+        let set = RangeSet::new(ranges.clone());
+        for start in 0..25 {
+            for end in start..26 {
+                let r = start..end;
+                let linear = ranges
+                    .iter()
+                    .filter(|x| !x.is_empty())
+                    .any(|x| r.start < x.end && x.start < r.end);
+                assert_eq!(set.overlaps(&r), linear, "{r:?}");
+            }
+        }
     }
 
     #[test]
