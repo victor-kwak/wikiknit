@@ -271,6 +271,16 @@ fn gate(
     } else {
         ""
     };
+    // `git add -f`/`--force` (also in a short cluster like `-Af`), or a git call that cannot
+    // be seen: ignored files may be staged.
+    let force_adds = analysis.calls.iter().any(|c| {
+        c.opaque
+            || (c.subcommand == "add"
+                && c.args.iter().any(|a| {
+                    a == "--force"
+                        || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+                }))
+    });
     // Configs from where each commit runs, and from the session's folders.
     let mut starts: Vec<PathBuf> = commits
         .iter()
@@ -300,7 +310,9 @@ fn gate(
         let Some(vault_repo) = repo_of_dir(&config.vault) else {
             continue;
         };
-        if state::git_ignores_dir(&config.vault) {
+        // Unless the command force-adds files (`git add -f` can stage ignored notes), or runs
+        // git in a way that cannot be seen.
+        if !force_adds && state::git_ignores_dir(&config.vault) {
             continue;
         }
         let same_repo =

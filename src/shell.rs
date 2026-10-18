@@ -196,17 +196,20 @@ impl Ctx {
     /// it still depends on something this parser cannot see).
     fn cd_target(&self, dir: &str) -> Option<String> {
         let mut d = dir.to_string();
-        // `$HOME` is the user's home unless the command set HOME. Any other variable's value
-        // cannot be known for certain here (it may be set conditionally, in a loop, by `read`),
-        // so a target that uses one is unknown.
-        if !self.vars.contains_key("HOME") {
-            for home in ["${HOME}", "$HOME"] {
-                if let Some(rest) = d.strip_prefix(home)
-                    && (rest.is_empty() || rest.starts_with('/'))
-                {
-                    d = format!("~{rest}");
-                }
+        // `$HOME` and `~` are the user's home unless the command may have set HOME (an
+        // assignment, `read`, a loop variable): then any home-relative target is unknown. Any
+        // other variable's value cannot be known for certain here, so a target that uses one
+        // is unknown too.
+        let home_set = self.vars.contains_key("HOME");
+        for home in ["${HOME}", "$HOME"] {
+            if let Some(rest) = d.strip_prefix(home)
+                && (rest.is_empty() || rest.starts_with('/'))
+            {
+                d = format!("~{rest}");
             }
+        }
+        if home_set && d.starts_with('~') {
+            return None;
         }
         let bad_tilde = d.starts_with('~') && d != "~" && !d.starts_with("~/");
         (!is_dynamic_word(&d) && !bad_tilde).then_some(d)
@@ -358,6 +361,15 @@ fn collect(command: &str, ctx: &mut Ctx, out: &mut Analysis, depth: usize) {
                     if !matches!(p.words.first().map(String::as_str), Some("exit" | "return")) {
                         ctx.lose_cwd();
                     }
+                }
+                // `for NAME in ...` / `select NAME`: NAME is assigned each time round.
+                if matches!(first, Some("for" | "select"))
+                    && let Some(name) = cmd.words.get(1)
+                {
+                    if risky_name(name) {
+                        ctx.opaque_rest = true;
+                    }
+                    ctx.vars.insert(name.clone(), "$loop".to_string());
                 }
                 if matches!(
                     first,
@@ -1453,6 +1465,7 @@ fn source_file(
 /// one that changes how git runs, or the alias table.
 fn risky_name(name: &str) -> bool {
     is_dynamic_word(name)
+        || name == "HOME"
         || is_config_var(name)
         || name == "GIT_WORK_TREE"
         || name.contains("BASH_ALIASES")
@@ -3876,6 +3889,18 @@ mod tests {
             assert!(opaque_call(c), "{c}: {:?}", git_calls(c));
         }
         assert!(!opaque_call("exec 2>/dev/null; git status"));
+        // HOME may be changed by read, printf -v, or a loop: home-relative targets are unknown.
+        for c in ["HOME=/x; cd ~/r && git commit", "HOME=/x; cd && git commit"] {
+            assert!(git_commits(c)[0].dir_unknown, "{c}");
+        }
+        for c in [
+            "read HOME; cd ~/r && git commit",
+            "printf -v HOME %s /x; cd ~/r && git commit",
+            "for HOME in /x; do cd ~/r; done; git commit",
+            "for GIT_DIR in x/.git; do :; done; git commit",
+        ] {
+            assert!(opaque_call(c), "{c}");
+        }
         // Review: every stdin redirect of exec, namerefs, printf -vNAME, clustered set flags.
         for c in [
             "exec <<-EOF\n\tgit commit -m x\n\tEOF\ngit status",

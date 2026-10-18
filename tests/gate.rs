@@ -708,6 +708,17 @@ fn force_added_notes_in_an_ignored_vault_are_gated() {
     fs::write(repo.join("notes/n.md"), "# n\nedited [[m]]\n").unwrap();
     let out = s.pre_commit("git commit -am x");
     assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    // Force-adding an ignored folder in the same command as the commit is gated too.
+    let s = Setup::new("vault = \"notes\"\n");
+    let repo = s.repo();
+    fs::create_dir_all(repo.join("notes")).unwrap();
+    fs::write(repo.join(".gitignore"), "notes/\n").unwrap();
+    s.session_start("s1");
+    fs::write(repo.join("notes/n.md"), "# n\nnew\n").unwrap();
+    let out = s.pre_commit("git add -f notes && git commit -m x");
+    assert_eq!(code(&out), Some(2), "{}", stderr(&out));
+    let out = s.pre_commit("git add -A && git commit -m x");
+    assert_eq!(code(&out), Some(0), "{}", stderr(&out));
     // A new ignored note that is staged with -f is pending too.
     let s = Setup::standard();
     let repo = s.repo();
