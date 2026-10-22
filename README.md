@@ -352,13 +352,16 @@ block in the project's `CLAUDE.md` and the git hook do the checking. It adds:
 
 - The skill `link`: how to link the notes an agent writes (by meaning, both ways, with aliases),
   and to run `wikiknit check --changed` before committing.
-- A `PostToolUse` hook on `Read` and `Bash`. When the agent reads a vault note (with `Read`, or a
-  shell command that prints it: `cat`, `head`, `tail`, `sed -n`, `grep`, ...), the hook adds that
-  note's `stale` and `drift` findings next to what it read:
+- A `PostToolUse` hook on `Read` and `Bash` (and `PostToolUseFailure` on `Bash`, for a command
+  that printed a note and then exited non-zero). When the agent reads a vault note (with `Read`,
+  or a shell command that prints it: `cat`, `head`, `tail`, `sed -n`, `grep`, ..., after `cd`s,
+  with globs like `Projects/x/*.md`), the hook adds that note's `stale` and `drift` findings next
+  to what it read:
 
   ```text
   wikiknit: the vault note Projects/app/overview may be out of date.
   - drift (line 9): 16 commit(s) in ~/Repos/app since `verified_commit` 1a2b3c4 (HEAD 9f8e7d6, 2026-10-17). Fix: `git -C ...`
+  (Found by wikiknit from the note's frontmatter and the vault's wikiknit.toml.)
   ```
 
   It prints nothing when the note has no such finding, when the file is not a note of a vault

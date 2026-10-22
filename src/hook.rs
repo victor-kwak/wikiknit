@@ -331,14 +331,32 @@ fn glob(word: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
     found
 }
 
-/// `*` (any run) and `?` (one character) matching.
+/// `*` (any run) and `?` (one character) matching, in O(pattern x name): on a mismatch, only
+/// the last `*` takes one more character.
 fn wildcard(pattern: &[char], name: &[char]) -> bool {
-    match pattern.split_first() {
-        None => name.is_empty(),
-        Some(('*', rest)) => (0..=name.len()).any(|i| wildcard(rest, &name[i..])),
-        Some(('?', rest)) => !name.is_empty() && wildcard(rest, &name[1..]),
-        Some((c, rest)) => name.first() == Some(c) && wildcard(rest, &name[1..]),
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    p = sp + 1;
+                    n = sn + 1;
+                    star = Some((sp, sn + 1));
+                }
+                None => return false,
+            },
+        }
     }
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 /// A word as a path: `~/x` from home, `x` from `cwd`. `None` when it cannot be known.
@@ -593,6 +611,21 @@ mod tests {
         );
         assert_eq!(files("cat <x.md"), ["/w/x.md"]);
         assert_eq!(files("X=1 /usr/bin/cat x.md # cat no.md"), ["/w/x.md"]);
+    }
+
+    #[test]
+    fn wildcards() {
+        let m = |p: &str, n: &str| {
+            wildcard(
+                &p.chars().collect::<Vec<_>>(),
+                &n.chars().collect::<Vec<_>>(),
+            )
+        };
+        assert!(m("*.md", "a.md") && m("a?c*", "abcd") && m("**", "") && m("*a*b", "xaab"));
+        assert!(!m("*.md", "a.mdx") && !m("a?", "a") && !m("b*", "ab"));
+        // No backtracking blowup.
+        let long = "a".repeat(5000);
+        assert!(!m(&format!("{}b", "a*".repeat(50)), &long));
     }
 
     #[test]
