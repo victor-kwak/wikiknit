@@ -8,10 +8,12 @@ pub mod config;
 pub mod filter;
 pub mod git;
 pub mod graph;
+pub mod init;
 pub mod links;
 pub mod mentions;
 pub mod parse;
 pub mod rules;
+pub mod snippet;
 pub mod text;
 pub mod vault;
 

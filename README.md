@@ -5,6 +5,9 @@ keep as their memory. It finds what makes a vault mislead the agent that reads i
 links the vault's own rules require, notes that name another note without linking it, notes that
 fell behind the repository they describe, and resolved issues still listed as open.
 
+**Set it up:** ask your agent: "Set up wikiknit for this vault, following
+https://github.com/victor-kwak/wikiknit/blob/main/docs/agent-install.md"
+
 - **check**: broken links, wrong link style, unquoted links in frontmatter, links hidden in code or
   HTML, notes with no outgoing link, orphans, links your rules require (in either direction), links
   your rules forbid, stale notes, notes that drifted from their repository, aliases two notes share.
@@ -14,9 +17,35 @@ fell behind the repository they describe, and resolved issues still listed as op
 - **links**: the notes linked to or from a note, with the line each link is written on.
 - **catalog**: one line per note (id, type, tags, aliases, title, summary), to pick link targets.
 - **graph**: connected components with index ("hub") notes left out, so isolated clusters show up.
+- **init**: set a vault up: a starter `wikiknit.toml` and the git hooks.
+- **snippet**: the instructions for agents, for the project's `AGENTS.md` or `CLAUDE.md`.
 
 wikiknit reads the files directly (Obsidian does not need to run) and never edits notes: the agent
 does, with the fix wikiknit gives. It is fast: `check` on a 5,000-note vault takes about 0.2 s.
+
+## How it fits together
+
+```mermaid
+flowchart TB
+  subgraph setup["Setup (once per project; init again in each clone for .git/hooks)"]
+    U["User asks the agent to set up wikiknit"] --> A1["Agent follows docs/agent-install.md"]
+    A1 --> B["cargo install (from GitHub)"] --> I["wikiknit init"]
+    I --> C["wikiknit.toml: vault, link_style, hubs, ignore (only what the notes show)"]
+    I --> H["pre-commit + pre-merge-commit hooks in core.hooksPath or .git/hooks (a hook it did not write is left alone)"]
+    A1 --> S["wikiknit snippet --into AGENTS.md or CLAUDE.md"] --> F["Block between the wikiknit:start and wikiknit:end markers"]
+    A1 --> Q["Ask the user for rules: require_link, require_inbound, forbid_link, stale, drift"] --> C
+    A1 --> V["wikiknit check: report findings"]
+  end
+  subgraph work["Every session"]
+    L["Agent loads AGENTS.md or CLAUDE.md"] --> R["wikiknit check NOTE before relying on it: drift, stale"] --> E["Agent edits notes"] --> X["wikiknit check --changed and mentions --changed"]
+    X -->|findings: apply each fix| E
+    X -->|clean| G["git commit"] --> K{"Hook: check --staged. Does the commit add errors vs HEAD?"}
+    K -->|yes: blocked, each error with a fix| E
+    K -->|no| D["Committed (warnings never block)"]
+  end
+  F -.-> L
+  H -.-> K
+```
 
 ## Why it is small
 
@@ -37,9 +66,53 @@ when a commit adds an error, and it runs for every `git commit`, whoever runs it
 ## Install
 
 ```bash
-cargo install --git https://github.com/victor-kwak/wikiknit   # latest from GitHub
-cargo install --path .                                       # from a checkout
+cargo install --locked --git https://github.com/victor-kwak/wikiknit   # latest from GitHub
+cargo install --locked --path .                                       # from a checkout
 ```
+
+There are no prebuilt binaries yet. Then, from the project that holds the vault:
+
+```bash
+wikiknit init --dry-run          # what it would do
+wikiknit init                    # wikiknit.toml + git hooks; a second run changes nothing
+wikiknit snippet --into AGENTS.md    # or CLAUDE.md: the instructions for agents
+```
+
+`init` finds the vault (the folder with `.obsidian/`; without one it names the folder that holds
+the notes with `[[wikilinks]]` and stops: pass `--vault <folder>`) and its git repository. It
+keeps a `wikiknit.toml` that already names the vault (in the vault folder or above it). Else it
+writes one at the repository top with only what the notes show: `link_style` (`full-path`
+when at least 95% of the links to notes in folders give the full path, `shortest` when most give a
+shorter name, nothing when they are mixed; with fewer than 5 such links and none shorter, `full-path`
+when Obsidian's `newLinkFormat` is `absolute`), `hubs` (notes that link at least a quarter of the
+others, at least 5, and at least 3 times as many as the median note),
+and `ignore` for the templates folder (the one Obsidian's Templates or Templater plugin names,
+else a top-level `Templates/` or `_templates/`, any case). Each value comes with the reason in a comment. It writes no rules:
+add those yourself (see [Configure](#configure)).
+
+Then it installs `pre-commit` and `pre-merge-commit` hooks that run `wikiknit check --staged`
+(with `--config <path>` when the config is not at the repository top), in the folder git runs
+hooks from: `core.hooksPath` when the repository sets it, else `.git/hooks`. It does not
+overwrite:
+
+- An existing `wikiknit.toml` is kept as it is (`--config <file>` names one, or where a new one
+  goes).
+- A hook wikiknit did not write is left alone: `init` prints the line to add to it and exits 1
+  (for the pre-commit framework, husky, or lefthook, it names their config instead). The line runs
+  only where the config exists, so it is safe in a hooks folder other repositories share. A hook
+  that already runs this config's `wikiknit check --staged` is accepted.
+- A hook wikiknit wrote gets one line per config (a second vault in the repository adds a line).
+- `core.hooksPath` set in your global git config, or naming a folder outside the repository, is
+  shared with other repositories: `init` does not write there (exit 1, with the line to add).
+- Outside a git repository it writes the config in the vault folder and skips the hooks.
+- The config is written beside its place, loaded, then moved in: a config that does not load is
+  never left behind.
+
+`.git/hooks` is not committed: in a new clone, run `wikiknit init` again.
+
+`snippet` prints the agent instructions of this version between `<!-- wikiknit:start -->` and
+`<!-- wikiknit:end -->`; `--into <file>` puts them in that file: it replaces the block when the file
+has one, else adds it at the end. Run it again after an upgrade.
 
 ## Use
 
@@ -97,12 +170,14 @@ the `wikiknit.toml` in or above that folder that names it as its vault, else def
 
 ## Git pre-commit hook
 
+`wikiknit init` installs this as `pre-commit` and `pre-merge-commit`. To write it yourself:
+
 ```sh
 #!/bin/sh
 # .git/hooks/pre-commit (chmod +x), or a tracked .githooks/pre-commit with
 # `git config core.hooksPath .githooks`. Copy it to pre-merge-commit too.
 command -v wikiknit >/dev/null 2>&1 || { echo "wikiknit is not on PATH; vault not checked" >&2; exit 0; }
-exec wikiknit check --staged
+wikiknit check --staged || exit $?
 ```
 
 Git runs hooks at the top of the work tree. When `wikiknit.toml` is not there (it is in the vault
@@ -237,9 +312,10 @@ longer domain (`www.example.com.au`).
 
 ## Claude Code plugin
 
-This repo is also a Claude Code plugin marketplace. The plugin adds one skill, `link`: how to link
-the notes an agent writes (by meaning, both ways, with aliases), and to run `wikiknit check
---changed` before committing. It adds no hooks: the git pre-commit hook does the checking.
+This repo is also a Claude Code plugin marketplace. The plugin is optional: the `wikiknit snippet`
+block in the project's `CLAUDE.md` and the git hook do the checking. It adds one skill, `link`: how
+to link the notes an agent writes (by meaning, both ways, with aliases), and to run `wikiknit check
+--changed` before committing. It adds no hooks.
 
 ```bash
 claude plugin marketplace add victor-kwak/wikiknit   # or a local checkout path

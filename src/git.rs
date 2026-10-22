@@ -12,7 +12,7 @@ use crate::Error;
 
 /// Environment variables that point git at a repository. A git hook runs with some of them
 /// set (`GIT_DIR`, and `GIT_INDEX_FILE`, often relative to the work-tree top).
-const REPO_ENV: &[&str] = &[
+pub(crate) const REPO_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -65,7 +65,7 @@ fn base(dir: &Path) -> Command {
 
 /// git for a repository found from `dir` alone: nothing from the environment's repository
 /// leaks in (another repository for `drift`, or the vault's own while it is being found).
-fn other(dir: &Path) -> Command {
+pub(crate) fn other(dir: &Path) -> Command {
     let mut cmd = base(dir);
     for var in REPO_ENV {
         cmd.env_remove(var);
@@ -73,7 +73,7 @@ fn other(dir: &Path) -> Command {
     cmd
 }
 
-fn run(mut cmd: Command, what: &str) -> Result<Vec<u8>, Error> {
+pub(crate) fn run(mut cmd: Command, what: &str) -> Result<Vec<u8>, Error> {
     let out = cmd
         .stderr(Stdio::piped())
         .output()

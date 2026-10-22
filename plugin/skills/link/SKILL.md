@@ -34,4 +34,10 @@ Warnings, and what to do:
 - `stale`: a date such as `last_verified` is past its limit. Update it only if you checked the note against its source in this task.
 - `drift`: the repository a project note describes has commits since its `verified_commit`. Before you rely on the note, read the `git log` the fix gives and update what changed; then set `verified_commit` to the new head.
 
-A git pre-commit hook may run `wikiknit check --staged`. If it blocks a commit, it printed the errors that commit adds: fix them, stage the fixes, and commit again.
+A git pre-commit hook (installed by `wikiknit init`) runs `wikiknit check --staged`. If it blocks a commit, it printed the errors that commit adds: fix them, stage the fixes, and commit again.
+
+## Other folders, and setup
+
+- wikiknit finds `wikiknit.toml` in the current folder and its parents. From another folder or repository, name it: `wikiknit --config <path>/wikiknit.toml check ...`.
+- Before you rely on a note about a repository or a live system, run `wikiknit check <note>`: it reports `drift` and `stale` for that note.
+- No `wikiknit.toml` yet: follow https://github.com/victor-kwak/wikiknit/blob/main/docs/agent-install.md (`wikiknit init`, then `wikiknit snippet --into CLAUDE.md`).

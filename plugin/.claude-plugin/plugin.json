@@ -1,8 +1,8 @@
 {
   "name": "wikiknit",
   "displayName": "wikiknit",
-  "version": "0.7.1",
-  "description": "Linting for a Markdown vault an AI agent keeps as memory: the link skill tells the agent how to link the notes it writes and to run `wikiknit check --changed` before committing. No hooks; pair it with a git pre-commit hook running `wikiknit check --staged`. Needs the wikiknit CLI on PATH.",
+  "version": "0.8.0",
+  "description": "Linting for a Markdown vault an AI agent keeps as memory: the link skill tells the agent how to link the notes it writes and to run `wikiknit check --changed` before committing. No hooks; `wikiknit init` installs the git pre-commit hook that runs `wikiknit check --staged`. Needs the wikiknit CLI on PATH.",
   "author": {
     "name": "Victor Kwak"
   },

@@ -154,6 +154,25 @@ enum Command {
     },
     /// Link graph summary: isolated notes and components, hub notes excluded.
     Graph,
+    /// Set a vault up for checking: find the vault and its git repository, write a starter
+    /// wikiknit.toml with what the vault shows (link style, index notes, templates folder), and
+    /// install the pre-commit and pre-merge-commit hooks that run `wikiknit check --staged`.
+    /// Never overwrites: an existing config is kept, and a hook wikiknit did not write is left
+    /// alone (it prints the line to add). A second run changes nothing. Exit 1 when a step needs
+    /// you. `--vault` names the vault; `--config` where the config is or goes.
+    Init {
+        /// Print what would change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print the agent instructions for this version, between `<!-- wikiknit:start -->` and
+    /// `<!-- wikiknit:end -->`, for the project's instruction file (AGENTS.md, CLAUDE.md, ...).
+    Snippet {
+        /// Write the block into this file instead: replace the block between the markers, or
+        /// add it at the end (the file is created if missing).
+        #[arg(long, value_name = "FILE")]
+        into: Option<PathBuf>,
+    },
     /// Removed in 0.7 (the Claude Code hooks). Kept as a no-op that exits 0, so a session
     /// whose plugin still has the old hooks is not blocked by an unknown subcommand.
     #[command(hide = true)]
@@ -477,7 +496,54 @@ fn opt(s: Option<&String>) -> String {
     s.cloned().unwrap_or_default()
 }
 
+fn init(cli: &Cli, dry_run: bool) -> Result<ExitCode> {
+    if cli.format == Format::Json {
+        bail!("init prints text only");
+    }
+    let report = wikiknit::init::run(&wikiknit::init::Options {
+        cwd: std::env::current_dir()?,
+        vault: cli.vault.clone(),
+        config: cli.config.clone(),
+        dry_run,
+    })?;
+    for line in &report.lines {
+        out!("{line}");
+    }
+    if !report.next.is_empty() {
+        out!("\nNext:");
+        for (i, step) in report.next.iter().enumerate() {
+            out!("{}. {step}", i + 1);
+        }
+    }
+    Ok(if report.incomplete {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn snippet(into: Option<&std::path::Path>) -> Result<ExitCode> {
+    use wikiknit::snippet::{self, Outcome};
+    let Some(path) = into else {
+        print!("{}", snippet::text());
+        return Ok(ExitCode::SUCCESS);
+    };
+    let what = match snippet::write_into(path)? {
+        Outcome::Created => "created with the wikiknit block",
+        Outcome::Appended => "wikiknit block added at the end",
+        Outcome::Replaced => "wikiknit block replaced",
+        Outcome::Unchanged => "wikiknit block already current; not changed",
+    };
+    out!("{}: {what}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run(cli: Cli) -> Result<ExitCode> {
+    match &cli.command {
+        Command::Init { dry_run } => return init(&cli, *dry_run),
+        Command::Snippet { into } => return snippet(into.as_deref()),
+        _ => {}
+    }
     let config = load_config(&cli)?;
     // `--changed`/`--staged` read their own copies of the vault.
     let since = match &cli.command {
@@ -645,6 +711,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Hook { .. } => unreachable!("handled in main"),
+        Command::Init { .. } | Command::Snippet { .. } => unreachable!("handled above"),
         Command::Graph => {
             let vault = vault();
             let r = graph::report(vault);
