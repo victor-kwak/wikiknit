@@ -52,18 +52,17 @@ writes only what the notes show and never overwrites a config or a hook it did n
 
 ## Why it is small
 
-wikiknit used to search the vault (BM25 plus local embeddings), build token-budgeted context packs,
-suggest links, and gate commits from Claude Code's Bash tool until a "link pass" was recorded. An
-evaluation on a real 72-note agent vault (2026-10) removed all of that:
+wikiknit does not search the vault, build context packs, suggest links, or hold an agent's work
+until it confirms a link pass. Each was tested with agents and did not earn its place:
 
-- Reading the vault with plain Grep and Read answered recall questions as well as the context packs,
-  with fewer tokens. Half of each pack was noise, and one pack cut off the section with the answer.
-- Agents ignored the link suggestions, and cleared every commit hold by recording the pass without
-  changing a link. The gate enforced a ritual, not link quality, and it cost most of the code.
-- What did mislead agents were stale notes that contradicted themselves. `drift` and `forbid_link`
-  catch the kinds of staleness that can be found without guessing.
+- An agent's own search and read tools answer recall questions as well as a ranked context pack,
+  with fewer tokens and no risk of cutting off the part that holds the answer.
+- Agents skip link suggestions, and they clear a "confirm your link pass" gate without changing a
+  link. Such a gate enforces a step, not link quality.
+- What misleads agents is stale notes that contradict themselves. `drift` and `forbid_link` catch
+  the kinds of staleness that can be found without guessing.
 
-What stays is deterministic: each check finds a real defect or stays quiet. The git hook blocks only
+What wikiknit does is deterministic: each check finds a real defect or stays quiet. The git hook blocks only
 when a commit adds an error, and it runs for every `git commit`, whoever runs it.
 
 ## Install
