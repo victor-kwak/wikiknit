@@ -76,11 +76,12 @@ curl -fsSL https://raw.githubusercontent.com/victor-kwak/wikiknit/main/install.s
 ```
 
 `WIKIKNIT_VERSION=v0.8.1` pins a release; `WIKIKNIT_INSTALL_DIR` picks the folder. Windows: the
-`.zip` on the [releases page](https://github.com/victor-kwak/wikiknit/releases). From source:
+`.zip` on the [releases page](https://github.com/victor-kwak/wikiknit/releases). With Rust:
 
 ```bash
-cargo install --locked --git https://github.com/victor-kwak/wikiknit   # latest from GitHub
-cargo install --locked --path .                                       # from a checkout
+cargo binstall wikiknit                                               # the release binary, via cargo-binstall
+cargo install --locked wikiknit                                       # build from crates.io
+cargo install --locked --git https://github.com/victor-kwak/wikiknit   # build the latest main
 ```
 
 Then, from the project that holds the vault:

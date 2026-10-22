@@ -38,7 +38,7 @@ https://github.com/victor-kwak/wikiknit/releases and put `wikiknit.exe` in a fol
 another platform, or if the user prefers building from source and has Rust:
 
 ```bash
-cargo install --locked --git https://github.com/victor-kwak/wikiknit
+cargo install --locked wikiknit
 ```
 
 Do not install Rust without the user's consent. Make sure the folder holding `wikiknit` is on
