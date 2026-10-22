@@ -1,4 +1,4 @@
-//! Small text helpers shared by catalog, search, and links.
+//! Small text helpers shared by catalog and links.
 
 use std::sync::LazyLock;
 

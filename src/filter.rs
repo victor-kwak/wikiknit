@@ -1,4 +1,4 @@
-//! Note filters shared by `catalog`, `search`, and `links`.
+//! Note filters shared by `catalog` and `links`.
 
 use regex::Regex;
 use serde_json::Value;
