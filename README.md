@@ -27,25 +27,28 @@ does, with the fix wikiknit gives. It is fast: `check` on a 5,000-note vault tak
 
 ```mermaid
 flowchart TB
-  subgraph setup["Setup (once per project; init again in each clone for .git/hooks)"]
-    U["User asks the agent to set up wikiknit"] --> A1["Agent follows docs/agent-install.md"]
-    A1 --> B["cargo install (from GitHub)"] --> I["wikiknit init"]
-    I --> C["wikiknit.toml: vault, link_style, hubs, ignore (only what the notes show)"]
-    I --> H["pre-commit + pre-merge-commit hooks in core.hooksPath or .git/hooks (a hook it did not write is left alone)"]
-    A1 --> S["wikiknit snippet --into AGENTS.md or CLAUDE.md"] --> F["Block between the wikiknit:start and wikiknit:end markers"]
-    A1 --> Q["Ask the user for rules: require_link, require_inbound, forbid_link, stale, drift"] --> C
-    A1 --> V["wikiknit check: report findings"]
+  subgraph setup["Setup: once per project, by an agent following docs/agent-install.md"]
+    direction LR
+    B["cargo install"] --> I["wikiknit init"]
+    I --> C["wikiknit.toml<br/>(what the notes show)"]
+    I --> H["pre-commit and<br/>pre-merge-commit hooks"]
+    Q["Rules the user confirms"] --> C
+    S["wikiknit snippet<br/>--into AGENTS.md"] --> F["Instruction file<br/>(between markers)"]
   end
   subgraph work["Every session"]
-    L["Agent loads AGENTS.md or CLAUDE.md"] --> R["wikiknit check NOTE before relying on it: drift, stale"] --> E["Agent edits notes"] --> X["wikiknit check --changed and mentions --changed"]
-    X -->|findings: apply each fix| E
-    X -->|clean| G["git commit"] --> K{"Hook: check --staged. Does the commit add errors vs HEAD?"}
-    K -->|yes: blocked, each error with a fix| E
-    K -->|no| D["Committed (warnings never block)"]
+    direction LR
+    L["Agent reads the<br/>instruction file"] --> R["wikiknit check NOTE<br/>(drift, stale)"] --> E["Agent edits notes"] --> X["check --changed<br/>mentions --changed"]
+    X -->|"findings: apply fix"| E
+    X -->|clean| G["git commit"] --> K{"Hook: check --staged.<br/>New errors vs HEAD?"}
+    K -->|"yes: blocked"| E
+    K -->|no| D["Committed<br/>(warnings never block)"]
   end
   F -.-> L
   H -.-> K
 ```
+
+`init` writes only what the notes show and never overwrites a config or a hook it did not write;
+hooks in `.git/hooks` are per clone (run `init` again there). Details: [Install](#install).
 
 ## Why it is small
 

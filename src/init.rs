@@ -282,8 +282,19 @@ fn templates_folder(vault: &Path) -> Option<(String, String)> {
     Some((dir, "a top-level templates folder".into()))
 }
 
+/// `s` as a one-line TOML basic string.
 fn toml_str(s: &str) -> String {
-    toml::Value::String(s.to_string()).to_string()
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// What the vault shows: the settings to write, and notes on what it could not tell.
@@ -385,6 +396,13 @@ fn infer(vault_dir: &Path) -> Result<(Vec<Setting>, Vec<String>), Error> {
     Ok((settings, unset))
 }
 
+/// `s` on one line: a note name with a line break must not end a TOML comment early.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// The starter config text.
 fn config_text(vault_rel: &str, settings: &[Setting]) -> String {
     let mut out = format!(
@@ -396,7 +414,7 @@ fn config_text(vault_rel: &str, settings: &[Setting]) -> String {
         toml_str(vault_rel)
     );
     for s in settings {
-        out.push_str(&format!("\n# {}\n{}\n", s.why, s.toml));
+        out.push_str(&format!("\n# {}\n{}\n", one_line(&s.why), s.toml));
     }
     out
 }
@@ -847,7 +865,7 @@ pub fn run(opts: &Options) -> Result<Report, Error> {
             for s in &settings {
                 report
                     .lines
-                    .push(format!("          {}  # {}", s.toml, s.why));
+                    .push(format!("          {}  # {}", s.toml, one_line(&s.why)));
             }
             for u in &unset {
                 report.lines.push(format!("          {u}"));

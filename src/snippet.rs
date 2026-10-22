@@ -114,6 +114,28 @@ pub fn splice(existing: &str, block: &str) -> Result<(String, bool), String> {
 /// Put this version's block into the instruction file at `path` (created if missing).
 pub fn write_into(path: &Path) -> Result<Outcome, Error> {
     let block = text();
+    // A symlinked instruction file (`CLAUDE.md` -> `AGENTS.md`) is written at its target, but
+    // only a target in the link's own folder or below: a cloned repository's `CLAUDE.md` must
+    // not lead the write to `~/.bashrc`.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let inside = path
+            .canonicalize()
+            .ok()
+            .zip(dir.canonicalize().ok())
+            .is_some_and(|(real, dir)| real.starts_with(dir));
+        if !inside {
+            return Err(Error::Config {
+                path: path.to_path_buf(),
+                message: "a link to a file outside its folder (or to nothing); not changed: \
+                          name the file itself"
+                    .into(),
+            });
+        }
+    }
     let existing = match std::fs::read(path) {
         Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| Error::Config {
             path: path.to_path_buf(),

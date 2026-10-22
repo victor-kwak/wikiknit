@@ -974,3 +974,47 @@ fn snippet_writes_through_a_symlinked_file() {
             .contains("wikiknit:start")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn snippet_does_not_follow_a_link_out_of_its_folder() {
+    let s = Sandbox::new();
+    let w = s.work();
+    let outside = s.dir.path().join("bashrc");
+    fs::write(&outside, "export X=1\n").unwrap();
+    std::os::unix::fs::symlink(&outside, w.join("CLAUDE.md")).unwrap();
+    let out = s.wk(&w, &["snippet", "--into", "CLAUDE.md"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("outside its folder"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "export X=1\n");
+}
+
+/// A note name with a line break cannot add a line of TOML to the config.
+#[cfg(unix)]
+#[test]
+fn init_keeps_note_names_inside_config_comments() {
+    let s = Sandbox::new();
+    let w = s.work();
+    s.git(&w, &["init", "-q", "-b", "main"]);
+    write(&w, "v/.obsidian/app.json", "{}");
+    let evil = "x\nvault = \"..\"\n#";
+    let mut index = String::from("# hub\n");
+    for i in 0..8 {
+        write(&w, &format!("v/n{i}.md"), &format!("# n{i}\n[[{evil}]]\n"));
+        index.push_str(&format!("[[n{i}]] "));
+    }
+    write(&w, &format!("v/{evil}.md"), &format!("{index}\n"));
+    let out = s.wk(&w, &["init"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let config = fs::read_to_string(w.join("wikiknit.toml")).unwrap();
+    let table: toml::Table = config.parse().unwrap();
+    assert_eq!(table["vault"].as_str(), Some("v"), "{config}");
+    assert!(
+        config.lines().filter(|l| l.starts_with("vault")).count() == 1,
+        "{config}"
+    );
+}
