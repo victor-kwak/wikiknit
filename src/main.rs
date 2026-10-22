@@ -189,7 +189,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Command::Hook { args } = &cli.command {
         if args.first().is_some_and(|a| a == "read") {
-            // A panic is caught too: a hook that fails shows the user an error notice.
+            // A panic is caught too, without its message: the hook exits 0 with nothing on
+            // stderr whatever happens.
+            std::panic::set_hook(Box::new(|_| {}));
             let _ = std::panic::catch_unwind(read_hook);
         }
         return ExitCode::SUCCESS;

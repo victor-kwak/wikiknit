@@ -74,7 +74,8 @@ fn report(paths: &[PathBuf]) -> Option<String> {
         }
         let cfg = configs
             .entry(config_file.clone())
-            .or_insert_with(|| Config::load(&config_file).ok());
+            // Quietly: notes about removed keys belong to `check`, not to every read.
+            .or_insert_with(|| Config::load_with(&config_file, false).ok());
         let Some(cfg) = cfg.as_ref() else { continue };
         let Some(note) = load_note(cfg, &path) else {
             continue;
@@ -89,18 +90,47 @@ fn report(paths: &[PathBuf]) -> Option<String> {
         }
         text.push_str(&block);
     }
-    (!text.is_empty()).then_some(text)
+    (!text.is_empty()).then(|| {
+        format!(
+            "{text}(Found by wikiknit from the note's frontmatter and the vault's wikiknit.toml.)"
+        )
+    })
 }
 
+/// The findings as text. Messages and fixes hold text from the note's frontmatter and the
+/// vault's `wikiknit.toml` (a repository path, a `fix`): each is one line, without control
+/// characters, cut at `MAX_FIELD`, so a vault cannot shape the context the agent gets beyond
+/// what reading the note already shows it.
 fn describe(id: &str, found: &[Finding]) -> String {
-    let mut s = format!("wikiknit: the vault note {id} may be out of date.\n");
+    let mut s = format!(
+        "wikiknit: the vault note {} may be out of date.\n",
+        one_line(id)
+    );
     for f in found {
         s.push_str(&format!(
             "- {} (line {}): {}. Fix: {}\n",
-            f.rule, f.line, f.message, f.fix
+            f.rule,
+            f.line,
+            one_line(&f.message),
+            one_line(&f.fix)
         ));
     }
     s
+}
+
+/// Longest message or fix text kept, in characters.
+const MAX_FIELD: usize = 400;
+
+fn one_line(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_FIELD)
+        .collect();
+    if s.chars().count() > MAX_FIELD {
+        out.push_str("...");
+    }
+    out
 }
 
 /// A Markdown file that exists, with the `wikiknit.toml` found from its folder upward (to the
@@ -127,12 +157,9 @@ fn load_note(cfg: &Config, path: &Path) -> Option<Note> {
     if !real.starts_with(&cfg.vault) {
         return None;
     }
-    // The id comes from the path the vault walk would take: the path as given when it is
-    // inside the vault, else the real one.
-    let rel = path
-        .strip_prefix(&cfg.vault)
-        .ok()
-        .or_else(|| real.strip_prefix(&cfg.vault).ok())?;
+    // The real path is the note: the vault walk reads a symlink to a note as a file, and
+    // checks the note it points to.
+    let rel = real.strip_prefix(&cfg.vault).ok()?;
     let mut parts = Vec::new();
     for c in rel.components() {
         let Component::Normal(p) = c else { return None };
@@ -146,7 +173,8 @@ fn load_note(cfg: &Config, path: &Path) -> Option<Note> {
     if cfg.is_ignored(&rel) {
         return None;
     }
-    let text = std::fs::read_to_string(&real).ok()?;
+    let bytes = std::fs::read(&real).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     let id = &rel[..rel.len() - 3];
     Some(Note::from_text(id, real, text))
 }
@@ -170,20 +198,38 @@ fn lexical(path: &Path) -> Option<PathBuf> {
 }
 
 /// The `.md` files a shell command prints: arguments of `cat`, `head`, `sed`, `grep`, ...
-/// (not redirect targets, not `sed -i`), resolved from `cwd` and the `cd`s before them.
-/// Heredoc bodies are skipped. Words with `$`, globs, or backquotes are not guessed at.
+/// (not redirect targets, not `sed -i`), resolved from `cwd` and the `cd`s before them, with
+/// globs in the last component expanded. Heredoc bodies are skipped. Words with `$` or
+/// backquotes are not guessed at.
 #[must_use]
 pub fn printed_files(command: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut cwd = cwd.map(Path::to_path_buf);
+    // The folder outside each subshell `( ... )` we are in: a `cd` inside one ends with it.
+    let mut outer = Vec::new();
     let mut out = Vec::new();
     for words in simple_commands(command) {
+        match words.first().map(String::as_str) {
+            Some(SUBSHELL_START) => {
+                outer.push(cwd.clone());
+                continue;
+            }
+            Some(SUBSHELL_END) => {
+                if let Some(c) = outer.pop() {
+                    cwd = c;
+                }
+                continue;
+            }
+            _ => {}
+        }
         let Some((name, args)) = command_name(&words) else {
             continue;
         };
         if name == "cd" || name == "pushd" {
-            cwd = match args.iter().find(|a| !a.starts_with('-')) {
+            cwd = match args.iter().find(|a| !a.starts_with('-') || *a == "-") {
                 None => home.clone(),
+                // `cd -`: the previous folder is not known.
+                Some(dir) if dir == "-" => None,
                 Some(dir) => expand(dir, cwd.as_deref(), home.as_deref()),
             };
             continue;
@@ -191,39 +237,55 @@ pub fn printed_files(command: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
         if !PRINTERS.contains(&name) {
             continue;
         }
-        // `sed -i` writes the file; `grep -l`/`-c`/`-q` print no line of it.
+        // `sed -i` and `awk -i inplace` write the file; `grep -l`/`-c`/`-q` print no line of it.
+        let long = ["--count", "--files-with", "--quiet", "--silent"];
         let silent = match name {
             "sed" => has_flag(args, &['i'], &["--in-place"]),
-            "grep" | "egrep" | "rg" => has_flag(
-                args,
-                &['c', 'l', 'L', 'q'],
-                &["--count", "--files-with", "--quiet", "--silent"],
-            ),
+            "awk" => args.iter().any(|a| a.ends_with("inplace")),
+            "grep" | "egrep" => has_flag(args, &['c', 'l', 'L', 'q'], &long),
+            // `rg -L` follows symlinks.
+            "rg" => has_flag(args, &['c', 'l', 'q'], &long),
             _ => false,
         };
         if silent {
             continue;
         }
-        let mut redirect = false;
+        // grep's first operand is its pattern, unless `-e`/`-f` give it (and their argument
+        // is a pattern or a pattern file, not a file it prints).
+        let searcher = matches!(name, "grep" | "egrep" | "rg");
+        let mut pattern_left = searcher
+            && !has_flag(args, &['e', 'f'], &["--regexp", "--file"])
+            && !args.iter().any(|a| a == "-e" || a == "-f");
+        let mut skip = false;
         for a in args {
-            if redirect {
-                redirect = false;
+            if skip {
+                skip = false;
                 continue;
             }
             // `> f`, `2>> f`, `&> f`: the next word is written, not read. `>f` is one word.
+            // `<<< word`: the word is input text.
             let bare = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-            if bare == ">" || bare == ">>" {
-                redirect = true;
+            if bare == ">" || bare == ">>" || a == "<<<" || (searcher && (a == "-e" || a == "-f")) {
+                skip = true;
                 continue;
             }
             if bare.starts_with('>') {
                 continue;
             }
             let a = a.strip_prefix('<').unwrap_or(a);
-            if a.starts_with('-') || !a.to_ascii_lowercase().ends_with(".md") {
+            if a.starts_with('-') {
                 continue;
             }
-            if let Some(p) = expand(a, cwd.as_deref(), home.as_deref()) {
+            if pattern_left {
+                pattern_left = false;
+                continue;
+            }
+            if !a.to_ascii_lowercase().ends_with(".md") {
+                continue;
+            }
+            if a.contains(['*', '?']) {
+                out.extend(glob(a, cwd.as_deref(), home.as_deref()));
+            } else if let Some(p) = expand(a, cwd.as_deref(), home.as_deref()) {
                 out.push(p);
             }
         }
@@ -238,6 +300,45 @@ fn has_flag(args: &[String], short: &[char], long: &[&str]) -> bool {
         Some(_) => long.iter().any(|f| a.starts_with(f)),
         None => a.starts_with('-') && a[1..].chars().any(|c| short.contains(&c)),
     })
+}
+
+/// The files a glob names, as the shell would expand it: `*` and `?` in the last component
+/// only (`Projects/x/*.md`), hidden files only for a pattern that starts with `.`.
+fn glob(word: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let (dir, pattern) = word.rsplit_once('/').unwrap_or(("", word));
+    if dir.contains(['*', '?']) {
+        return Vec::new();
+    }
+    let dir = if dir.is_empty() && !word.starts_with('/') {
+        cwd.map(Path::to_path_buf)
+    } else {
+        expand(if dir.is_empty() { "/" } else { dir }, cwd, home)
+    };
+    let Some(Ok(entries)) = dir.as_ref().map(std::fs::read_dir) else {
+        return Vec::new();
+    };
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name: Vec<char> = e.file_name().to_string_lossy().chars().collect();
+            (pattern.first() == Some(&'.') || name.first() != Some(&'.'))
+                && wildcard(&pattern, &name)
+        })
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    found
+}
+
+/// `*` (any run) and `?` (one character) matching.
+fn wildcard(pattern: &[char], name: &[char]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some(('*', rest)) => (0..=name.len()).any(|i| wildcard(rest, &name[i..])),
+        Some(('?', rest)) => !name.is_empty() && wildcard(rest, &name[1..]),
+        Some((c, rest)) => name.first() == Some(c) && wildcard(rest, &name[1..]),
+    }
 }
 
 /// A word as a path: `~/x` from home, `x` from `cwd`. `None` when it cannot be known.
@@ -280,8 +381,14 @@ fn command_name(words: &[String]) -> Option<(&str, &[String])> {
     None
 }
 
+/// Pseudo-commands `simple_commands` gives for `(` and `)`.
+const SUBSHELL_START: &str = "(";
+const SUBSHELL_END: &str = ")";
+
 /// Split a shell command into simple commands (at `;`, `&&`, `||`, `|`, `&`, newlines,
-/// parentheses, braces), each a list of words with quotes removed. Heredoc bodies and comments
+/// parentheses, braces), each a list of words with quotes removed; `(` and `)` also come as
+/// commands of their own (`SUBSHELL_START`, `SUBSHELL_END`), so a `cd` in a subshell ends with
+/// it. Heredoc bodies and comments
 /// are dropped. A best effort: no expansion, no nested quoting rules beyond `'`, `"`, `\`.
 #[must_use]
 pub fn simple_commands(command: &str) -> Vec<Vec<String>> {
@@ -388,6 +495,11 @@ pub fn simple_commands(command: &str) -> Vec<Vec<String>> {
                 if !words.is_empty() {
                     cmds.push(std::mem::take(&mut words));
                 }
+                if c == '(' {
+                    cmds.push(vec![SUBSHELL_START.to_string()]);
+                } else if c == ')' {
+                    cmds.push(vec![SUBSHELL_END.to_string()]);
+                }
                 if c == '\n' && !pending.is_empty() {
                     // Skip each heredoc body, in order, up to its delimiter line.
                     for (delim, strip) in pending.drain(..) {
@@ -459,9 +571,22 @@ mod tests {
             files("grep -c a x.md; grep -rl a y.md; rg --files-with-matches a z.md").is_empty()
         );
         assert_eq!(files("grep -in a x.md"), ["/w/x.md"]);
+        // grep's pattern, `-e`/`-f` arguments, and here-strings are not files it prints.
+        assert!(
+            files("grep -rn \"notes/old.md\" .; grep -f p.md x.txt; grep a <<< b.md").is_empty()
+        );
+        assert_eq!(files("grep -e old.md -n x.md y.txt"), ["/w/x.md"]);
+        assert_eq!(files("rg -L foo x.md"), ["/w/x.md"]);
+        assert!(files("awk -i inplace 1 x.md").is_empty());
+        // A `cd` in a subshell ends with it; after `cd -` the folder is unknown.
+        assert_eq!(
+            files("(cd /s && cat a.md); cat b.md"),
+            ["/s/a.md", "/w/b.md"]
+        );
+        assert!(files("cd /s; cd -; cat c.md").is_empty());
         assert!(files("cat a.md >> b.md").contains(&"/w/a.md".to_string()));
         assert!(!files("cat a.md >> b.md").contains(&"/w/b.md".to_string()));
-        assert!(files("git add x.md; echo y.md; cat $D/x.md *.md").is_empty());
+        assert!(files("git add x.md; echo y.md; cat $D/x.md").is_empty());
         assert_eq!(
             files("python3 - <<'PY'\nopen('cat z.md')\nPY\ncat after.md"),
             ["/w/after.md"]
@@ -478,7 +603,9 @@ mod tests {
                 vec!["a".to_string(), "b c".into(), "d\"e".into()],
                 vec!["f".into()],
                 vec!["g".into()],
+                vec!["(".into()],
                 vec!["h".into()],
+                vec![")".into()],
             ]
         );
         assert_eq!(

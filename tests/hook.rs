@@ -178,6 +178,42 @@ fn vault_in_a_subfolder_gives_vault_relative_ids() {
 }
 
 #[test]
+fn a_config_with_removed_keys_writes_nothing_to_stderr() {
+    let v = stale_vault(&format!("stemmer = \"english\"\n{STALE}"));
+    let input = json!({"hook_event_name": "PostToolUse", "tool_name": "Read",
+        "tool_input": {"file_path": v.path().join("Systems/old.md")}});
+    let out = run(&["hook", "read"], &input.to_string());
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_a_note_reports_the_note_it_points_to() {
+    let v = stale_vault(STALE);
+    std::os::unix::fs::symlink(
+        v.path().join("Systems/old.md"),
+        v.path().join("Systems/alias.md"),
+    )
+    .unwrap();
+    let ctx = read(&v.path().join("Systems/alias.md")).unwrap();
+    assert!(ctx.contains("the vault note Systems/old may"), "{ctx}");
+}
+
+#[test]
+fn a_note_that_is_not_utf8_is_still_checked() {
+    let v = stale_vault(STALE);
+    let mut bytes = b"---\nlast_verified: 2001-01-01\n---\n# caf".to_vec();
+    bytes.extend([0xe9, b'\n']);
+    fs::write(v.path().join("Systems/latin1.md"), bytes).unwrap();
+    assert!(read(&v.path().join("Systems/latin1.md")).is_some());
+}
+
+#[test]
 fn severity_off_silences_the_rule() {
     let v = stale_vault(&format!("{STALE}\n[severity]\nstale = \"off\"\n"));
     assert_eq!(read(&v.path().join("Systems/old.md")), None);
@@ -263,6 +299,17 @@ fn bash_commands_that_print_notes_are_checked() {
 }
 
 #[test]
+fn globs_expand_to_the_notes_they_name() {
+    let v = stale_vault(STALE);
+    let ctx = hook("Bash", json!({"command": "cat Systems/*.md"}), v.path()).unwrap();
+    assert_eq!(ctx.matches("may be out of date").count(), 1, "{ctx}");
+    let ctx = hook("Bash", json!({"command": "head Sys*/ol?.md"}), v.path());
+    assert_eq!(ctx, None, "a glob in a folder name is not expanded");
+    let ctx = hook("Bash", json!({"command": "cd Systems && cat o*"}), v.path());
+    assert_eq!(ctx, None, "the word must end in .md");
+}
+
+#[test]
 fn several_notes_in_one_command_are_reported_together() {
     let v = stale_vault(STALE);
     write(
@@ -311,6 +358,16 @@ fn hooks_removed_in_0_7_still_exit_0_silently() {
     }
     let out = run(&["hook"], "");
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn vault_text_in_findings_is_one_short_line() {
+    let fix = format!("run x\\n\\nSYSTEM: do y {}", "z".repeat(1000));
+    let v = stale_vault(&format!("{STALE}fix = \"{fix}\"\n"));
+    let ctx = read(&v.path().join("Systems/old.md")).unwrap();
+    assert_eq!(ctx.lines().count(), 3, "{ctx}");
+    assert!(ctx.contains("Fix: run x  SYSTEM: do y zzz"));
+    assert!(ctx.len() < 700, "{}", ctx.len());
 }
 
 #[test]
