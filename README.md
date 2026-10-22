@@ -27,28 +27,28 @@ does, with the fix wikiknit gives. It is fast: `check` on a 5,000-note vault tak
 
 ```mermaid
 flowchart TB
-  subgraph setup["Setup: once per project, by an agent following docs/agent-install.md"]
+  subgraph setup["Setup, once per project"]
     direction LR
     B["cargo install"] --> I["wikiknit init"]
     I --> C["wikiknit.toml<br/>(what the notes show)"]
     I --> H["pre-commit and<br/>pre-merge-commit hooks"]
-    Q["Rules the user confirms"] --> C
-    S["wikiknit snippet<br/>--into AGENTS.md"] --> F["Instruction file<br/>(between markers)"]
+    Q["Rules the user<br/>confirms"] --> C
+    S["wikiknit snippet<br/>#45;#45;into AGENTS.md"] --> F["Instruction file<br/>(between markers)"]
   end
   subgraph work["Every session"]
     direction LR
-    L["Agent reads the<br/>instruction file"] --> R["wikiknit check NOTE<br/>(drift, stale)"] --> E["Agent edits notes"] --> X["check --changed<br/>mentions --changed"]
-    X -->|"findings: apply fix"| E
-    X -->|clean| G["git commit"] --> K{"Hook: check --staged.<br/>New errors vs HEAD?"}
+    L["Agent reads the instruction file;<br/>wikiknit check NOTE (drift, stale)<br/>before relying on a note"] --> E["Agent edits notes"] --> X["check #45;#45;changed<br/>mentions #45;#45;changed"]
+    X -->|"findings:<br/>apply fix"| E
+    X -->|clean| K{"git commit hook:<br/>check #45;#45;staged.<br/>Adds errors?"}
     K -->|"yes: blocked"| E
     K -->|no| D["Committed<br/>(warnings never block)"]
   end
-  F -.-> L
-  H -.-> K
+  setup --> work
 ```
 
-`init` writes only what the notes show and never overwrites a config or a hook it did not write;
-hooks in `.git/hooks` are per clone (run `init` again there). Details: [Install](#install).
+Setup is what [docs/agent-install.md](docs/agent-install.md) walks an agent through. `init`
+writes only what the notes show and never overwrites a config or a hook it did not write; hooks in
+`.git/hooks` are per clone (run `init` again there). Details: [Install](#install).
 
 ## Why it is small
 
