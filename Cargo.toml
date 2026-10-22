@@ -1,6 +1,6 @@
 [package]
 name = "wikiknit"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Lint wikilinks in Markdown vaults (Obsidian and friends): broken links, link rules, unlinked mentions, notes that drifted from their repo, and a check for staged changes."
@@ -10,7 +10,7 @@ homepage = "https://github.com/victor-kwak/wikiknit"
 readme = "README.md"
 keywords = ["obsidian", "wikilinks", "markdown", "lint", "notes"]
 categories = ["command-line-utilities", "text-processing"]
-exclude = ["/tests/fixtures", "/plugin", "/.claude-plugin"]
+exclude = ["/tests/fixtures", "/plugin", "/.claude-plugin", "/install.sh", "/.github"]
 
 [dependencies]
 aho-corasick = "1.1.5"
@@ -26,6 +26,15 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 toml = "1.1.8"
+
+# `cargo binstall wikiknit` downloads the release archive (see .github/workflows/release.yml).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

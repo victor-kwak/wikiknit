@@ -1,0 +1,102 @@
+name: Release
+# On a version tag (v0.8.1): build the binary for each platform, then publish a GitHub release
+# with one archive per platform and a SHA-256 file for each. Asset names match
+# `[package.metadata.binstall]` in Cargo.toml and `install.sh`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag matches the crate version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      # The test suite runs on Linux (CI runs it on every push); elsewhere a smoke test of the
+      # real binary: a vault with one broken link, which `check` must report.
+      - name: Test (Linux)
+        if: matrix.musl
+        shell: bash
+        run: cargo test --release --locked --target ${{ matrix.target }}
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          bin="$PWD/target/${{ matrix.target }}/release/wikiknit"
+          if [ "${{ runner.os }}" = Windows ]; then bin="$bin.exe"; fi
+          "$bin" --version
+          mkdir smoke && cd smoke
+          printf 'vault = "."\n' > wikiknit.toml
+          printf '# a\n[[b]] [[missing]]\n' > a.md
+          printf '# b\n[[a]]\n' > b.md
+          set +e; "$bin" check > out.txt; code=$?; set -e
+          cat out.txt
+          test "$code" = 1 && grep -q unresolved-link out.txt
+      - name: Package
+        shell: bash
+        run: |
+          name="wikiknit-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir "$name"
+          bin=wikiknit
+          if [ "${{ runner.os }}" = Windows ]; then bin=wikiknit.exe; fi
+          cp "target/${{ matrix.target }}/release/$bin" README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z a "$name.zip" "$name" >/dev/null
+            archive="$name.zip"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null; then sha256sum "$archive" > "$archive.sha256"
+          else shasum -a 256 "$archive" > "$archive.sha256"; fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Prebuilt binaries. Install: see README (install.sh, or cargo binstall wikiknit). Each archive has a .sha256 file."

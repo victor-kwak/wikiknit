@@ -26,17 +26,24 @@ wikiknit checks the links in the vault. It never edits notes. When you are done:
 wikiknit --version
 ```
 
-If this prints `wikiknit 0.8.0` or later, go to step 3. Otherwise install it from GitHub (this
-compiles it; it takes about a minute):
+If this prints `wikiknit 0.8.1` or later, go to step 3. Otherwise, on Linux or macOS, install the
+prebuilt binary (it checks the download's SHA-256 and installs to `~/.local/bin`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/victor-kwak/wikiknit/main/install.sh | sh
+```
+
+On Windows, download the `.zip` for `x86_64-pc-windows-msvc` from
+https://github.com/victor-kwak/wikiknit/releases and put `wikiknit.exe` in a folder on `PATH`. On
+another platform, or if the user prefers building from source and has Rust:
 
 ```bash
 cargo install --locked --git https://github.com/victor-kwak/wikiknit
 ```
 
-Prebuilt binaries do not exist yet. If `cargo` is missing, stop and ask the user to install Rust
-(https://rustup.rs); do not install it without their consent. `cargo install` puts `wikiknit` in
-`~/.cargo/bin`: make sure that folder is on `PATH`, or the git hook prints "wikiknit is not on
-PATH; vault not checked" and lets every commit through.
+Do not install Rust without the user's consent. Make sure the folder holding `wikiknit` is on
+`PATH` (the installer says when it is not), or the git hook prints "wikiknit is not on PATH; vault
+not checked" and lets every commit through.
 
 ## 3. Run `wikiknit init`
 

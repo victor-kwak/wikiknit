@@ -29,7 +29,7 @@ does, with the fix wikiknit gives. It is fast: `check` on a 5,000-note vault tak
 flowchart TB
   subgraph setup["Setup, once per project"]
     direction LR
-    B["cargo install"] --> I["wikiknit init"]
+    B["Install the binary"] --> I["wikiknit init"]
     I --> C["wikiknit.toml<br/>(what the notes show)"]
     I --> H["pre-commit and<br/>pre-merge-commit hooks"]
     Q["Rules the user<br/>confirms"] --> C
@@ -68,12 +68,22 @@ when a commit adds an error, and it runs for every `git commit`, whoever runs it
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64, aarch64; static) and macOS (arm64, x86_64), with a SHA-256
+check, into `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/victor-kwak/wikiknit/main/install.sh | sh
+```
+
+`WIKIKNIT_VERSION=v0.8.1` pins a release; `WIKIKNIT_INSTALL_DIR` picks the folder. Windows: the
+`.zip` on the [releases page](https://github.com/victor-kwak/wikiknit/releases). From source:
+
 ```bash
 cargo install --locked --git https://github.com/victor-kwak/wikiknit   # latest from GitHub
 cargo install --locked --path .                                       # from a checkout
 ```
 
-There are no prebuilt binaries yet. Then, from the project that holds the vault:
+Then, from the project that holds the vault:
 
 ```bash
 wikiknit init --dry-run          # what it would do
@@ -204,6 +214,28 @@ What it does not see:
 
 `--staged` writes the index as a tree into a temporary object store; wikiknit only reads the
 repository.
+
+Hooks are per clone: git does not copy them, so a fresh clone runs no check until `wikiknit init`
+runs there (it keeps the config and adds the hooks).
+
+### In CI
+
+The hook runs on each machine that has it. A CI step catches what reaches the repository any
+other way (a clone without the hook, `--no-verify`, a rebase or cherry-pick): it fails when the
+vault has any link error. For GitHub Actions:
+
+```yaml
+  vault-links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: curl -fsSL https://raw.githubusercontent.com/victor-kwak/wikiknit/main/install.sh | sh
+      - run: ~/.local/bin/wikiknit check          # add --config <path> if wikiknit.toml is not at the top
+```
+
+Pin `WIKIKNIT_VERSION` in the step's `env` to upgrade on purpose. A vault that has errors already
+fails from the start: fix them first, or check only what each push adds by comparing with the
+previous commit in your own script.
 
 ## Configure
 
