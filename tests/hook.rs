@@ -263,14 +263,28 @@ fn bash_commands_that_print_notes_are_checked() {
     let (vault, _code) = drift_vault();
     let v = vault.path();
     let bash = |cmd: &str, cwd: &Path| hook("Bash", json!({"command": cmd}), cwd);
-    // Relative to the hook's cwd, and after a `cd`.
+    // Relative to the hook's cwd, and after a `cd`. Claude Code gives the cwd the command
+    // ended in.
     let ctx = bash("cat INDEX.md; sed -n 1,20p Projects/app/overview.md", v).unwrap();
     assert_eq!(ctx.matches("may be out of date").count(), 1, "{ctx}");
     let cmd = format!(
         "cd {} && head -40 Projects/app/overview.md | grep -n port",
         v.display()
     );
-    assert!(bash(&cmd, Path::new("/")).is_some());
+    assert!(bash(&cmd, v).is_some());
+    let ctx = bash("cd Projects && cat app/overview.md", &v.join("Projects"));
+    assert!(
+        ctx.is_some(),
+        "started one folder above the cwd it ended in"
+    );
+    let ctx = bash(
+        "cat Projects/app/overview.md; cd Projects",
+        &v.join("Projects"),
+    );
+    assert!(
+        ctx.is_some(),
+        "read before the cd, from the folder it started in"
+    );
     // Written, not read: a heredoc, `sed -i`, a redirect target; and commands that do not print.
     assert_eq!(
         bash(

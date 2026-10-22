@@ -44,7 +44,7 @@ pub fn read(input: &str) -> Option<String> {
     let cwd = v.get("cwd").and_then(Value::as_str).map(PathBuf::from);
     let paths = match v.get("tool_name")?.as_str()? {
         "Read" => vec![PathBuf::from(tool_input.get("file_path")?.as_str()?)],
-        "Bash" => printed_files(tool_input.get("command")?.as_str()?, cwd.as_deref()),
+        "Bash" => printed_files_ending_in(tool_input.get("command")?.as_str()?, cwd.as_deref()),
         _ => return None,
     };
     let text = report(&paths)?;
@@ -197,12 +197,44 @@ fn lexical(path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Levels above the hook's `cwd` tried as the folder a command started in.
+const MAX_START_DEPTH: usize = 8;
+
+/// `printed_files` for a command whose shell ended in `end`: Claude Code gives a hook the
+/// working directory as the command left it (`cd sub && cat a.md` reports `.../sub`). The
+/// command started in `end` or a folder above it: the first whose `cd`s lead to `end`. When
+/// none does (`cd ..`, `cd -`, a `cd` that failed), every path is read from `end`, which is
+/// right for what the command reads after its last `cd`.
+#[must_use]
+pub fn printed_files_ending_in(command: &str, end: Option<&Path>) -> Vec<PathBuf> {
+    let Some(end) = end.and_then(lexical) else {
+        return printed_files(command, None);
+    };
+    for start in end.ancestors().take(MAX_START_DEPTH + 1) {
+        let (files, last) = run_shell(command, Some(start), true);
+        if last.and_then(|l| lexical(&l)).as_deref() == Some(end.as_path()) {
+            return files;
+        }
+    }
+    run_shell(command, Some(&end), false).0
+}
+
 /// The `.md` files a shell command prints: arguments of `cat`, `head`, `sed`, `grep`, ...
 /// (not redirect targets, not `sed -i`), resolved from `cwd` and the `cd`s before them, with
 /// globs in the last component expanded. Heredoc bodies are skipped. Words with `$` or
 /// backquotes are not guessed at.
 #[must_use]
 pub fn printed_files(command: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
+    run_shell(command, cwd, true).0
+}
+
+/// The files the command prints, and the folder its shell ends in (`None` when unknown).
+/// Without `follow_cd`, every path is read from `cwd`.
+fn run_shell(
+    command: &str,
+    cwd: Option<&Path>,
+    follow_cd: bool,
+) -> (Vec<PathBuf>, Option<PathBuf>) {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut cwd = cwd.map(Path::to_path_buf);
     // The folder outside each subshell `( ... )` we are in: a `cd` inside one ends with it.
@@ -226,6 +258,9 @@ pub fn printed_files(command: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
             continue;
         };
         if name == "cd" || name == "pushd" {
+            if !follow_cd {
+                continue;
+            }
             cwd = match args.iter().find(|a| !a.starts_with('-') || *a == "-") {
                 None => home.clone(),
                 // `cd -`: the previous folder is not known.
@@ -290,7 +325,7 @@ pub fn printed_files(command: &str, cwd: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
-    out
+    (out, cwd)
 }
 
 /// An option among `args`: a short one in a cluster (`-ni`), or a long one by prefix
@@ -611,6 +646,22 @@ mod tests {
         );
         assert_eq!(files("cat <x.md"), ["/w/x.md"]);
         assert_eq!(files("X=1 /usr/bin/cat x.md # cat no.md"), ["/w/x.md"]);
+    }
+
+    #[test]
+    fn the_start_folder_is_found_from_where_the_command_ended() {
+        let end = |cmd: &str, cwd: &str| {
+            printed_files_ending_in(cmd, Some(Path::new(cwd)))
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(end("cd v && cat a.md", "/w/v"), ["/w/v/a.md"]);
+        assert_eq!(end("cd v/n; cat ../a.md", "/w/v/n"), ["/w/v/n/../a.md"]);
+        assert_eq!(end("cat a.md", "/w"), ["/w/a.md"]);
+        assert_eq!(end("cd /abs && cat a.md", "/abs"), ["/abs/a.md"]);
+        // Started below the end: paths are read from where it ended.
+        assert_eq!(end("cd ..; cat a.md", "/w"), ["/w/a.md"]);
     }
 
     #[test]
