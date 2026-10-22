@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::Serialize;
 
-use crate::config::{LinkStyle, Severity, When};
+use crate::config::{Config, LinkStyle, Severity, When};
 use crate::parse::{LinkKind, Location};
 use crate::vault::Note;
 use crate::vault::{Form, Target, Vault};
@@ -54,7 +54,7 @@ impl Finding {
 }
 
 struct Sink<'a> {
-    vault: &'a Vault,
+    cfg: &'a Config,
     out: Vec<Finding>,
     /// The key for the next `push_fix` (its message when unset).
     next_key: Option<String>,
@@ -76,7 +76,7 @@ impl Sink<'_> {
         fix: String,
     ) {
         let key = self.next_key.take().unwrap_or_else(|| message.clone());
-        let severity = match self.vault.config.severity(rule) {
+        let severity = match self.cfg.severity(rule) {
             Severity::Off => return,
             Severity::Warn => "warn",
             Severity::Error => "error",
@@ -276,7 +276,7 @@ impl<'a> Closest<'a> {
 pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding> {
     let cfg = &vault.config;
     let mut sink = Sink {
-        vault,
+        cfg,
         out: Vec::new(),
         next_key: None,
     };
@@ -496,66 +496,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             sink.push_fix("orphan", &note.id, 1, "no note links here".into(), fix);
         }
 
-        if let Some(rule) = cfg.stale_rule(&note.id)
-            && rule.required
-            && p.frontmatter
-                .value
-                .as_ref()
-                .and_then(|v| v.get(&rule.field))
-                .is_none()
-        {
-            sink.key(format!("{} missing", rule.field)).push_fix(
-                "stale",
-                &note.id,
-                1,
-                format!("has no `{}` date", rule.field),
-                rule.fix.clone().unwrap_or_else(|| {
-                    format!(
-                        "check the note against its source, then add `{}: {}` to the frontmatter",
-                        rule.field,
-                        format_date(today)
-                    )
-                }),
-            );
-        }
-        if let Some(rule) = cfg.stale_rule(&note.id)
-            && let Some(value) = p
-                .frontmatter
-                .value
-                .as_ref()
-                .and_then(|v| v.get(&rule.field))
-        {
-            let line = frontmatter_line(note, &rule.field);
-            let field = &rule.field;
-            match value.as_str().and_then(parse_date) {
-                Some(day) if today - day > i64::from(rule.days) => {
-                    sink.key(format!("{field} old")).push_fix(
-                        "stale",
-                        &note.id,
-                        line,
-                        format!(
-                            "`{field}` is {} days old (limit {})",
-                            today - day,
-                            rule.days
-                        ),
-                        rule.fix.clone().unwrap_or_else(|| {
-                            format!(
-                                "check the note against its source, then set `{field}: {}`",
-                                format_date(today)
-                            )
-                        }),
-                    )
-                }
-                Some(_) => {}
-                None => sink.key(format!("{field} not a date")).push_fix(
-                    "stale",
-                    &note.id,
-                    line,
-                    format!("`{field}` is not a date"),
-                    format!("write it as YYYY-MM-DD: `{field}: {}`", format_date(today)),
-                ),
-            }
-        }
+        stale(cfg, note, today, &mut sink);
 
         if !cfg.is_hub(&note.id) && outbound.is_empty() {
             sink.push_fix(
@@ -567,7 +508,7 @@ pub fn check(vault: &Vault, selected: Option<&BTreeSet<String>>) -> Vec<Finding>
             );
         }
 
-        drift(vault, note, &mut sink);
+        drift(note, &mut sink);
         forbidden_links(vault, note, &resolved, &mut sink);
 
         // Missing required links of this note: (target id, note index if it exists), in rule
@@ -801,10 +742,91 @@ fn sibling(vault: &Vault, editor: &Note, when: &When) -> Option<usize> {
     Some(editor.line_at(last).0)
 }
 
+/// Whether a note can be trusted as it is, from the note alone (no other note is read):
+/// `stale` and `drift`. What a read-time hook reports.
+#[must_use]
+pub fn trust(cfg: &Config, note: &Note) -> Vec<Finding> {
+    let mut sink = Sink {
+        cfg,
+        out: Vec::new(),
+        next_key: None,
+    };
+    stale(cfg, note, today(), &mut sink);
+    drift(note, &mut sink);
+    sink.out
+}
+
+/// `stale`: the note's `[[stale]]` date field is missing (when required), not a date, or old.
+fn stale(cfg: &Config, note: &Note, today: i64, sink: &mut Sink<'_>) {
+    if let Some(rule) = cfg.stale_rule(&note.id)
+        && rule.required
+        && note
+            .parsed
+            .frontmatter
+            .value
+            .as_ref()
+            .and_then(|v| v.get(&rule.field))
+            .is_none()
+    {
+        sink.key(format!("{} missing", rule.field)).push_fix(
+            "stale",
+            &note.id,
+            1,
+            format!("has no `{}` date", rule.field),
+            rule.fix.clone().unwrap_or_else(|| {
+                format!(
+                    "check the note against its source, then add `{}: {}` to the frontmatter",
+                    rule.field,
+                    format_date(today)
+                )
+            }),
+        );
+    }
+    if let Some(rule) = cfg.stale_rule(&note.id)
+        && let Some(value) = note
+            .parsed
+            .frontmatter
+            .value
+            .as_ref()
+            .and_then(|v| v.get(&rule.field))
+    {
+        let line = frontmatter_line(note, &rule.field);
+        let field = &rule.field;
+        match value.as_str().and_then(parse_date) {
+            Some(day) if today - day > i64::from(rule.days) => {
+                sink.key(format!("{field} old")).push_fix(
+                    "stale",
+                    &note.id,
+                    line,
+                    format!(
+                        "`{field}` is {} days old (limit {})",
+                        today - day,
+                        rule.days
+                    ),
+                    rule.fix.clone().unwrap_or_else(|| {
+                        format!(
+                            "check the note against its source, then set `{field}: {}`",
+                            format_date(today)
+                        )
+                    }),
+                )
+            }
+            Some(_) => {}
+            None => sink.key(format!("{field} not a date")).push_fix(
+                "stale",
+                &note.id,
+                line,
+                format!("`{field}` is not a date"),
+                format!("write it as YYYY-MM-DD: `{field}: {}`", format_date(today)),
+            ),
+        }
+    }
+}
+
 /// `drift`: the note names a repository and the commit it was checked against; report the
 /// commits made since, so the note is checked before anyone relies on it.
-fn drift(vault: &Vault, note: &Note, sink: &mut Sink<'_>) {
-    let Some(rule) = vault.config.drift_rule(&note.id) else {
+fn drift(note: &Note, sink: &mut Sink<'_>) {
+    let Some(rule) = sink.cfg.drift_rule(&note.id) else {
         return;
     };
     let fm = &note.parsed.frontmatter;

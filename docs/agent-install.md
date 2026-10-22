@@ -164,8 +164,10 @@ git commit -m "Set up wikiknit"
 
 ## Optional: Claude Code plugin
 
-For Claude Code there is a plugin with one skill, `link`: how to link the notes an agent writes.
-It is optional; the snippet and the hook do the checking.
+For Claude Code there is a plugin with one skill, `link` (how to link the notes an agent writes),
+and one hook: after the agent reads a vault note, it adds the note's `stale` and `drift` findings
+next to what it read. The hook is silent when the note is fine and never blocks. The plugin is
+optional; the snippet and the git hook do the checking.
 
 ```bash
 claude plugin marketplace add victor-kwak/wikiknit

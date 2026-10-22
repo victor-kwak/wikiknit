@@ -8,7 +8,7 @@
     {
       "name": "wikiknit",
       "source": "./plugin",
-      "description": "Link linting for Markdown vaults: a link skill for the notes an agent writes."
+      "description": "Link linting for Markdown vaults: a link skill for the notes an agent writes, and stale/drift warnings when it reads one."
     }
   ]
 }

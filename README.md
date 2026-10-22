@@ -348,9 +348,24 @@ longer domain (`www.example.com.au`).
 ## Claude Code plugin
 
 This repo is also a Claude Code plugin marketplace. The plugin is optional: the `wikiknit snippet`
-block in the project's `CLAUDE.md` and the git hook do the checking. It adds one skill, `link`: how
-to link the notes an agent writes (by meaning, both ways, with aliases), and to run `wikiknit check
---changed` before committing. It adds no hooks.
+block in the project's `CLAUDE.md` and the git hook do the checking. It adds:
+
+- The skill `link`: how to link the notes an agent writes (by meaning, both ways, with aliases),
+  and to run `wikiknit check --changed` before committing.
+- A `PostToolUse` hook on `Read` and `Bash`. When the agent reads a vault note (with `Read`, or a
+  shell command that prints it: `cat`, `head`, `tail`, `sed -n`, `grep`, ...), the hook adds that
+  note's `stale` and `drift` findings next to what it read:
+
+  ```text
+  wikiknit: the vault note Projects/app/overview may be out of date.
+  - drift (line 9): 16 commit(s) in ~/Repos/app since `verified_commit` 1a2b3c4 (HEAD 9f8e7d6, 2026-10-17). Fix: `git -C ...`
+  ```
+
+  It prints nothing when the note has no such finding, when the file is not a note of a vault
+  with a `wikiknit.toml` (found from the file's folder upward, to the top of its git work tree),
+  or when anything fails. It never blocks and always exits 0. It reads only the note (and runs
+  `git` for `drift`): about 1 ms per call, 10 ms for a note with a `[[drift]]` rule. Content an
+  agent finds with a search tool and does not read gets no warning.
 
 ```bash
 claude plugin marketplace add victor-kwak/wikiknit   # or a local checkout path

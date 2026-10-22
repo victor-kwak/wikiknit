@@ -1,0 +1,29 @@
+{
+  "description": "After a Read or Bash call that read a vault note, adds the note's stale and drift findings next to the result (also when the command exits non-zero). Silent when there are none; never blocks.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Read|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v wikiknit >/dev/null 2>&1 || exit 0; exec wikiknit hook read",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v wikiknit >/dev/null 2>&1 || exit 0; exec wikiknit hook read",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

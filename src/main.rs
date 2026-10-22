@@ -173,18 +173,25 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         into: Option<PathBuf>,
     },
-    /// Removed in 0.7 (the Claude Code hooks). Kept as a no-op that exits 0, so a session
-    /// whose plugin still has the old hooks is not blocked by an unknown subcommand.
+    /// Claude Code hooks. `hook read`: a `PostToolUse` hook (`Read`, `Bash`) that reads the
+    /// hook JSON on stdin and, when the tool read a vault note with `stale` or `drift`
+    /// findings, prints them as `additionalContext`. Anything else, including the hooks removed
+    /// in 0.7 (`session-start`, `pre-commit`, `stop`) that old plugin caches still run, is a
+    /// no-op. Always exits 0 and never blocks.
     #[command(hide = true)]
     Hook {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<String>,
+        args: Vec<String>,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Hook { .. }) {
+    if let Command::Hook { args } = &cli.command {
+        if args.first().is_some_and(|a| a == "read") {
+            // A panic is caught too: a hook that fails shows the user an error notice.
+            let _ = std::panic::catch_unwind(read_hook);
+        }
         return ExitCode::SUCCESS;
     }
     match run(cli) {
@@ -193,6 +200,18 @@ fn main() -> ExitCode {
             eprintln!("wikiknit: {e:#}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `hook read`: the hook JSON on stdin; the findings, if any, on stdout.
+fn read_hook() {
+    use std::io::{Read as _, Write as _};
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    if let Some(out) = wikiknit::hook::read(&input) {
+        let _ = writeln!(std::io::stdout().lock(), "{out}");
     }
 }
 
